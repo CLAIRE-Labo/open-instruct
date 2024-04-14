@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
+from torch.cuda import memory_allocated
 
 import argparse
 import logging
@@ -461,6 +462,11 @@ def main():
             args.dataset_name,
             args.dataset_config_name,
         )
+        allocated = torch.cuda.memory_allocated(0)
+        reserved = torch.cuda.memory_reserved(0)
+
+        print(f"Memory Allocated after loading dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+        print(f"Memory Reserved after loading dataset: {reserved / (1024 ** 3)} GB")
     else:
         data_files = {}
         dataset_args = {}
@@ -522,7 +528,11 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+    allocated = torch.cuda.memory_allocated(0)
+    reserved = torch.cuda.memory_reserved(0)
 
+    print(f"Memory Allocated after loading model and tokenizer: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+    print(f"Memory Reserved after loading model and tokenizer: {reserved / (1024 ** 3)} GB")
     if args.model_name_or_path:
         if args.use_qlora:
             bnb_config = BitsAndBytesConfig(
@@ -627,7 +637,11 @@ def main():
         )
     else:
         raise ValueError("You need to have either 'prompt'&'completion' or 'messages' in your column names.")
-    
+    allocated = torch.cuda.memory_allocated(0)
+    reserved = torch.cuda.memory_reserved(0)
+
+    print(f"Memory Allocated after processing dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+    print(f"Memory Reserved after processing dataset: {reserved / (1024 ** 3)} GB")
     with accelerator.main_process_first():
         lm_datasets = raw_datasets.map(
             encode_function,
@@ -639,6 +653,11 @@ def main():
         )
         lm_datasets.set_format(type="pt")
         lm_datasets = lm_datasets.filter(lambda example: (example['labels'] != -100).any())
+        allocated = torch.cuda.memory_allocated(0)
+        reserved = torch.cuda.memory_reserved(0)
+
+        print(f"Memory Allocated after tokenizing and reformatting dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+        print(f"Memory Reserved after tokenizing and reformatting  dataset: {reserved / (1024 ** 3)} GB")
 
     train_dataset = lm_datasets["train"]
 
@@ -792,8 +811,12 @@ def main():
         else:
             active_dataloader = train_dataloader
         for step, batch in enumerate(active_dataloader):
+            # Print the size of each component in the batch
             with accelerator.accumulate(model):
+                #print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
                 outputs = model(**batch, use_cache=False)
+                print(f"Memory allocated after forward pass: {memory_allocated() / 1e9} GB")
+
                 if args.reduce_loss == 'mean':
                     loss = outputs.loss
                 else:
@@ -852,6 +875,8 @@ def main():
 
                 if completed_steps >= args.max_train_steps:
                     break
+            
+
 
         if args.checkpointing_steps == "epoch":
             output_dir = f"epoch_{epoch}"

@@ -50,6 +50,15 @@ def parse_args():
     parser.add_argument("--qlora", action="store_true")  # qlora requires special treatment.
     parser.add_argument("--save_tokenizer", action="store_true")
     parser.add_argument("--use_fast_tokenizer", action="store_true")
+    parser.add_argument(
+        "--tokenizer_revision",
+        help="""Specifies a revision for the tokenizer. If not given, defaults
+                 to the value of the `model_revision` arg. In most cases, the tokenizer
+                 revision should be the same as the model revision and this flag shouldn't
+                 be needed.""",
+        default=None,
+        required=False,
+    )
     return parser.parse_args()
 
 
@@ -76,6 +85,7 @@ if __name__ == "__main__":
     else:
         base_model = AutoModelForCausalLM.from_pretrained(
             args.base_model_name_or_path if args.base_model_name_or_path else peft_config.base_model_name_or_path,
+            trust_remote_code=True
         )
     print("Loading the lora model...")
     lora_model = PeftModel.from_pretrained(base_model, args.lora_model_name_or_path)
@@ -88,7 +98,13 @@ if __name__ == "__main__":
     # If tokenizer is specified, use it. Otherwise, use the tokenizer in the lora model folder or the base model folder.
     if args.tokenizer_name_or_path:
         print(f"Loading the tokenizer from {args.tokenizer_name_or_path}...")
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path, use_fast=args.use_fast_tokenizer)
+        #tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path, use_fast=args.use_fast_tokenizer)
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer_name_or_path,
+            trust_remote_code=True,
+            use_fast=args.use_fast_tokenizer,
+            revision=args.tokenizer_revision
+        )
     else:
         try:
             print("Trying to load the tokenizer in the lora model folder...")
