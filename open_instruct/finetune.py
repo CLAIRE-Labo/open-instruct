@@ -17,6 +17,7 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import deepspeed
+import wandb
 
 import transformers
 from transformers import (
@@ -41,6 +42,19 @@ try:
     from hf_olmo import OLMoTokenizerFast
 except ImportError:
     logger.warning("OLMo not installed. Ignore if using a different model.")
+
+# wandb login stage
+api_key_file = os.getenv('WANDB_API_KEY_FILE_AT')
+
+if api_key_file:
+    try:
+        with open(api_key_file, 'r') as file:
+            wandb_api_key = file.readline().strip()
+            os.environ['WANDB_API_KEY'] = wandb_api_key  # Set the API key in the environment
+    except Exception as e:
+        raise ValueError(f"An error occurred while reading the WANDB_API_KEY from file: {e}")
+else:
+    raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -398,8 +412,16 @@ def main():
     accelerator_log_kwargs = {}
 
     if args.with_tracking:
-        accelerator_log_kwargs["log_with"] = args.report_to
-        accelerator_log_kwargs["project_dir"] = args.output_dir
+        if "wandb" in args.report_to.split(",") or args.report_to == "all":
+            wandb_api_key = os.getenv('WANDB_API_KEY')
+            wandb.login(key=wandb_api_key)
+
+            # Initialize wandb
+            wandb.init(project="alignment_as_translation", entity="zeyneptandogan")
+
+            # Configure wandb logging within Accelerator
+            accelerator_log_kwargs["log_with"] = args.report_to
+            accelerator_log_kwargs["project_dir"] = args.output_dir
 
     # if you get timeouts (e.g. due to long tokenization) increase this.
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=args.timeout))
