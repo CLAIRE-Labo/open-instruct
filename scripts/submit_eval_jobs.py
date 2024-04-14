@@ -18,6 +18,7 @@ parser.add_argument("--cluster", nargs='+', default=["ai2/allennlp-cirrascale", 
 parser.add_argument("--is_tuned", action="store_true")
 parser.add_argument("--use_hf_tokenizer_template", action="store_true")
 parser.add_argument("--priority", type=str, default="preemptible")
+parser.add_argument("--olmo", action="store_true", help="Pass this flag if evaluating an OLMo model and `olmo` isn't in the model name.")
 args = parser.parse_args()
 
 
@@ -51,8 +52,10 @@ experiment_groups = [
     "tydiqa_no_context_1shot",
     "codex_eval_temp_0.1",
     "codex_eval_temp_0.8",
+    "ifeval",
     "trutufulqa",
     "toxigen",
+    "xstest",
     "alpaca_eval",
 ]
 
@@ -208,6 +211,17 @@ for experiment_group in experiment_groups:
             --model_name_or_path /model \
             --tokenizer_name_or_path /model
         '''
+    elif experiment_group == "ifeval":
+        task_spec['arguments'][0] = '''
+            python -m eval.ifeval.run_eval \
+                --data_dir /data/ifeval/ \
+                --save_dir /output/ \
+                --model_name_or_path /model \
+                --tokenizer_name_or_path /model \
+                --use_chat_format \
+                --chat_formatting_function eval.templates.create_prompt_with_tulu_chat_format \
+                --use_vllm
+        '''
     elif experiment_group == "trutufulqa":
         task_spec['arguments'][0] = '''
         python -m eval.truthfulqa.run_eval \
@@ -236,6 +250,18 @@ for experiment_group in experiment_groups:
             --use_chat_format \
             --chat_formatting_function eval.templates.create_prompt_with_tulu_chat_format
         '''
+    elif experiment_group == "xstest":
+        task_spec['arguments'][0] = '''
+        python -m eval.xstest.run_eval \
+            --data_dir /data/xstest/ \
+            --save_dir /output/ \
+            --model_name_or_path /model \
+            --tokenizer_name_or_path /model \
+            --eval_batch_size 32 \
+            --use_vllm \
+            --use_chat_format \
+            --chat_formatting_function eval.templates.create_prompt_with_tulu_chat_format
+        '''
     elif experiment_group == "alpaca_eval":
         task_spec['arguments'][0] = '''
         python -m eval.alpaca_farm.run_eval \
@@ -246,15 +272,19 @@ for experiment_group in experiment_groups:
             --use_chat_format \
             --chat_formatting_function eval.templates.create_prompt_with_tulu_chat_format
         '''
+        # OLMo models can only output 2048 new tokens at most; default is 8192.
+        if "olmo" in model_info[0] or args.olmo:
+            task_spec['arguments'][0] += " --max_new_tokens 2048"
+
     else:
         raise ValueError("experiment_group not supported")
 
     if model_info[0].startswith("hf-"):  # if it's a huggingface model, load it from the model hub
         task_spec['arguments'] = [task_spec['arguments'][0].replace("--model_name_or_path /model", "--model_name_or_path "+model_info[1])]
-        task_spec['arguments'] = [task_spec['arguments'][0].replace("--tokenizer_name_or_path /model", "--model_name_or_path "+model_info[1])]
+        task_spec['arguments'] = [task_spec['arguments'][0].replace("--tokenizer_name_or_path /model", "--tokenizer_name_or_path "+model_info[1])]
     elif model_info[1].startswith("/"):  # if it's a local model, load it from the local directory
         task_spec['arguments'] = [task_spec['arguments'][0].replace("--model_name_or_path /model", "--model_name_or_path "+model_info[1])]
-        task_spec['arguments'] = [task_spec['arguments'][0].replace("--tokenizer_name_or_path /model", "--model_name_or_path "+model_info[1])]
+        task_spec['arguments'] = [task_spec['arguments'][0].replace("--tokenizer_name_or_path /model", "--tokenizer_name_or_path "+model_info[1])]
     else:  # if it's a beaker model, mount the beaker dataset to `/model`
         task_spec['datasets'][1]['source']['beaker'] = model_info[1]
 
@@ -331,7 +361,7 @@ for experiment_group in experiment_groups:
             "--chat_formatting_function eval.templates.create_prompt_with_tulu_chat_format", 
             "--chat_formatting_function eval.templates.create_prompt_with_xwin_chat_format")
         ]
-    elif "olmo" in model_info[0]:
+    elif "olmo" in model_info[0] or args.olmo:
         task_spec['arguments'] = [task_spec['arguments'][0].replace(
             "--chat_formatting_function eval.templates.create_prompt_with_tulu_chat_format", 
             "--chat_formatting_function eval.templates.create_prompt_with_olmo_chat_format")
