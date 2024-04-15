@@ -799,6 +799,8 @@ def main():
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_loss = 0
+        epoch_data_count = 0  # To keep track of the number of data points in each epoch
+
         if (
             args.resume_from_checkpoint
             and epoch == starting_epoch
@@ -812,6 +814,8 @@ def main():
             active_dataloader = train_dataloader
         for step, batch in enumerate(active_dataloader):
             # Print the size of each component in the batch
+            batch_size = len(batch['input_ids'])  # Assuming 'input_ids' is the key for input data
+            epoch_data_count += batch_size
             with accelerator.accumulate(model):
                 #print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
                 outputs = model(**batch, use_cache=False)
@@ -856,6 +860,9 @@ def main():
                 if args.logging_steps and completed_steps % args.logging_steps == 0:
                     avg_loss = accelerator.gather(total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_steps
                     logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
+                    # Print number of examples processed so far in this epoch
+                    print(
+                        f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
                     if args.with_tracking:
                         accelerator.log(
                             {
@@ -864,6 +871,7 @@ def main():
                             },
                             step=completed_steps,
                         )
+
                     total_loss = 0
                     
                 if isinstance(checkpointing_steps, int):
@@ -876,8 +884,7 @@ def main():
                 if completed_steps >= args.max_train_steps:
                     break
 
-
-
+        print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
         if args.checkpointing_steps == "epoch":
             output_dir = f"epoch_{epoch}"
             if args.output_dir is not None:
