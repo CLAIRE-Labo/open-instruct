@@ -382,7 +382,7 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
         'input_ids': input_ids.flatten(),
         'labels': labels.flatten(),
         'attention_mask': attention_mask.flatten(),
-        'input_text': example_text
+        #'input_text': example_text
     }
 
 
@@ -521,6 +521,7 @@ def main():
     elif args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(
             args.model_name_or_path,
+            padding=True,
             trust_remote_code=args.trust_remote_code,
             use_fast=not args.use_slow_tokenizer,
             revision=tokenizer_revision
