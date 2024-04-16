@@ -347,6 +347,7 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
     example_text = _concat_messages(messages).strip()
     if add_bos:
         example_text = tokenizer.bos_token + example_text
+
     tokenized_example = tokenizer(example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
     input_ids = tokenized_example.input_ids
     labels = input_ids.clone()
@@ -381,6 +382,7 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
         'input_ids': input_ids.flatten(),
         'labels': labels.flatten(),
         'attention_mask': attention_mask.flatten(),
+        'input_text': example_text
     }
 
 
@@ -635,13 +637,16 @@ def main():
             max_seq_length=args.max_seq_length,
             add_bos=args.add_bos,
         )
+
+        #first_encoded_example = encode_with_messages_format(raw_datasets["train"][0], tokenizer, 1024, add_bos=True)["input_text"]
+        #print("input data format: ", first_encoded_example)
     else:
         raise ValueError("You need to have either 'prompt'&'completion' or 'messages' in your column names.")
     allocated = torch.cuda.memory_allocated(0)
     reserved = torch.cuda.memory_reserved(0)
 
-    print(f"Memory Allocated after processing dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-    print(f"Memory Reserved after processing dataset: {reserved / (1024 ** 3)} GB")
+    #print(f"Memory Allocated after processing dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+    #print(f"Memory Reserved after processing dataset: {reserved / (1024 ** 3)} GB")
     with accelerator.main_process_first():
         lm_datasets = raw_datasets.map(
             encode_function,
@@ -656,8 +661,8 @@ def main():
         allocated = torch.cuda.memory_allocated(0)
         reserved = torch.cuda.memory_reserved(0)
 
-        print(f"Memory Allocated after tokenizing and reformatting dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-        print(f"Memory Reserved after tokenizing and reformatting  dataset: {reserved / (1024 ** 3)} GB")
+        #print(f"Memory Allocated after tokenizing and reformatting dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+        #print(f"Memory Reserved after tokenizing and reformatting  dataset: {reserved / (1024 ** 3)} GB")
 
     train_dataset = lm_datasets["train"]
 
