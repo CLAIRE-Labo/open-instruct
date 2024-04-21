@@ -20,8 +20,9 @@ from eval.truthfulqa.utilities import (
     split_multi_answer,
     format_best,
     set_columns,
+    save_questions,
 )
-from eval.truthfulqa.metrics import run_gpt_classifier_eval, run_hf_classifier_eval, MC_calcs
+from eval.truthfulqa.metrics import run_gpt_classifier_eval, run_hf_classifier_eval, MC_calcs, run_bleu, run_rouge, run_BLEURT
 from eval.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
 
 
@@ -281,8 +282,8 @@ def main(args):
             use_fast_tokenizer=not args.use_slow_tokenizer,
         )
         model = load_hf_lm(
-            model_name_or_path=args.model_name_or_path, 
-            load_in_8bit=args.load_in_8bit, 
+            model_name_or_path=args.model_name_or_path,
+            load_in_8bit=args.load_in_8bit,
             device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
             gptq_model=args.gptq,
         )
@@ -290,7 +291,7 @@ def main(args):
         if isinstance(model, GPTNeoXForCausalLM) or isinstance(model, OPTForCausalLM):
             tokenizer.model_max_length = model.config.max_position_embeddings
             print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
-        if "truth" in args.metrics or "info" in args.metrics:
+        if args.metrics in ['truth', 'info', 'mc','bleu', 'rouge', 'bleurt']:
             print("Running generations!")
             run_hf_model(
                 questions,
@@ -351,6 +352,7 @@ def main(args):
                             device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
                         )
                         questions = run_hf_classifier_eval(model_key, 'truth', truth_classifier, truth_tokenizer, questions, info=False)
+                    save_questions(questions, args.save_dir, "predictions.csv")
                 else:
                     if args.gpt_info_model_name:
                         questions = run_gpt_classifier_eval(model_key, 'info', args.gpt_info_model_name, questions, info=True)
@@ -361,8 +363,20 @@ def main(args):
                             device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
                         )
                         questions = run_hf_classifier_eval(model_key, 'info', info_classifier, info_tokenizer, questions, info=True)
+                    save_questions(questions, args.save_dir, "predictions.csv")
             except Exception as err:
                 print(err)
+        elif metric in ['bleu', 'rouge', 'bleurt']:
+            try:
+                if metric == 'bleu':
+                    questions = run_bleu(model_key, questions)
+                elif metric == 'rouge':
+                    questions = run_rouge(model_key, questions)
+                elif metric == 'bleurt':
+                    questions = run_BLEURT(model_key, questions)
+                save_questions(questions, args.save_dir, "predictions.csv")
+            except Exception as err:
+                print(f"Error running {metric} metric: {err}")
         else:
             warnings.warn("Metric {0} not known, skipping!".format(metric), stacklevel=2)
 
@@ -370,7 +384,8 @@ def main(args):
         questions["{} truth-info acc".format(model_key)] = questions["{} truth acc".format(model_key)] * questions["{} info acc".format(model_key)]
 
     # save all
-    questions.to_csv(os.path.join(args.save_dir, "predictions.csv"), index=False)
+    save_questions(questions, args.save_dir, "predictions.csv")
+    #questions.to_csv(os.path.join(args.save_dir, "predictions.csv"), index=False)
 
     # format and print basic results
     results = format_frame(questions)
@@ -381,6 +396,9 @@ def main(args):
 
     # filter to most informative metrics
     results = results[results['Metric'].isin(['MC1', 'MC2',
+                                              'bleu acc',
+                                              'rouge1 acc',
+                                              'BLEURT acc',
                                               'truth acc',
                                               'info acc',
                                               'truth-info acc'])]
@@ -460,14 +478,14 @@ if __name__ == '__main__':
     parser.add_argument(
         "--chat_formatting_function", 
         type=str, 
-        default="eval.templates.create_prompt_with_tulu_chat_format", 
+        default="eval.templates.create_prompt_with_finetuned_olmo1b_chat_format",  #"eval.templates.create_prompt_with_tulu_chat_format",
         help="The function to use to create the chat format. This function will be dynamically imported. Please see examples in `eval/templates.py`."
     )
     parser.add_argument(
         '--metrics', 
         nargs='+', 
-        default=['truth', 'info', 'mc'], 
-        choices=['truth', 'info', 'mc'], 
+        default=['truth', 'info', 'mc','bleu', 'rouge', 'bleurt'],
+        choices=['truth', 'info', 'mc', 'bleu', 'rouge', 'bleurt'],
         help='Metrics to run'
     )
     parser.add_argument(

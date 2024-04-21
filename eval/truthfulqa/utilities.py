@@ -13,11 +13,12 @@ def load_questions(filename='questions.csv'):
     return questions
 
 
-def save_questions(questions, filename='answers.csv'):
+def save_questions(questions, save_dir='results/' ,filename='answers.csv'):
 
     """Saves dataframe of questions (with model answers) to csv"""
+    full_path = os.path.join(save_dir, filename)
+    questions.to_csv(full_path, index=False)
 
-    questions.to_csv(filename, index=False)
 
 
 def format_prompt(ser, preset='qa', format='general'):

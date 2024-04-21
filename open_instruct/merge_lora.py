@@ -102,8 +102,7 @@ if __name__ == "__main__":
         tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer_name_or_path,
             trust_remote_code=True,
-            use_fast=args.use_fast_tokenizer,
-            revision=args.tokenizer_revision
+            use_fast=args.use_fast_tokenizer
         )
     else:
         try:
