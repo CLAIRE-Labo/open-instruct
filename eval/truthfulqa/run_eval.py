@@ -4,6 +4,9 @@ import json
 import torch
 import pandas as pd
 
+import sys
+sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+
 import warnings
 from eval.utils import (
     load_hf_lm,
@@ -62,6 +65,8 @@ def run_chatgpt(questions, engine, tag, preset='qa', batch_size=1, cache_path=No
         temperature=0.0
     )
     assert len(responses) == len(instances)
+    for idx, response in zip(tqdm(questions.index, desc="Processing ChatGPT Responses"), responses):
+        questions.loc[idx, tag] = trim_answer(response["output"])
     return questions
 
 
@@ -89,7 +94,7 @@ def run_gpt3(questions, engine, tag, preset='qa', batch_size=1, cache_path=None,
     )
     assert len(responses) == len(instances)
 
-    for idx, response in zip(questions.index, responses):
+    for idx, response in zip(tqdm(questions.index, desc="Processing GPT-3 Responses"), responses):
         questions.loc[idx, tag] = trim_answer(response["output"])
 
     return questions
@@ -179,7 +184,7 @@ def run_gpt3_mc(questions, engine, tag, preset='qa', batch_size=1, cache_path=No
 
 def run_hf_model(questions, model, tokenizer, tag, preset="qa", batch_size=1, max_new_tokens=50, chat_formatting_function=None):
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
-
+    print("entered run hf model")
     if tag not in questions.columns:
         questions[tag] = ''
     questions[tag].fillna('', inplace=True)
@@ -207,6 +212,8 @@ def run_hf_model(questions, model, tokenizer, tag, preset="qa", batch_size=1, ma
     # otherwise, we will just store the completions as is
     for idx, completion in zip(questions.index, completions):
         questions.loc[idx, tag] = trim_answer(completion) if not chat_formatting_function else completion
+
+    questions.to_csv("results/answer_model.csv", index=False)
     return questions
 
 
@@ -288,20 +295,24 @@ def main(args):
             gptq_model=args.gptq,
         )
         from transformers import GPTNeoXForCausalLM, OPTForCausalLM
+        allowable_metrics = ['truth', 'info', 'mc', 'bleu', 'rouge', 'bleurt']
         if isinstance(model, GPTNeoXForCausalLM) or isinstance(model, OPTForCausalLM):
             tokenizer.model_max_length = model.config.max_position_embeddings
             print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
-        if args.metrics in ['truth', 'info', 'mc','bleu', 'rouge', 'bleurt']:
+        if any(metric in allowable_metrics for metric in args.metrics):
             print("Running generations!")
-            run_hf_model(
-                questions,
-                model, 
-                tokenizer, 
-                tag=args.model_name_or_path, 
-                preset=args.preset, 
-                batch_size=args.eval_batch_size, 
-                chat_formatting_function=dynamic_import_function(args.chat_formatting_function) if args.use_chat_format else None
-            )
+            if not os.path.exists("results/answer_model.csv"):
+                run_hf_model(
+                    questions,
+                    model,
+                    tokenizer,
+                    tag=args.model_name_or_path,
+                    preset=args.preset,
+                    batch_size=args.eval_batch_size,
+                    chat_formatting_function=dynamic_import_function(args.chat_formatting_function) if args.use_chat_format else None
+                )
+            else:
+                questions = pd.read_csv("results/answer_model.csv")
         if "mc" in args.metrics:
             print("Running multiple-choice classification!")
             run_hf_model_mc(
@@ -313,6 +324,7 @@ def main(args):
                 preset=args.preset,
                 chat_formatting_function=dynamic_import_function(args.chat_formatting_function) if args.use_chat_format else None
             )
+
     elif args.openai_engine:
         # gpt-3 language models
         cache_path = os.path.join(args.save_dir, "openai_query_cache.jsonl")
@@ -335,12 +347,13 @@ def main(args):
     print("Running metrics!")
 
     model_key = args.model_name_or_path if args.model_name_or_path else args.openai_engine
+    print(questions)
     for metric in args.metrics:
         if metric == 'mc':
             continue
         elif metric in ['truth', 'info']:
-            if model_key not in questions.columns:
-                raise ValueError("Answers missing for {0}!".format(model_key))
+            #if model_key not in questions.columns:
+            #    raise ValueError("Answers missing for {0}!".format(model_key))
             try:
                 if metric == 'truth':
                     if args.gpt_truth_model_name:
@@ -379,7 +392,7 @@ def main(args):
                 print(f"Error running {metric} metric: {err}")
         else:
             warnings.warn("Metric {0} not known, skipping!".format(metric), stacklevel=2)
-
+    print("columns: ", questions.columns)
     if "truth" in args.metrics and "info" in args.metrics:
         questions["{} truth-info acc".format(model_key)] = questions["{} truth acc".format(model_key)] * questions["{} info acc".format(model_key)]
 
@@ -484,7 +497,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--metrics', 
         nargs='+', 
-        default=['truth', 'info', 'mc','bleu', 'rouge', 'bleurt'],
+        default=['truth', 'info','bleu', 'rouge', 'bleurt'],
         choices=['truth', 'info', 'mc', 'bleu', 'rouge', 'bleurt'],
         help='Metrics to run'
     )

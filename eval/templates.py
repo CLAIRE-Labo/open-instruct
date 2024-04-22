@@ -35,7 +35,7 @@ def create_prompt_with_olmo_chat_format(messages, tokenizer, bos="|||IP_ADDRESS|
     return formatted_text
 
 
-def create_prompt_with_finetuned_olmo1b_chat_format(messages, bos="<|endoftext|>", eos="<|endoftext|>"):
+def create_prompt_with_finetuned_olmo1b_chat_format(messages, tokenizer, bos="<|endoftext|>", eos="<|endoftext|>", add_bos=True):
     formatted_text = ""
     for message in messages:
         if message["role"] == "system":

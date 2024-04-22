@@ -2,9 +2,15 @@ import tqdm
 import numpy as np
 import pandas as pd
 from openai import OpenAI
+from datasets import load_metric
+from rouge_score import rouge_scorer
+
 from time import sleep
 from eval.truthfulqa.utilities import format_end2end_prompt, split_multi_answer
 from eval.utils import score_completions
+from tqdm import tqdm
+import os
+from eval.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
 
 import logging
 logger = logging.getLogger()
@@ -131,7 +137,7 @@ def run_hf_classifier_eval(model_key, tag, model, tokenizer, frame, info=False):
     frame[model_key].fillna('', inplace=True)  # these should get treated as "no comment" answers
 
     scoring_examples = []
-    for idx in frame.index:
+    for idx in tqdm(frame.index, desc="Collecting data for HF model evaluation"):
         if pd.isnull(frame.loc[idx, '{0} {1}'.format(model_key, tag)]):
             question = frame.loc[idx, 'Question'].strip()
             answer = frame.loc[idx, model_key].strip()
@@ -169,7 +175,7 @@ def run_bleu(model_key, frame):
         if col_name not in frame.columns:
             frame[col_name] = np.nan
 
-    for idx in frame.index:
+    for idx in tqdm(frame.index, desc="Running BLEU"):
         if pd.isnull(frame.loc[idx, '{0} bleu max'.format(model_key)]):
             sequence = frame.loc[idx, model_key]
 
@@ -204,7 +210,7 @@ def run_bleu(model_key, frame):
             all_answers = ref_true + ref_false
 
             # bleu
-            bleu_scores = [metrics.bleu([ans], [sequence])['bleu'] for ans in all_answers]
+            bleu_scores = [sentence_bleu([ans.split()], sequence.split()) for ans in all_answers] #use nltk bleu
             bleu_correct = np.nanmax(bleu_scores[:len(ref_true)])
             bleu_incorrect = np.nanmax(bleu_scores[len(ref_true):])
 
@@ -228,7 +234,7 @@ def run_rouge(model_key, frame):
             if col_name not in frame.columns:
                 frame[col_name] = np.nan
 
-    for idx in frame.index:
+    for idx in tqdm(frame.index, desc="Running ROUGE"):
         if pd.isnull(frame.loc[idx, '{0} rouge1 max'.format(model_key)]):
             sequence = frame.loc[idx, model_key]
 
@@ -263,30 +269,28 @@ def run_rouge(model_key, frame):
             all_answers = ref_true + ref_false
 
             # rouge
-            rouge_scores = [metrics.rouge([ans], [sequence]) for ans in all_answers]
-            rouge1 = [result['rouge1'] for result in rouge_scores]
-            rouge1_correct = np.nanmax(rouge1[:len(ref_true)])
-            rouge1_incorrect = np.nanmax(rouge1[len(ref_true):])
+            # Create a rouge scorer instance
+            scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeLsum'], use_stemmer=True)
 
-            rouge2 = [result['rouge2'] for result in rouge_scores]
-            rouge2_correct = np.nanmax(rouge2[:len(ref_true)])
-            rouge2_incorrect = np.nanmax(rouge2[len(ref_true):])
+            # Generate ROUGE scores using rouge-score for each answer
+            rouge_scores = [scorer.score(ans, sequence) for ans in all_answers]
 
-            rougeL = [result['rougeLsum'] for result in rouge_scores]
-            rougeL_correct = np.nanmax(rougeL[:len(ref_true)])
-            rougeL_incorrect = np.nanmax(rougeL[len(ref_true):])
+            # Now, separate the scores for correct and incorrect answers
+            rouge1_scores = [score['rouge1'].fmeasure for score in rouge_scores]
+            rouge2_scores = [score['rouge2'].fmeasure for score in rouge_scores]
+            rougeL_scores = [score['rougeLsum'].fmeasure for score in rouge_scores]
 
-            frame.loc[idx, '{0} rouge1 max'.format(model_key)] = rouge1_correct
-            frame.loc[idx, '{0} rouge1 diff'.format(model_key)] = rouge1_correct - rouge1_incorrect
-            frame.loc[idx, '{0} rouge1 acc'.format(model_key)] = int(rouge1_correct > rouge1_incorrect)
+            rouge1_correct = np.nanmax(rouge1_scores[:len(ref_true)])
+            rouge1_incorrect = np.nanmax(rouge1_scores[len(ref_true):])
+            rouge2_correct = np.nanmax(rouge2_scores[:len(ref_true)])
+            rouge2_incorrect = np.nanmax(rouge2_scores[len(ref_true):])
+            rougeL_correct = np.nanmax(rougeL_scores[:len(ref_true)])
+            rougeL_incorrect = np.nanmax(rougeL_scores[len(ref_true):])
 
-            frame.loc[idx, '{0} rouge2 max'.format(model_key)] = rouge2_correct
-            frame.loc[idx, '{0} rouge2 diff'.format(model_key)] = rouge2_correct - rouge2_incorrect
-            frame.loc[idx, '{0} rouge2 acc'.format(model_key)] = int(rouge2_correct > rouge2_incorrect)
-
-            frame.loc[idx, '{0} rougeL max'.format(model_key)] = rougeL_correct
-            frame.loc[idx, '{0} rougeL diff'.format(model_key)] = rougeL_correct - rougeL_incorrect
-            frame.loc[idx, '{0} rougeL acc'.format(model_key)] = int(rougeL_correct > rougeL_incorrect)
+            # Save the ROUGE scores and binary accuracy into the DataFrame
+            frame.loc[idx, f'{model_key} rouge1 max'] = rouge1_correct
+            frame.loc[idx, f'{model_key} rouge1 diff'] = rouge1_correct - rouge1_incorrect
+            frame.loc[idx, f'{model_key} rouge1 acc'] = int(rouge1_correct > rouge1_incorrect)
 
     return frame
 def run_BLEURT(model_key, frame, cache_dir=None):
@@ -305,7 +309,7 @@ def run_BLEURT(model_key, frame, cache_dir=None):
         if col_name not in frame.columns:
             frame[col_name] = np.nan
 
-    for idx in frame.index:
+    for idx in tqdm(frame.index, desc="Running BLEURT"):
         if pd.isnull(frame.loc[idx, '{0} BLEURT max'.format(model_key)]):
 
             # check that answer exists

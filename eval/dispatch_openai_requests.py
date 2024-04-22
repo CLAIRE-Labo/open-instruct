@@ -4,9 +4,14 @@ Thanks to Graham Neubig for sharing the original code.
 '''
 import asyncio
 from typing import Any, List, Dict
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, OpenAIError
 
-aclient = AsyncOpenAI()
+
+try:
+    aclient = AsyncOpenAI()
+except OpenAIError as e:
+    aclient = None
+    print("OpenAI API key not set. Some functionalities will not be available.")
 
 async def dispatch_openai_chat_requesets(
     messages_list: List[List[Dict[str,Any]]],
