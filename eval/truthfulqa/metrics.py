@@ -4,7 +4,7 @@ import pandas as pd
 from openai import OpenAI
 from datasets import load_metric
 from rouge_score import rouge_scorer
-
+from nltk.translate.bleu_score import sentence_bleu
 from time import sleep
 from eval.truthfulqa.utilities import format_end2end_prompt, split_multi_answer
 from eval.utils import score_completions
