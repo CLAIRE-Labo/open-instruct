@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
 from torch.cuda import memory_allocated
-
 import argparse
 import logging
 import math
@@ -35,7 +34,11 @@ from transformers import (
     OPTForCausalLM,
     BitsAndBytesConfig,
 )
+import sys
+sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from eval.truthfulqa.run_eval import main as run_eval
 
 logger = get_logger(__name__)
 
@@ -58,22 +61,20 @@ else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
 
-def validate_model(model, data_loader, accelerator, tokenizer, args):
-    model.eval()
-    total_eval_loss = 0
-    num_eval_steps = 0
-
-    for batch in data_loader:
-        with torch.no_grad():
-            outputs = model(**batch, use_cache=False)
-            loss = outputs.loss
-            total_eval_loss += accelerator.gather(loss.detach()).sum().item()
-
-        num_eval_steps += 1
-
-    avg_val_loss = total_eval_loss / num_eval_steps
-    model.train()
-    return avg_val_loss
+def log_eval_results_to_wandb(eval_results_path):
+    # Load the summary CSV file
+    try:
+        results_df = pd.read_csv(eval_results_path)
+        results_dict = results_df.iloc[0].to_dict()
+        wandb.log({
+            "BLEURT acc": results_dict.get('BLEURT acc', None),
+            "bleu acc": results_dict.get('bleu acc', None),
+            "rouge1 acc": results_dict.get('rouge1 acc', None),
+            "rouge2 acc": results_dict.get('rouge2 acc', None),
+            "rougeL acc": results_dict.get('rougeL acc', None)
+        })
+    except Exception as e:
+        print(f"Failed to read or log evaluation results: {e}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -438,7 +439,7 @@ def main():
             wandb.login(key=wandb_api_key)
 
             # Initialize wandb
-            wandb.init(project="alignment_as_translation", entity="zeyneptandogan")
+            wandb.init(project="alignment_as_translation", entity="claire-labo")
 
             # Configure wandb logging within Accelerator
             accelerator_log_kwargs["log_with"] = args.report_to
@@ -485,8 +486,8 @@ def main():
         allocated = torch.cuda.memory_allocated(0)
         reserved = torch.cuda.memory_reserved(0)
 
-        print(f"Memory Allocated after loading dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-        print(f"Memory Reserved after loading dataset: {reserved / (1024 ** 3)} GB")
+        #print(f"Memory Allocated after loading dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+        #print(f"Memory Reserved after loading dataset: {reserved / (1024 ** 3)} GB")
     else:
         data_files = {}
         dataset_args = {}
@@ -914,7 +915,23 @@ def main():
             output_dir = f"epoch_{epoch}"
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
+            if args.save_tokenizer:
+                print(f"Saving the tokenizer to {output_dir}...")
+                tokenizer.save_pretrained(output_dir)
             save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
+
+            #evaluate the current epoch model
+            eval_args = Namespace(
+                model_name_or_path=output_dir,
+                tokenizer_name_or_path=output_dir,
+                data_dir=args.eval_data_dir,
+                save_dir=f"{output_dir}/eval_results",  # Save evaluation results
+                metrics=['bleu', 'rouge', 'bleurt'],  # Specify your metrics
+            )
+            run_eval(eval_args)
+            eval_results_path = f"{output_dir}/eval_results/summary.csv"
+            log_eval_results_to_wandb(eval_results_path)
+
 
     if args.with_tracking:
         accelerator.end_training()

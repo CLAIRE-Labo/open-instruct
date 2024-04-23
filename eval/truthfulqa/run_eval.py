@@ -433,17 +433,17 @@ def main(args):
         json.dump(results, f, indent=2)
 
 
-if __name__ == '__main__':
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name_or_path", 
-        type=str, 
+        "--model_name_or_path",
+        type=str,
         help="The HuggingFace model to be evaluated."
     )
     parser.add_argument(
-        "--tokenizer_name_or_path", 
-        type=str, 
-        default=None, 
+        "--tokenizer_name_or_path",
+        type=str,
+        default=None,
         help="If specified, we will load the tokenizer from here."
     )
     parser.add_argument(
@@ -452,80 +452,81 @@ if __name__ == '__main__':
         help="If given, we will use the slow tokenizer."
     )
     parser.add_argument(
-        "--openai_engine", 
-        type=str, 
-        default=None, 
+        "--openai_engine",
+        type=str,
+        default=None,
         help="If specified, we will evaluate the OpenAI engine."
     )
     parser.add_argument(
-        "--data_dir", 
-        type=str, 
-        default="data/eval/truthfulqa", 
+        "--data_dir",
+        type=str,
+        default="data/eval/truthfulqa",
         help="The directory containing the truthfulqa data. Download from https://github.com/sylinrl/TruthfulQA/tree/main/data."
     )
     parser.add_argument(
-        "--save_dir", 
-        type=str, 
-        default="results/truthfulqa/", 
+        "--save_dir",
+        type=str,
+        default="results/truthfulqa/",
         help="The directory to save the results."
     )
     parser.add_argument(
-        "--num_instances", 
-        type=int, 
-        default=None, 
+        "--num_instances",
+        type=int,
+        default=None,
         help="The number of instances to evaluate. If not given, we will evaluate all instances."
     )
     parser.add_argument(
-        "--load_in_8bit", 
-        action="store_true", 
+        "--load_in_8bit",
+        action="store_true",
         help="Load model in 8bit mode, which will reduce memory and speed up inference."
     )
     parser.add_argument(
-        "--gptq", 
-        action="store_true", 
+        "--gptq",
+        action="store_true",
         help="If given, we're evaluating a 4-bit quantized GPTQ model."
     )
     parser.add_argument(
-        "--eval_batch_size", 
-        type=int, 
-        default=1, 
+        "--eval_batch_size",
+        type=int,
+        default=1,
         help="batch size for evaluation."
     )
     parser.add_argument(
-        "--use_chat_format", 
-        action="store_true", 
+        "--use_chat_format",
+        action="store_true",
         help="If given, we will use the chat format for the prompts."
     )
     parser.add_argument(
-        "--chat_formatting_function", 
-        type=str, 
-        default="eval.templates.create_prompt_with_finetuned_olmo1b_chat_format",  #"eval.templates.create_prompt_with_tulu_chat_format",
+        "--chat_formatting_function",
+        type=str,
+        default="eval.templates.create_prompt_with_finetuned_olmo1b_chat_format",
+        # "eval.templates.create_prompt_with_tulu_chat_format",
         help="The function to use to create the chat format. This function will be dynamically imported. Please see examples in `eval/templates.py`."
     )
     parser.add_argument(
-        '--metrics', 
-        nargs='+', 
+        '--metrics',
+        nargs='+',
         default=['bleu', 'rouge', 'bleurt'],
         choices=['truth', 'info', 'mc', 'bleu', 'rouge', 'bleurt'],
         help='Metrics to run'
     )
     parser.add_argument(
-        '--preset', 
-        type=str, 
-        default='qa', 
+        '--preset',
+        type=str,
+        default='qa',
         help='Preset to use for prompt generation. Please see presets.py for options.'
     )
     parser.add_argument(
-        '--gpt_truth_model_name', 
-        type=str, 
+        '--gpt_truth_model_name',
+        type=str,
         help='A trained GPT judge model name to be used for computing the metrics for `truth` if it is specified.' \
              'Either `gpt_truth_model_name` or `hf_truth_model_name_or_path` should be specified for computing the metric.'
     )
     parser.add_argument(
-        '--gpt_info_model_name', 
-        type=str, 
+        '--gpt_info_model_name',
+        type=str,
         help='A trained GPT judge model name to be used for computing the metrics for `info` if it is specified.' \
-            'Either `gpt_info_model_name` or `hf_info_model_name_or_path` should be specified for computing the metric.'
+             'Either `gpt_info_model_name` or `hf_info_model_name_or_path` should be specified for computing the metric.'
     )
     parser.add_argument(
         '--hf_truth_model_name_or_path',
@@ -537,7 +538,10 @@ if __name__ == '__main__':
         '--hf_info_model_name_or_path',
         type=str,
         help='A trained HuggingFace judge model name to be used for computing the metrics for `info` if it is specified.' \
-            'Either `gpt_info_model_name` or `hf_info_model_name_or_path` should be specified for computing the metric.'
+             'Either `gpt_info_model_name` or `hf_info_model_name_or_path` should be specified for computing the metric.'
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+if __name__ == '__main__':
+    args = parse_args()
     main(args)
