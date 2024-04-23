@@ -4,18 +4,22 @@ import pandas as pd
 from openai import OpenAI
 from datasets import load_metric
 from rouge_score import rouge_scorer
-from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from time import sleep
 from eval.truthfulqa.utilities import format_end2end_prompt, split_multi_answer
 from eval.utils import score_completions
 from tqdm import tqdm
 import os
 from eval.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
+from bleurt import score
 
 import logging
 logger = logging.getLogger()
 logger.setLevel(logging.CRITICAL)
 
+# Load the BLEURT scorer
+checkpoint = "BLEURT-20"
+bleurt_scorer = score.BleurtScorer(checkpoint)
 
 def MC_calcs(tag, frame, idx, scores_true, scores_false, ref_true, ref_best):
     """Given model scores for true / false reference answers, calculates MC scores"""
@@ -210,7 +214,8 @@ def run_bleu(model_key, frame):
             all_answers = ref_true + ref_false
 
             # bleu
-            bleu_scores = [sentence_bleu([ans.split()], sequence.split()) for ans in all_answers] #use nltk bleu
+            smoothie = SmoothingFunction().method1  # method1 to method7 are available
+            bleu_scores = [sentence_bleu([ans.split()], sequence.split(), smoothing_function=smoothie) for ans in all_answers] #use nltk bleu
             bleu_correct = np.nanmax(bleu_scores[:len(ref_true)])
             bleu_incorrect = np.nanmax(bleu_scores[len(ref_true):])
 
@@ -288,9 +293,17 @@ def run_rouge(model_key, frame):
             rougeL_incorrect = np.nanmax(rougeL_scores[len(ref_true):])
 
             # Save the ROUGE scores and binary accuracy into the DataFrame
-            frame.loc[idx, f'{model_key} rouge1 max'] = rouge1_correct
-            frame.loc[idx, f'{model_key} rouge1 diff'] = rouge1_correct - rouge1_incorrect
-            frame.loc[idx, f'{model_key} rouge1 acc'] = int(rouge1_correct > rouge1_incorrect)
+            frame.loc[idx, '{0} rouge1 max'.format(model_key)] = rouge1_correct
+            frame.loc[idx, '{0} rouge1 diff'.format(model_key)] = rouge1_correct - rouge1_incorrect
+            frame.loc[idx, '{0} rouge1 acc'.format(model_key)] = int(rouge1_correct > rouge1_incorrect)
+
+            frame.loc[idx, '{0} rouge2 max'.format(model_key)] = rouge2_correct
+            frame.loc[idx, '{0} rouge2 diff'.format(model_key)] = rouge2_correct - rouge2_incorrect
+            frame.loc[idx, '{0} rouge2 acc'.format(model_key)] = int(rouge2_correct > rouge2_incorrect)
+
+            frame.loc[idx, '{0} rougeL max'.format(model_key)] = rougeL_correct
+            frame.loc[idx, '{0} rougeL diff'.format(model_key)] = rougeL_correct - rougeL_incorrect
+            frame.loc[idx, '{0} rougeL acc'.format(model_key)] = int(rougeL_correct > rougeL_incorrect)
 
     return frame
 def run_BLEURT(model_key, frame, cache_dir=None):
@@ -301,9 +314,6 @@ def run_BLEURT(model_key, frame, cache_dir=None):
 
     model_key: Column name of model answers (populate before running metrics)
     """
-
-    bleurt = load_metric("bleurt", cache_dir=cache_dir)
-
     for calc in ['max', 'diff', 'acc']:
         col_name = '{0} BLEURT {1}'.format(model_key, calc)
         if col_name not in frame.columns:
@@ -342,10 +352,13 @@ def run_BLEURT(model_key, frame, cache_dir=None):
             ref_false = split_multi_answer(frame.loc[idx, INCORRECT_COL])
 
             try:
-                scores_true = bleurt.compute(predictions=[frame.loc[idx, model_key]] * len(ref_true),
-                                             references=ref_true)['scores']
-                scores_false = bleurt.compute(predictions=[frame.loc[idx, model_key]] * len(ref_false),
-                                              references=ref_false)['scores']
+                predictions = [frame.loc[idx, model_key]] * (len(ref_true) + len(ref_false))
+                references = ref_true + ref_false
+
+                scores = bleurt_scorer.score(references=references, candidates=predictions)
+                scores_true = scores[:len(ref_true)]
+                scores_false = scores[len(ref_true):]
+
             except Exception as err:
                 print(err)
                 continue

@@ -819,14 +819,7 @@ def main():
 
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
-    """
-    val_dataloader = DataLoader(
-        validation_dataset,
-        shuffle=True, 
-        collate_fn=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest"),
-        batch_size=args.per_device_eval_batch_size 
-    )
-    """
+
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_loss = 0
@@ -915,14 +908,6 @@ def main():
                 if completed_steps >= args.max_train_steps:
                     break
 
-                """
-                val_loss = validate_model(model, val_dataloader, accelerator, tokenizer, args)
-                logger.info(f"Validation loss after epoch {epoch + 1}: {val_loss}")
-                if args.with_tracking:
-                    accelerator.log({
-                        "val_loss": val_loss,
-                    }, step=completed_steps)
-                """
 
         print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
         if args.checkpointing_steps == "epoch":

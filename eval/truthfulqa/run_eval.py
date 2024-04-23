@@ -3,7 +3,7 @@ import os
 import json
 import torch
 import pandas as pd
-
+import os
 import sys
 sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
 
@@ -294,6 +294,8 @@ def main(args):
             device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
             gptq_model=args.gptq,
         )
+        args.hf_truth_model_name_or_path = args.model_name_or_path
+        args.hf_info_model_name_or_path = args.model_name_or_path
         from transformers import GPTNeoXForCausalLM, OPTForCausalLM
         allowable_metrics = ['truth', 'info', 'mc', 'bleu', 'rouge', 'bleurt']
         if isinstance(model, GPTNeoXForCausalLM) or isinstance(model, OPTForCausalLM):
@@ -347,34 +349,38 @@ def main(args):
     print("Running metrics!")
 
     model_key = args.model_name_or_path if args.model_name_or_path else args.openai_engine
-    print(questions)
+    #print(questions)
     for metric in args.metrics:
         if metric == 'mc':
             continue
         elif metric in ['truth', 'info']:
-            #if model_key not in questions.columns:
-            #    raise ValueError("Answers missing for {0}!".format(model_key))
+            if model_key not in questions.columns:
+                raise ValueError("Answers missing for {0}!".format(model_key))
             try:
                 if metric == 'truth':
+                    print("entered truth")
                     if args.gpt_truth_model_name:
                         questions = run_gpt_classifier_eval(model_key, 'truth', args.gpt_truth_model_name, questions, info=False)
                     elif args.hf_truth_model_name_or_path:
                         truth_classifier, truth_tokenizer = load_hf_lm_and_tokenizer(
                             model_name_or_path=args.hf_truth_model_name_or_path, 
                             tokenizer_name_or_path=args.hf_truth_model_name_or_path,
-                            device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
+                            #device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
                         )
                         questions = run_hf_classifier_eval(model_key, 'truth', truth_classifier, truth_tokenizer, questions, info=False)
+                    print(questions.columns)
                     save_questions(questions, args.save_dir, "predictions.csv")
-                else:
+                if metric == 'info':
+                    print("entered info")
                     if args.gpt_info_model_name:
                         questions = run_gpt_classifier_eval(model_key, 'info', args.gpt_info_model_name, questions, info=True)
                     elif args.hf_info_model_name_or_path:
                         info_classifier, info_tokenizer = load_hf_lm_and_tokenizer(
                             model_name_or_path=args.hf_info_model_name_or_path, 
                             tokenizer_name_or_path=args.hf_info_model_name_or_path,
-                            device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
+                            #device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
                         )
+                        print(questions.columns)
                         questions = run_hf_classifier_eval(model_key, 'info', info_classifier, info_tokenizer, questions, info=True)
                     save_questions(questions, args.save_dir, "predictions.csv")
             except Exception as err:
@@ -411,6 +417,8 @@ def main(args):
     results = results[results['Metric'].isin(['MC1', 'MC2',
                                               'bleu acc',
                                               'rouge1 acc',
+                                              'rouge2 acc',
+                                              'rougeL acc',
                                               'BLEURT acc',
                                               'truth acc',
                                               'info acc',
@@ -497,7 +505,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--metrics', 
         nargs='+', 
-        default=['truth', 'info','bleu', 'rouge', 'bleurt'],
+        default=['bleu', 'rouge', 'bleurt'],
         choices=['truth', 'info', 'mc', 'bleu', 'rouge', 'bleurt'],
         help='Metrics to run'
     )

@@ -8,7 +8,7 @@ from importlib import import_module
 from transformers import StoppingCriteria
 from eval.dispatch_openai_requests import dispatch_openai_chat_requesets, dispatch_openai_prompt_requesets
 import warnings
-
+import os
 
 class KeyWordsCriteria(StoppingCriteria):
     def __init__(self, stop_id_sequences):
@@ -26,7 +26,7 @@ class KeyWordsCriteria(StoppingCriteria):
             sequences_should_be_stopped.append(sequence_should_be_stopped)
         return all(sequences_should_be_stopped)
     
-    
+
 @torch.no_grad()
 def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequences=None, add_special_tokens=True, disable_tqdm=False, **generation_kwargs):
     generations = []
@@ -249,7 +249,7 @@ def load_hf_lm(
         if device_map:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name_or_path,
-                device_map=device_map,
+                #device_map=device_map,
                 torch_dtype=torch_dtype,
                 token=token,
                 trust_remote_code=trust_remote_code,

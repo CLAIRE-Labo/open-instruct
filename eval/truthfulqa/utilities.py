@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from eval.truthfulqa.presets import preset_map, COMPARE_PRIMER
-
+import os
 
 def load_questions(filename='questions.csv'):
 
