@@ -5,6 +5,30 @@ import torch
 import pandas as pd
 import os
 import sys
+from bleurt import score
+import tensorflow as tf
+import gpustat
+def get_gpu_memory():
+    stats = gpustat.new_query()
+    return [gpu.memory_total for gpu in stats.gpus]
+
+# Get total memory of the first GPU in MB
+total_memory = get_gpu_memory()[0]
+memory_limit_percentage = 0.4
+memory_limit = int(total_memory * memory_limit_percentage)
+
+# Configure the GPU memory allocation
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_virtual_device_configuration(
+                gpu,
+                [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=memory_limit)]
+            )
+    except RuntimeError as e:
+        print("Error setting memory limit:", e)
+
 sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
 
 import warnings
@@ -28,7 +52,7 @@ from eval.truthfulqa.utilities import (
 from eval.truthfulqa.metrics import run_gpt_classifier_eval, run_hf_classifier_eval, MC_calcs, run_bleu, run_rouge, run_BLEURT
 from eval.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
 
-
+bleurt_scorer=None
 def trim_answer(answer):
     # remove spaces at the beginning and end
     answer = answer.strip()
@@ -213,7 +237,7 @@ def run_hf_model(questions, model, tokenizer, tag, preset="qa", batch_size=1, ma
     for idx, completion in zip(questions.index, completions):
         questions.loc[idx, tag] = trim_answer(completion) if not chat_formatting_function else completion
 
-    questions.to_csv("results/answer_model.csv", index=False)
+    questions.to_csv(f"results/{args.filename_answers}.csv", index=False)
     return questions
 
 
@@ -275,6 +299,7 @@ def format_frame(results):
 
 
 def main(args):
+    global bleurt_scorer
     os.makedirs(args.save_dir, exist_ok=True)
     questions = pd.read_csv(os.path.join(args.data_dir, "TruthfulQA.csv"))
 
@@ -303,7 +328,7 @@ def main(args):
             print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
         if any(metric in allowable_metrics for metric in args.metrics):
             print("Running generations!")
-            if not os.path.exists("results/answer_model.csv"):
+            if not os.path.exists(f"results/{args.filename_answers}.csv"):
                 run_hf_model(
                     questions,
                     model,
@@ -314,7 +339,7 @@ def main(args):
                     chat_formatting_function=dynamic_import_function(args.chat_formatting_function) if args.use_chat_format else None
                 )
             else:
-                questions = pd.read_csv("results/answer_model.csv")
+                questions = pd.read_csv(f"results/{args.filename_answers}.csv")
         if "mc" in args.metrics:
             print("Running multiple-choice classification!")
             run_hf_model_mc(
@@ -392,7 +417,12 @@ def main(args):
                 elif metric == 'rouge':
                     questions = run_rouge(model_key, questions)
                 elif metric == 'bleurt':
-                    questions = run_BLEURT(model_key, questions)
+
+                    checkpoint = "BLEURT-20"
+                    if bleurt_scorer==None:
+                        bleurt_scorer = score.BleurtScorer(checkpoint)
+
+                    questions = run_BLEURT(model_key, questions, bleurt_scorer)
                 save_questions(questions, args.save_dir, "predictions.csv")
             except Exception as err:
                 print(f"Error running {metric} metric: {err}")
@@ -468,6 +498,12 @@ def parse_args():
         type=str,
         default="results/truthfulqa/",
         help="The directory to save the results."
+    )
+    parser.add_argument(
+        "--filename_answers",
+        type=str,
+        default="answer_model_tmp",
+        help="The directory to save the results/answers ."
     )
     parser.add_argument(
         "--num_instances",

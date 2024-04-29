@@ -61,13 +61,11 @@ def parse_args():
     )
     return parser.parse_args()
 
-
-if __name__ == "__main__":
-    args = parse_args()
+def main(args):
     peft_config = PeftConfig.from_pretrained(args.lora_model_name_or_path)
     print("Loading the base model...")
     if args.qlora:
-        quantization_config=BitsAndBytesConfig(
+        quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
@@ -91,14 +89,14 @@ if __name__ == "__main__":
     lora_model = PeftModel.from_pretrained(base_model, args.lora_model_name_or_path)
     print("Merging the lora modules...")
     merged_model = lora_model.merge_and_unload()
-    
+
     output_dir = args.output_dir if args.output_dir else args.lora_model_name_or_path
     os.makedirs(output_dir, exist_ok=True)
 
     # If tokenizer is specified, use it. Otherwise, use the tokenizer in the lora model folder or the base model folder.
     if args.tokenizer_name_or_path:
         print(f"Loading the tokenizer from {args.tokenizer_name_or_path}...")
-        #tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path, use_fast=args.use_fast_tokenizer)
+        # tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path, use_fast=args.use_fast_tokenizer)
         tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer_name_or_path,
             trust_remote_code=True,
@@ -114,13 +112,18 @@ if __name__ == "__main__":
 
     embedding_size = merged_model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
-        print(f"The vocabulary the tokenizer contains {len(tokenizer)-embedding_size} more tokens than the base model.")
+        print(
+            f"The vocabulary the tokenizer contains {len(tokenizer) - embedding_size} more tokens than the base model.")
         print("Resizing the token embeddings of the merged model...")
         merged_model.resize_token_embeddings(len(tokenizer))
-    
+
     print(f"Saving merged model to {output_dir}...")
     merged_model.save_pretrained(output_dir)
 
     if args.save_tokenizer:
         print(f"Saving the tokenizer to {output_dir}...")
         tokenizer.save_pretrained(output_dir)
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)

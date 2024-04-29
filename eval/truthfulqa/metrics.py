@@ -17,9 +17,6 @@ import logging
 logger = logging.getLogger()
 logger.setLevel(logging.CRITICAL)
 
-# Load the BLEURT scorer
-checkpoint = "BLEURT-20"
-bleurt_scorer = score.BleurtScorer(checkpoint)
 
 def MC_calcs(tag, frame, idx, scores_true, scores_false, ref_true, ref_best):
     """Given model scores for true / false reference answers, calculates MC scores"""
@@ -306,7 +303,7 @@ def run_rouge(model_key, frame):
             frame.loc[idx, '{0} rougeL acc'.format(model_key)] = int(rougeL_correct > rougeL_incorrect)
 
     return frame
-def run_BLEURT(model_key, frame, cache_dir=None):
+def run_BLEURT(model_key, frame, bleurt_scorer=None, cache_dir=None):
 
     """
     Taken from truthfulQA
@@ -354,7 +351,8 @@ def run_BLEURT(model_key, frame, cache_dir=None):
             try:
                 predictions = [frame.loc[idx, model_key]] * (len(ref_true) + len(ref_false))
                 references = ref_true + ref_false
-
+                if bleurt_scorer==None:
+                    bleurt_scorer =  score.BleurtScorer(checkpoint)
                 scores = bleurt_scorer.score(references=references, candidates=predictions)
                 scores_true = scores[:len(ref_true)]
                 scores_false = scores[len(ref_true):]

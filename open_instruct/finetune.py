@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import deepspeed
 import wandb
+from argparse import Namespace
 
 import transformers
 from transformers import (
@@ -31,7 +32,7 @@ from transformers import (
     get_scheduler,
     GPTNeoXTokenizerFast,
     GPT2Tokenizer,
-    OPTForCausalLM,
+     OPTForCausalLM,
     BitsAndBytesConfig,
 )
 import sys
@@ -39,6 +40,8 @@ sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open
 
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from eval.truthfulqa.run_eval import main as run_eval
+from eval.truthfulqa.run_eval import parse_args as parse_args_eval
+from open_instruct.merge_lora import main as merge_lora
 
 logger = get_logger(__name__)
 
@@ -89,6 +92,12 @@ def parse_args():
         type=str,
         default=None,
         help="The configuration name of the dataset to use (via the datasets library).",
+    )
+    parser.add_argument(
+        "--save_tokenizer",
+        type=bool,
+        default=True,
+        help="Whether to save the tokenizer (default: True)."
     )
     parser.add_argument(
         "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
@@ -203,6 +212,8 @@ def parse_args():
         "--warmup_ratio", type=float, default=0, help="Ratio of total training steps used for warmup."
     )
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
+    parser.add_argument("--merged_output_dir", type=str, default=None, help="Where to store the final merged models.")
+
     parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
     parser.add_argument(
         "--preprocessing_num_workers",
@@ -486,8 +497,8 @@ def main():
         allocated = torch.cuda.memory_allocated(0)
         reserved = torch.cuda.memory_reserved(0)
 
-        #print(f"Memory Allocated after loading dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-        #print(f"Memory Reserved after loading dataset: {reserved / (1024 ** 3)} GB")
+        print(f"Memory Allocated after loading dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+        print(f"Memory Reserved after loading dataset: {reserved / (1024 ** 3)} GB")
     else:
         data_files = {}
         dataset_args = {}
@@ -665,8 +676,8 @@ def main():
     allocated = torch.cuda.memory_allocated(0)
     reserved = torch.cuda.memory_reserved(0)
 
-    #print(f"Memory Allocated after processing dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-    #print(f"Memory Reserved after processing dataset: {reserved / (1024 ** 3)} GB")
+    print(f"Memory Allocated after processing dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+    print(f"Memory Reserved after processing dataset: {reserved / (1024 ** 3)} GB")
     with accelerator.main_process_first():
         lm_datasets = raw_datasets.map(
             encode_function,
@@ -681,8 +692,8 @@ def main():
         allocated = torch.cuda.memory_allocated(0)
         reserved = torch.cuda.memory_reserved(0)
 
-        #print(f"Memory Allocated after tokenizing and reformatting dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-        #print(f"Memory Reserved after tokenizing and reformatting  dataset: {reserved / (1024 ** 3)} GB")
+        print(f"Memory Allocated after tokenizing and reformatting dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+        print(f"Memory Reserved after tokenizing and reformatting  dataset: {reserved / (1024 ** 3)} GB")
 
     train_dataset = lm_datasets["train"]
 
@@ -842,7 +853,7 @@ def main():
             batch_size = len(batch['input_ids'])  # Assuming 'input_ids' is the key for input data
             epoch_data_count += batch_size
             with accelerator.accumulate(model):
-                #print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
+                print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
                 outputs = model(**batch, use_cache=False)
                 print(f"Memory allocated after forward pass: {memory_allocated() / 1e9} GB")
 
@@ -910,28 +921,51 @@ def main():
                     break
 
 
+
         print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
         if args.checkpointing_steps == "epoch":
+            #first save the epoch
             output_dir = f"epoch_{epoch}"
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
-            if args.save_tokenizer:
-                print(f"Saving the tokenizer to {output_dir}...")
-                tokenizer.save_pretrained(output_dir)
             save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
 
-            #evaluate the current epoch model
+            merged_output_dir = ""
+            if args.merged_output_dir is not None:
+                merged_output_dir = os.path.join(args.merged_output_dir, output_dir)
+            # call merge lora to get final situation for epochs
+            merge_args = Namespace(
+                base_model_name_or_path=args.model_name_or_path,
+                tokenizer_name_or_path=args.model_name_or_path,
+                lora_model_name_or_path=output_dir,
+                save_tokenizer=True,
+                qlora=False,
+                use_fast_tokenizer=False,
+                merged_output_dir=merged_output_dir
+            )
+            merge_lora(merge_args)
+
+            # evaluate the current epoch model
             eval_args = Namespace(
-                model_name_or_path=output_dir,
-                tokenizer_name_or_path=output_dir,
-                data_dir=args.eval_data_dir,
-                save_dir=f"{output_dir}/eval_results",  # Save evaluation results
+                model_name_or_path=merged_output_dir,
+                tokenizer_name_or_path=merged_output_dir,
+                data_dir="data/",
+                save_dir=f"{merged_output_dir}/eval_results",  # Save evaluation results
                 metrics=['bleu', 'rouge', 'bleurt'],  # Specify your metrics
+                num_instances=None,
+                preset='qa',
+                eval_batch_size=1,
+                use_chat_format=True,
+                openai_engine=None,
+                chat_formatting_function="eval.templates.create_prompt_with_finetuned_olmo1b_chat_format",
+                use_slow_tokenizer=None,
+                load_in_8bit=False,
+                gptq=False,
+                filename_answers= f"epoch_{epoch}"
             )
             run_eval(eval_args)
-            eval_results_path = f"{output_dir}/eval_results/summary.csv"
+            eval_results_path = f"{merged_output_dir}/eval_results/summary.csv"
             log_eval_results_to_wandb(eval_results_path)
-
 
     if args.with_tracking:
         accelerator.end_training()
@@ -941,7 +975,6 @@ def main():
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
         save_with_accelerate(accelerator, model, tokenizer, args.output_dir, args)
-
 
 if __name__ == "__main__":
     main()
