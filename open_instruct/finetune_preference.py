@@ -4,6 +4,7 @@ from torch.cuda import memory_allocated
 import argparse
 import logging
 import math
+import ast
 import os
 import random
 import datasets
@@ -38,6 +39,7 @@ from transformers import (
     BitsAndBytesConfig,
 )
 import sys
+import subprocess
 
 sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
 
@@ -66,12 +68,9 @@ if api_key_file:
 else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
-
-def log_eval_results_to_wandb(eval_results_path):
+def log_eval_results_to_wandb(result_dict):
     # Load the summary CSV file
     try:
-        results_df = pd.read_csv(eval_results_path)
-        results_dict = results_df.iloc[0].to_dict()
         wandb.log({
             "BLEURT acc": results_dict.get('BLEURT acc', None),
             "bleu acc": results_dict.get('bleu acc', None),
@@ -81,7 +80,6 @@ def log_eval_results_to_wandb(eval_results_path):
         })
     except Exception as e:
         print(f"Failed to read or log evaluation results: {e}")
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -339,7 +337,7 @@ def encode_with_rejected_chosen(example, tokenizer, max_seq_length, add_bos=Fals
 
     def _concat_messages(messages):
         message_text = ""
-        system_message = "For the following prompt and output, your mission is to provide an improved response for the given prompt compared to the given output."
+        system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given output."
         message_text += "<|system|>\n" + system_message + "\n"
         for message in messages:
             if message["role"] == "human":
@@ -353,6 +351,8 @@ def encode_with_rejected_chosen(example, tokenizer, max_seq_length, add_bos=Fals
         return message_text
 
     example_text = _concat_messages(messages).strip()
+    #print(example_text) #to be commented out
+
     if add_bos:
         example_text = tokenizer.bos_token + example_text
 
@@ -504,7 +504,7 @@ def main():
             wandb.login(key=wandb_api_key)
 
             # Initialize wandb
-            wandb.init(project="alignment_as_translation", entity="claire-labo")
+            wandb.init(project="alignment_as_translation", entity="zeyneptandogan")#"claire-labo")
 
             # Configure wandb logging within Accelerator
             accelerator_log_kwargs["log_with"] = args.report_to
@@ -567,7 +567,7 @@ def main():
     #for train
     # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line) -> for now
     updated_dataset_train = raw_datasets['train'].map(add_filtered_msgs)
-    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0)
+    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0).select(range(1000)) # delete this
 
     #for test
     updated_dataset_test = raw_datasets['test'].map(add_filtered_msgs)
@@ -578,8 +578,12 @@ def main():
         'test': filtered_test
     })
 
+    print("Size of training set:", len(filtered_dataset['train']))
+    print("Size of test set:", len(filtered_dataset['test']))
+
     # add info column which will store human, assistant_rejected and assistant_chosen messages
     filtered_dataset["train"] = filtered_dataset["train"].map(extract_role_messages)
+    filtered_dataset["test"] = filtered_dataset["test"].map(extract_role_messages)
 
     # Load pretrained model and tokenizer
     if args.config_name:
@@ -700,6 +704,25 @@ def main():
     # on a small vocab and want a smaller embedding size, remove this test.
     # gather deepspeed to get "real" embedding size
     embeddings = model.get_input_embeddings()
+
+    """
+    num_tokens, embedding_dim = embeddings.weight.size()
+
+    # Create a new embedding tensor for the additional token
+    new_embeddings = torch.nn.Embedding(num_tokens + 1, embedding_dim)
+
+    # Compute the average of all existing embeddings
+    average_embedding = embeddings.weight.data.mean(dim=0)
+
+    # Initialize the last token's embeddings (the new token) with this average
+    new_embeddings.weight.data[-1] = average_embedding
+
+    model.set_input_embeddings(new_embeddings)
+
+    embeddings =model.get_input_embeddings()
+
+    """
+
     with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
         embedding_size = embeddings.weight.shape[0]
         if len(tokenizer) > embeddings.weight.shape[0]:
@@ -988,57 +1011,23 @@ def main():
 
         print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
         if args.checkpointing_steps == "epoch":
-            # first save the epoch
             output_dir = f"epoch_{epoch}"
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
+                tokenizer.save_pretrained(output_dir)
             save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
-
-            merged_output_dir = ""
-            if args.merged_output_dir is not None:
-                merged_output_dir = os.path.join(args.merged_output_dir, output_dir)
-            # call merge lora to get final situation for epochs
-            merge_args = Namespace(
-                base_model_name_or_path=args.model_name_or_path,
-                tokenizer_name_or_path=args.model_name_or_path,
-                lora_model_name_or_path=output_dir,
-                save_tokenizer=True,
-                qlora=False,
-                use_fast_tokenizer=False,
-                merged_output_dir=merged_output_dir
-            )
-            merge_lora(merge_args)
-
-            # evaluate the current epoch model
-            eval_args = Namespace(
-                model_name_or_path=merged_output_dir,
-                tokenizer_name_or_path=merged_output_dir,
-                data_dir="data/",
-                save_dir=f"{merged_output_dir}/eval_results",  # Save evaluation results
-                metrics=['bleu', 'rouge', 'bleurt'],  # Specify your metrics
-                num_instances=None,
-                preset='qa',
-                eval_batch_size=1,
-                use_chat_format=True,
-                openai_engine=None,
-                chat_formatting_function="eval.templates.create_prompt_with_finetuned_olmo1b_chat_format",
-                use_slow_tokenizer=None,
-                load_in_8bit=False,
-                gptq=False,
-                filename_answers=f"epoch_{epoch}"
-            )
-            run_eval(eval_args)
-            eval_results_path = f"{merged_output_dir}/eval_results/summary.csv"
-            log_eval_results_to_wandb(eval_results_path)
-
-    if args.with_tracking:
-        accelerator.end_training()
+            accelerator.wait_for_everyone() #ensure that the files are created
+           
 
     if args.output_dir is not None:
-        accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
         save_with_accelerate(accelerator, model, tokenizer, args.output_dir, args)
+
+
+    accelerator.wait_for_everyone()
+    if args.with_tracking:
+        accelerator.end_training()
 
 
 if __name__ == "__main__":

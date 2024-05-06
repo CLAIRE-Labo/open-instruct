@@ -12,7 +12,7 @@ from tqdm import tqdm
 import os
 from eval.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
 from bleurt import score
-
+import warnings
 import logging
 logger = logging.getLogger()
 logger.setLevel(logging.CRITICAL)

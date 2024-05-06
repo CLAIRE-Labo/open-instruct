@@ -920,52 +920,14 @@ def main():
                 if completed_steps >= args.max_train_steps:
                     break
 
-
-
         print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
         if args.checkpointing_steps == "epoch":
             #first save the epoch
             output_dir = f"epoch_{epoch}"
             if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
+                tokenizer.save_pretrained(output_dir)
             save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
-
-            merged_output_dir = ""
-            if args.merged_output_dir is not None:
-                merged_output_dir = os.path.join(args.merged_output_dir, output_dir)
-            # call merge lora to get final situation for epochs
-            merge_args = Namespace(
-                base_model_name_or_path=args.model_name_or_path,
-                tokenizer_name_or_path=args.model_name_or_path,
-                lora_model_name_or_path=output_dir,
-                save_tokenizer=True,
-                qlora=False,
-                use_fast_tokenizer=False,
-                merged_output_dir=merged_output_dir
-            )
-            merge_lora(merge_args)
-
-            # evaluate the current epoch model
-            eval_args = Namespace(
-                model_name_or_path=merged_output_dir,
-                tokenizer_name_or_path=merged_output_dir,
-                data_dir="data/",
-                save_dir=f"{merged_output_dir}/eval_results",  # Save evaluation results
-                metrics=['bleu', 'rouge', 'bleurt'],  # Specify your metrics
-                num_instances=None,
-                preset='qa',
-                eval_batch_size=1,
-                use_chat_format=True,
-                openai_engine=None,
-                chat_formatting_function="eval.templates.create_prompt_with_finetuned_olmo1b_chat_format",
-                use_slow_tokenizer=None,
-                load_in_8bit=False,
-                gptq=False,
-                filename_answers= f"epoch_{epoch}"
-            )
-            run_eval(eval_args)
-            eval_results_path = f"{merged_output_dir}/eval_results/summary.csv"
-            log_eval_results_to_wandb(eval_results_path)
+            accelerator.wait_for_everyone()  # ensure that the files are created
 
     if args.with_tracking:
         accelerator.end_training()

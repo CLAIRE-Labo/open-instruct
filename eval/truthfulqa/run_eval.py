@@ -14,7 +14,7 @@ def get_gpu_memory():
 
 # Get total memory of the first GPU in MB
 total_memory = get_gpu_memory()[0]
-memory_limit_percentage = 0.4
+memory_limit_percentage = 0.1
 memory_limit = int(total_memory * memory_limit_percentage)
 
 # Configure the GPU memory allocation
@@ -206,7 +206,7 @@ def run_gpt3_mc(questions, engine, tag, preset='qa', batch_size=1, cache_path=No
 
 
 
-def run_hf_model(questions, model, tokenizer, tag, preset="qa", batch_size=1, max_new_tokens=50, chat_formatting_function=None):
+def run_hf_model(questions, model, tokenizer, tag, preset="qa", batch_size=1, max_new_tokens=50, chat_formatting_function=None, storage="tmp"):
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
     print("entered run hf model")
     if tag not in questions.columns:
@@ -235,9 +235,11 @@ def run_hf_model(questions, model, tokenizer, tag, preset="qa", batch_size=1, ma
     # if it's not a chat format, we will do some post-processing for the answer to make sure it's valid
     # otherwise, we will just store the completions as is
     for idx, completion in zip(questions.index, completions):
-        questions.loc[idx, tag] = trim_answer(completion) if not chat_formatting_function else completion
+        x= trim_answer(completion)
 
-    questions.to_csv(f"results/{args.filename_answers}.csv", index=False)
+        questions.loc[idx, tag] = x if not chat_formatting_function else completion
+
+    questions.to_csv(f"results/{storage}.csv", index=False)
     return questions
 
 
@@ -328,18 +330,17 @@ def main(args):
             print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
         if any(metric in allowable_metrics for metric in args.metrics):
             print("Running generations!")
-            if not os.path.exists(f"results/{args.filename_answers}.csv"):
-                run_hf_model(
-                    questions,
-                    model,
-                    tokenizer,
-                    tag=args.model_name_or_path,
-                    preset=args.preset,
-                    batch_size=args.eval_batch_size,
-                    chat_formatting_function=dynamic_import_function(args.chat_formatting_function) if args.use_chat_format else None
-                )
-            else:
-                questions = pd.read_csv(f"results/{args.filename_answers}.csv")
+            run_hf_model(
+                questions,
+                model,
+                tokenizer,
+                tag=args.model_name_or_path,
+                preset=args.preset,
+                batch_size=args.eval_batch_size,
+                chat_formatting_function=dynamic_import_function(
+                    args.chat_formatting_function) if args.use_chat_format else None,
+                storage=args.filename_answers
+            )
         if "mc" in args.metrics:
             print("Running multiple-choice classification!")
             run_hf_model_mc(
