@@ -44,9 +44,9 @@ import subprocess
 sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
 
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-from eval.truthfulqa.run_eval import main as run_eval
-from eval.truthfulqa.run_eval import parse_args as parse_args_eval
-from open_instruct.merge_lora import main as merge_lora
+#from eval.truthfulqa.run_eval import main as run_eval
+#from eval.truthfulqa.run_eval import parse_args as parse_args_eval
+#from open_instruct.merge_lora import main as merge_lora
 
 logger = get_logger(__name__)
 
@@ -504,7 +504,7 @@ def main():
             wandb.login(key=wandb_api_key)
 
             # Initialize wandb
-            wandb.init(project="alignment_as_translation", entity="zeyneptandogan")#"claire-labo")
+            wandb.init(project="alignment_as_translation", entity="claire-labo")
 
             # Configure wandb logging within Accelerator
             accelerator_log_kwargs["log_with"] = args.report_to
@@ -551,8 +551,8 @@ def main():
         allocated = torch.cuda.memory_allocated(0)
         reserved = torch.cuda.memory_reserved(0)
 
-        print(f"Memory Allocated after loading dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-        print(f"Memory Reserved after loading dataset: {reserved / (1024 ** 3)} GB")
+        #print(f"Memory Allocated after loading dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+        #print(f"Memory Reserved after loading dataset: {reserved / (1024 ** 3)} GB")
     else:
         data_files = {}
         dataset_args = {}
@@ -567,7 +567,7 @@ def main():
     #for train
     # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line) -> for now
     updated_dataset_train = raw_datasets['train'].map(add_filtered_msgs)
-    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0).select(range(1000)) # delete this
+    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0)#.select(range(1000)) # delete this
 
     #for test
     updated_dataset_test = raw_datasets['test'].map(add_filtered_msgs)
@@ -639,8 +639,8 @@ def main():
     allocated = torch.cuda.memory_allocated(0)
     reserved = torch.cuda.memory_reserved(0)
 
-    print(f"Memory Allocated after loading model and tokenizer: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-    print(f"Memory Reserved after loading model and tokenizer: {reserved / (1024 ** 3)} GB")
+    #print(f"Memory Allocated after loading model and tokenizer: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+    #print(f"Memory Reserved after loading model and tokenizer: {reserved / (1024 ** 3)} GB")
     if args.model_name_or_path:
         if args.use_qlora:
             bnb_config = BitsAndBytesConfig(
@@ -762,8 +762,8 @@ def main():
     allocated = torch.cuda.memory_allocated(0)
     reserved = torch.cuda.memory_reserved(0)
 
-    print(f"Memory Allocated after processing dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-    print(f"Memory Reserved after processing dataset: {reserved / (1024 ** 3)} GB")
+    #print(f"Memory Allocated after processing dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+    #print(f"Memory Reserved after processing dataset: {reserved / (1024 ** 3)} GB")
     with accelerator.main_process_first():
         lm_datasets = filtered_dataset.map(
             encode_function,
@@ -779,9 +779,8 @@ def main():
         allocated = torch.cuda.memory_allocated(0)
         reserved = torch.cuda.memory_reserved(0)
 
-        print(
-            f"Memory Allocated after tokenizing and reformatting dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-        print(f"Memory Reserved after tokenizing and reformatting  dataset: {reserved / (1024 ** 3)} GB")
+        #print(f"Memory Allocated after tokenizing and reformatting dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+        #print(f"Memory Reserved after tokenizing and reformatting  dataset: {reserved / (1024 ** 3)} GB")
 
     train_dataset = lm_datasets["train"]
 
