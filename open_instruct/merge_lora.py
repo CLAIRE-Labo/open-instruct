@@ -38,8 +38,9 @@ def dequantize_model(model, dtype=torch.bfloat16, device="cuda"):
                 setattr(parent, target_name, new_module)
         # to save model, you have to unset this attribute
         model.is_loaded_in_4bit = False
-        
+
         return model
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -60,6 +61,7 @@ def parse_args():
         required=False,
     )
     return parser.parse_args()
+
 
 def main(args):
     peft_config = PeftConfig.from_pretrained(args.lora_model_name_or_path)
@@ -123,6 +125,7 @@ def main(args):
     if args.save_tokenizer:
         print(f"Saving the tokenizer to {output_dir}...")
         tokenizer.save_pretrained(output_dir)
+
 
 if __name__ == "__main__":
     args = parse_args()
