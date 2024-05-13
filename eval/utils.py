@@ -45,6 +45,7 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
             attention_mask = attention_mask.cuda()
 
         try:
+
             batch_outputs = model.generate(
                 input_ids=batch_input_ids,
                 attention_mask=attention_mask,
@@ -52,7 +53,8 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
                 stopping_criteria=[KeyWordsCriteria(stop_id_sequences)] if stop_id_sequences else None,
                 **generation_kwargs
             )
-        
+
+
             # the stopping criteria is applied at batch level, so if other examples are not stopped, the entire batch will continue to generate.
             # so some outputs still have the stop sequence, which we need to remove.
             if stop_id_sequences:
@@ -247,6 +249,7 @@ def load_hf_lm(
         )
     else:
         if device_map:
+            trust_remote_code=True
             model = AutoModelForCausalLM.from_pretrained(
                 model_name_or_path,
                 #device_map=device_map,

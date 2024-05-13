@@ -44,10 +44,10 @@ sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open
 
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 
-# from eval.truthfulqa.run_eval import main as run_eval
-# from eval.truthfulqa.run_eval import parse_args as parse_args_eval
-# from open_instruct.merge_lora import main as merge_lora
-
+from eval.truthfulqa.run_eval import main as run_eval
+from eval.truthfulqa.run_eval import parse_args as parse_args_eval
+from open_instruct.merge_lora import main as merge_lora
+import pandas as pd
 logger = get_logger(__name__)
 
 try:
@@ -69,19 +69,46 @@ else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
 
-def log_eval_results_to_wandb(result_dict):
+def log_eval_results_to_wandb(csv_path):
     # Load the summary CSV file
     try:
-        wandb.log({
-            "BLEURT acc": results_dict.get('BLEURT acc', None),
-            "bleu acc": results_dict.get('bleu acc', None),
-            "rouge1 acc": results_dict.get('rouge1 acc', None),
-            "rouge2 acc": results_dict.get('rouge2 acc', None),
-            "rougeL acc": results_dict.get('rougeL acc', None)
-        })
+        # Load the summary CSV file
+        results_df = pd.read_csv(csv_path)
+
+        # Assume there's only one row of metrics, typical in a summarised results CSV
+        if not results_df.empty:
+            results_dict = results_df.iloc[0].to_dict()  # Convert the first row to a dictionary
+
+            # Log metrics to wandb
+            metrics_to_log = {
+                "BLEURT acc": results_dict.get('BLEURT acc', None),
+                "bleu acc": results_dict.get('bleu acc', None),
+                "rouge1 acc": results_dict.get('rouge1 acc', None),
+                "rouge2 acc": results_dict.get('rouge2 acc', None),
+                "rougeL acc": results_dict.get('rougeL acc', None)
+            }
+            wandb.log(metrics_to_log)
+        else:
+            print("No data found in the CSV file.")
+
     except Exception as e:
         print(f"Failed to read or log evaluation results: {e}")
 
+import subprocess
+
+def run_evaluation_subprocess(base_path):
+    """ Run the evaluation script as a subprocess. """
+    # Construct the command to execute the Python script
+    command = [
+        'python', '/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct/open_instruct/eval_script.py',
+        '--base_path', base_path
+    ]
+    # Run the command
+    process = subprocess.run(command, capture_output=True, text=True)
+    # Print stdout and stderr from the subprocess
+    print(process.stdout)
+    if process.stderr:
+        print("Errors:", process.stderr)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -505,7 +532,7 @@ def main():
             wandb.login(key=wandb_api_key)
 
             # Initialize wandb
-            wandb.init(project="alignment_as_translation", entity="claire-labo")#"zeyneptandogan")#"claire-labo")
+            wandb.init(project="alignment_as_translation", entity="claire-labo")
 
             # Configure wandb logging within Accelerator
             accelerator_log_kwargs["log_with"] = args.report_to
@@ -569,7 +596,7 @@ def main():
     # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line) -> for now
     updated_dataset_train = raw_datasets['train'].map(add_filtered_msgs)
     filtered_train = updated_dataset_train.filter(
-        lambda x: len(x['rejected_filtered']) > 0)  # .select(range(1000)) # delete this
+        lambda x: len(x['rejected_filtered']) > 0)#.select(range(100)) # delete this
 
     # for test
     updated_dataset_test = raw_datasets['test'].map(add_filtered_msgs)
@@ -666,7 +693,7 @@ def main():
                 revision=args.model_revision
             )
         else:
-            print("load the model")
+            #print("load the model")
             model = AutoModelForCausalLM.from_pretrained(
                 args.model_name_or_path,
                 from_tf=bool(".ckpt" in args.model_name_or_path),
@@ -960,9 +987,9 @@ def main():
             batch_size = len(batch['input_ids'])  # Assuming 'input_ids' is the key for input data
             epoch_data_count += batch_size
             with accelerator.accumulate(model):
-                print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
+                #print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
                 outputs = model(**batch, use_cache=False)
-                print(f"Memory allocated after forward pass: {memory_allocated() / 1e9} GB")
+                #print(f"Memory allocated after forward pass: {memory_allocated() / 1e9} GB")
 
                 if args.reduce_loss == 'mean':
                     loss = outputs.loss
@@ -1036,6 +1063,13 @@ def main():
                 tokenizer.save_pretrained(output_dir)
             save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
             accelerator.wait_for_everyone()  # ensure that the files are created
+            print(output_dir)
+
+            print(f"Running evaluation at the end of epoch {epoch + 1}")
+            run_evaluation_subprocess(output_dir)
+            csv_path=output_dir+"/eval_results/summary.csv"
+            print("log eval results to wandb")
+            log_eval_results_to_wandb(csv_path)
 
     if args.output_dir is not None:
         if accelerator.is_main_process:

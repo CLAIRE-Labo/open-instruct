@@ -68,18 +68,46 @@ if api_key_file:
 else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
-def log_eval_results_to_wandb(result_dict):
+def log_eval_results_to_wandb(csv_path):
     # Load the summary CSV file
     try:
-        wandb.log({
-            "BLEURT acc": results_dict.get('BLEURT acc', None),
-            "bleu acc": results_dict.get('bleu acc', None),
-            "rouge1 acc": results_dict.get('rouge1 acc', None),
-            "rouge2 acc": results_dict.get('rouge2 acc', None),
-            "rougeL acc": results_dict.get('rougeL acc', None)
-        })
+        # Load the summary CSV file
+        results_df = pd.read_csv(csv_path)
+
+        # Assume there's only one row of metrics, typical in a summarised results CSV
+        if not results_df.empty:
+            results_dict = results_df.iloc[0].to_dict()  # Convert the first row to a dictionary
+
+            # Log metrics to wandb
+            metrics_to_log = {
+                "BLEURT acc": results_dict.get('BLEURT acc', None),
+                "bleu acc": results_dict.get('bleu acc', None),
+                "rouge1 acc": results_dict.get('rouge1 acc', None),
+                "rouge2 acc": results_dict.get('rouge2 acc', None),
+                "rougeL acc": results_dict.get('rougeL acc', None)
+            }
+            wandb.log(metrics_to_log)
+        else:
+            print("No data found in the CSV file.")
+
     except Exception as e:
         print(f"Failed to read or log evaluation results: {e}")
+
+import subprocess
+
+def run_evaluation_subprocess(base_path):
+    """ Run the evaluation script as a subprocess. """
+    # Construct the command to execute the Python script
+    command = [
+        'python', '/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct/open_instruct/eval_script.py',
+        '--base_path', base_path
+    ]
+    # Run the command
+    process = subprocess.run(command, capture_output=True, text=True)
+    # Print stdout and stderr from the subprocess
+    print(process.stdout)
+    if process.stderr:
+        print("Errors:", process.stderr)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -567,7 +595,7 @@ def main():
     #for train
     # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line) -> for now
     updated_dataset_train = raw_datasets['train'].map(add_filtered_msgs)
-    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0)#.select(range(1000)) # delete this
+    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0)#.select(range(500)) # delete this
 
     #for test
     updated_dataset_test = raw_datasets['test'].map(add_filtered_msgs)
@@ -1015,8 +1043,16 @@ def main():
                 output_dir = os.path.join(args.output_dir, output_dir)
                 tokenizer.save_pretrained(output_dir)
             save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
-            accelerator.wait_for_everyone() #ensure that the files are created
-           
+            accelerator.wait_for_everyone()  # ensure that the files are created
+            print(output_dir)
+
+            print(f"Running evaluation at the end of epoch {epoch + 1}")
+            run_evaluation_subprocess(output_dir)
+            csv_path=output_dir+"/eval_results/summary.csv"
+            print("log eval results to wandb")
+            log_eval_results_to_wandb(csv_path)
+
+
 
     if args.output_dir is not None:
         if accelerator.is_main_process:

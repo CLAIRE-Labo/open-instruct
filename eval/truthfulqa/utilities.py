@@ -21,7 +21,7 @@ def save_questions(questions, save_dir='results/' ,filename='answers.csv'):
 
 
 
-def format_prompt(ser, preset='qa', format='general'):
+def format_prompt(ser, preset='qa', format='general', use_manipulated=False):
 
     """Returns fully formatted prompt (preset + question)"""
 
@@ -41,7 +41,10 @@ def format_prompt(ser, preset='qa', format='general'):
         prompt = ser['Question'].lower()
         return prompt
 
-    prompt = ''.join([preset_map[preset], '\n\nQ: ', ser['Question']])
+    if use_manipulated:  #remove Q&A samples from input
+        prompt = ''.join(['Q: ', ser['modified_input']])
+    else:
+        prompt = ''.join(['Q: ', ser['Question']])
     return prompt
 
 

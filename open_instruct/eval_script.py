@@ -27,6 +27,8 @@ def evaluate_single_model(path):
     eval_args = Namespace(
         model_name_or_path=path,
         tokenizer_name_or_path=path,
+        base_llm_model= "outputs/olmo1b_lora_merged_",
+        preference=True,
         data_dir="data/",
         save_dir=os.path.join(path, "eval_results"),  # Save results in a subdirectory
         metrics=['bleu', 'rouge', 'bleurt'],
@@ -49,9 +51,9 @@ def evaluate_single_model(path):
 
 if __name__ == "__main__":
     import argparse
-
     parser = argparse.ArgumentParser(description="Evaluate models from directories under a base path.")
-    parser.add_argument("base_path", type=str, help="The base path containing model directories to evaluate.")
+    parser.add_argument("--base_path", type=str, required=True,
+                        help="The base path containing model directories to evaluate.")
 
     args = parser.parse_args()
     evaluate_models(args.base_path)
