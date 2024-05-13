@@ -394,7 +394,7 @@ def format_frame(results):
 def main(args):
     global bleurt_scorer
     os.makedirs(args.save_dir, exist_ok=True)
-    questions = pd.read_csv(os.path.join(args.data_dir, "TruthfulQA.csv")).head(10)
+    questions = pd.read_csv(os.path.join(args.data_dir, "TruthfulQA.csv"))
 
     if args.num_instances is not None:
         questions = questions.sample(args.num_instances, random_state=42)

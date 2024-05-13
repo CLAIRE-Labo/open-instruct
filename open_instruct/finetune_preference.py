@@ -49,7 +49,7 @@ from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_tr
 #from open_instruct.merge_lora import main as merge_lora
 
 logger = get_logger(__name__)
-
+import pandas as pd
 try:
     from hf_olmo import OLMoTokenizerFast
 except ImportError:
@@ -68,7 +68,7 @@ if api_key_file:
 else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
-def log_eval_results_to_wandb(csv_path):
+def log_eval_results_to_wandb(csv_path, accelerator):
     # Load the summary CSV file
     try:
         # Load the summary CSV file
@@ -86,7 +86,7 @@ def log_eval_results_to_wandb(csv_path):
                 "rouge2 acc": results_dict.get('rouge2 acc', None),
                 "rougeL acc": results_dict.get('rougeL acc', None)
             }
-            wandb.log(metrics_to_log)
+            accelerator.log(metrics_to_log)
         else:
             print("No data found in the CSV file.")
 
@@ -1050,7 +1050,7 @@ def main():
             run_evaluation_subprocess(output_dir)
             csv_path=output_dir+"/eval_results/summary.csv"
             print("log eval results to wandb")
-            log_eval_results_to_wandb(csv_path)
+            log_eval_results_to_wandb(csv_path, accelerator)
 
 
 
