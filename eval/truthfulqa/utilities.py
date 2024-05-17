@@ -41,10 +41,10 @@ def format_prompt(ser, preset='qa', format='general', use_manipulated=False):
         prompt = ser['Question'].lower()
         return prompt
 
-    if use_manipulated:  #remove Q&A samples from input
-        prompt = ''.join(['Q: ', ser['modified_input']])
+    if use_manipulated:  #Use Preference preset
+        prompt = ''.join([preset_map[preset],'\n\n Prompt: ', ser['modified_input']])
     else:
-        prompt = ''.join(['Q: ', ser['Question']])
+        prompt = ''.join([preset_map[preset], '\n\nQ: ', ser['Question']])
     return prompt
 
 

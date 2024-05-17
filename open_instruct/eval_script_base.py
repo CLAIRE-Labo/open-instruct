@@ -20,16 +20,15 @@ def evaluate_models(base_path):
             evaluate_single_model(full_path)
 
 
-def evaluate_single_model(args):
-    path=args.base_path
+def evaluate_single_model(path):
     print(f"Evaluating model in {path}")
     filename = os.path.basename(path)
 
     eval_args = Namespace(
         model_name_or_path=path,
         tokenizer_name_or_path=path,
-        base_llm_model= args.base_model,
-        preference=True,
+        base_llm_model= "outputs/olmo1b_lora_merged_",
+        preference=False,
         data_dir="data/",
         save_dir=os.path.join(path, "eval_results"),  # Save results in a subdirectory
         metrics=['bleu', 'rouge', 'bleurt'],
@@ -42,8 +41,7 @@ def evaluate_single_model(args):
         use_slow_tokenizer=None,
         load_in_8bit=False,
         gptq=False,
-        filename_answers=filename,
-        wandb_run_id= args.wandb_run_id
+        filename_answers=filename
     )
     print(f"{filename} started to be evaluated")
     # Run the evaluation
@@ -56,9 +54,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate models from directories under a base path.")
     parser.add_argument("--base_path", type=str, required=True,
                         help="The base path containing model directories to evaluate.")
-    parser.add_argument("--base_model", type=str, default=None, help="Get the base model for comparison")
-    parser.add_argument('--wandb_run_id', type=str, help="Wandb run ID if logging to an existing run")
 
     args = parser.parse_args()
-    evaluate_single_model(args)
-    #evaluate_models(args.base_path)
+    evaluate_models(args.base_path)

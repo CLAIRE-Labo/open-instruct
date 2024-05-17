@@ -8,6 +8,9 @@ import sys
 from bleurt import score
 import tensorflow as tf
 import gpustat
+import random
+import wandb
+
 def get_gpu_memory():
     stats = gpustat.new_query()
     return [gpu.memory_total for gpu in stats.gpus]
@@ -210,7 +213,7 @@ def create_prompt_without_new_token(original_questions, tag, bos="<|endoftext|>"
     for index, row in original_questions.iterrows():
         message_text = ""
         if pd.notna(row['Question']):
-            message_text += "Prompt: " + row['Question'].strip() + "\n"
+            message_text += row['Question'].strip() + "\n"
         if pd.notna(row[tag]):
             message_text += "\n Current rejected answer: " + row[tag].strip() + "\n Corrected output: \n "
             formatted_questions.append(message_text)  # append EOS here
@@ -219,14 +222,13 @@ def create_prompt_without_new_token(original_questions, tag, bos="<|endoftext|>"
     return formatted_questions
 
 def run_hf_model_create_input(questions, model, tokenizer, tag, preset="qa", batch_size=1, max_new_tokens=50,
-                 chat_formatting_function=None, storage="tmp"):
+                 chat_formatting_function=None, storage="tmp", idx_list=[]):
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
     print("entered run_hf_model_create_input model")
     if tag not in questions.columns:
         questions[tag] = ''
     questions[tag].fillna('', inplace=True)
     questions[tag] = questions[tag].astype(str)
-
     prompts = [
         format_prompt(questions.loc[idx], preset, format='general') for idx in questions.index
     ]
@@ -245,6 +247,21 @@ def run_hf_model_create_input(questions, model, tokenizer, tag, preset="qa", bat
     )
     assert len(completions) == len(prompts)
 
+    #print("Randomly selected prompt:", prompts[idx])
+    #print("Completion:", completions[idx])
+    row_data = []
+
+    # Iterate over each index in idx_list to create a separate row_data for each
+    for idx in idx_list:
+        item = {
+            "epoch": storage,
+            "prompt_before":  questions['Question'][idx],
+            "prompt_after" : "",
+            "before_translation": completions[idx],
+            "after_translation": ""  # Placeholder for data to be filled later
+        }
+        row_data.append(item)
+
     # if it's not a chat format, we will do some post-processing for the answer to make sure it's valid
     # otherwise, we will just store the completions as is
     for idx, completion in zip(questions.index, completions):
@@ -253,11 +270,11 @@ def run_hf_model_create_input(questions, model, tokenizer, tag, preset="qa", bat
         questions.loc[idx, tag] = x if not chat_formatting_function else completion
 
     questions["modified_input"] = create_prompt_without_new_token(questions, tag, bos="<|endoftext|>", eos="<|endoftext|>")
-    return questions
+    return questions, row_data
 
 
 def run_hf_model_preference(questions, model, tokenizer, tag, preset="qa", batch_size=1, max_new_tokens=50,
-                 chat_formatting_function=None, storage="tmp"):
+                 chat_formatting_function=None, storage="tmp", idx_list=[], text_table=None, row_data={}):
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
     print("entered run hf model")
     if tag not in questions.columns:
@@ -267,15 +284,15 @@ def run_hf_model_preference(questions, model, tokenizer, tag, preset="qa", batch
     questions[tag] = questions[tag].astype(str)
 
     prompts = [
-        format_prompt(questions.loc[idx], preset, format='general', use_manipulated=True) for idx in questions.index
+        format_prompt(questions.loc[idx], preset="pref", format='general', use_manipulated=True) for idx in questions.index
     ]
-    system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given output."
+    system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
 
     if chat_formatting_function is not None:
         for idx, prompt in enumerate(prompts):
             messages = [{"role": "system", "content": system_message}, {"role": "user", "content": prompt}]
             prompts[idx] = chat_formatting_function(messages, tokenizer, add_bos=False)
-            prompt += "A:" if prompt[-1] in ["\n", " "] else " A:"
+            prompt += "Prompt:" if prompt[-1] in ["\n", " "] else " Prompt:"
 
     # get the last token because the tokenizer may add space tokens at the start.
     stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
@@ -286,8 +303,32 @@ def run_hf_model_preference(questions, model, tokenizer, tag, preset="qa", batch
     )
     assert len(completions) == len(prompts)
 
+    #print("Randomly selected prompt:", prompts[idx])
+    #print("Completion:", completions[idx])
+    for row, idx in zip(row_data, idx_list):
+        # Update the 'after_translation' field
+        row["prompt_after"] = prompts[idx]
+        row["after_translation"] = completions[idx]
+
+    for row in row_data:
+        text_table.add_data(
+            row["epoch"],
+            row["prompt_before"],
+            row["prompt_after"],
+            row["before_translation"],
+            row["after_translation"]
+        )
+    print("before after comparison is logged")
+    wandb.log({"samples_evaluation" : text_table})
     # if it's not a chat format, we will do some post-processing for the answer to make sure it's valid
     # otherwise, we will just store the completions as is
+    directory_path = os.path.join('results', storage)
+    if not os.path.exists(directory_path):
+        os.makedirs(directory_path)
+    file_path = os.path.join(directory_path, 'before_after.json')
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(row_data, f, indent=2)
+
     for idx, completion in zip(questions.index, completions):
         x = trim_answer(completion)
 
@@ -395,6 +436,9 @@ def main(args):
     global bleurt_scorer
     os.makedirs(args.save_dir, exist_ok=True)
     questions = pd.read_csv(os.path.join(args.data_dir, "TruthfulQA.csv"))
+    random_indices = random.sample(range(len(questions)), 3)
+    wandb.init(project="alignment_translation", id=args.wandb_run_id, resume="allow")
+    text_table = wandb.Table(columns=["epoch", "prompt_before","prompt_after", "before_translation", "after_translation"])
 
     if args.num_instances is not None:
         questions = questions.sample(args.num_instances, random_state=42)
@@ -414,7 +458,7 @@ def main(args):
                 tokenizer_name_or_path=args.base_llm_model,
                 use_fast_tokenizer=not args.use_slow_tokenizer,
             )
-            questions=run_hf_model_create_input(
+            questions, row_data=run_hf_model_create_input(
                 questions,
                 model,
                 tokenizer,
@@ -423,7 +467,8 @@ def main(args):
                 batch_size=args.eval_batch_size,
                 chat_formatting_function=dynamic_import_function(
                     args.chat_formatting_function) if args.use_chat_format else None,
-                storage=args.filename_answers
+                storage=args.filename_answers,
+                idx_list= random_indices
             )
 
 
@@ -472,7 +517,10 @@ def main(args):
                 batch_size=args.eval_batch_size,
                 chat_formatting_function=dynamic_import_function(
                     args.chat_formatting_function)  if args.use_chat_format else None,
-                storage=args.filename_answers
+                storage=args.filename_answers,
+                idx_list=random_indices,
+                text_table=text_table,
+                row_data=row_data
             )
         if "mc" in args.metrics:
             print("Running multiple-choice classification!")
@@ -723,6 +771,8 @@ def parse_args():
         help='A trained HuggingFace judge model name to be used for computing the metrics for `info` if it is specified.' \
              'Either `gpt_info_model_name` or `hf_info_model_name_or_path` should be specified for computing the metric.'
     )
+    parser.add_argument('--wandb_run_id', type=str, help="Wandb run ID if logging to an existing run")
+
     return parser.parse_args()
 
 if __name__ == '__main__':

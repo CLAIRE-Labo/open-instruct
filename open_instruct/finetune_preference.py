@@ -68,46 +68,44 @@ if api_key_file:
 else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
-def log_eval_results_to_wandb(csv_path, accelerator):
+def log_eval_results_to_wandb(csv_path, epoch):
     # Load the summary CSV file
     try:
         # Load the summary CSV file
         results_df = pd.read_csv(csv_path)
-
+        metrics={}
         # Assume there's only one row of metrics, typical in a summarised results CSV
         if not results_df.empty:
             results_dict = results_df.iloc[0].to_dict()  # Convert the first row to a dictionary
-
-            # Log metrics to wandb
-            metrics_to_log = {
-                "BLEURT acc": results_dict.get('BLEURT acc', None),
-                "bleu acc": results_dict.get('bleu acc', None),
-                "rouge1 acc": results_dict.get('rouge1 acc', None),
-                "rouge2 acc": results_dict.get('rouge2 acc', None),
-                "rougeL acc": results_dict.get('rougeL acc', None)
+            metrics={
+                "BLEURT_acc": results_dict.get('BLEURT acc', None),
+                "bleu_acc": results_dict.get('bleu acc', None),
+                "rouge1_acc": results_dict.get('rouge1 acc', None),
+                "rouge2_acc": results_dict.get('rouge2 acc', None),
+                "rougeL_acc": results_dict.get('rougeL acc', None),
+                "eval_step": epoch + 1
             }
-            accelerator.log(metrics_to_log)
+
         else:
             print("No data found in the CSV file.")
-
+        return metrics
     except Exception as e:
         print(f"Failed to read or log evaluation results: {e}")
 
 import subprocess
 
-def run_evaluation_subprocess(base_path):
+def run_evaluation_subprocess(args,base_path, run_id):
     """ Run the evaluation script as a subprocess. """
     # Construct the command to execute the Python script
     command = [
         'python', '/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct/open_instruct/eval_script.py',
-        '--base_path', base_path
+        '--base_path', base_path,
+        '--base_model', args.base_model_dir,
+        '--wandb_run_id', run_id
     ]
     # Run the command
-    process = subprocess.run(command, capture_output=True, text=True)
-    # Print stdout and stderr from the subprocess
-    print(process.stdout)
-    if process.stderr:
-        print("Errors:", process.stderr)
+    subprocess.run(command, capture_output=True, text=True)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -242,7 +240,7 @@ def parse_args():
         "--warmup_ratio", type=float, default=0, help="Ratio of total training steps used for warmup."
     )
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
-    parser.add_argument("--merged_output_dir", type=str, default=None, help="Where to store the final merged models.")
+    parser.add_argument("--base_model_dir", type=str, default=None, help="Get the base model for comparison")
 
     parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
     parser.add_argument(
@@ -365,7 +363,7 @@ def encode_with_rejected_chosen(example, tokenizer, max_seq_length, add_bos=Fals
 
     def _concat_messages(messages):
         message_text = ""
-        system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given output."
+        system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
         message_text += "<|system|>\n" + system_message + "\n"
         for message in messages:
             if message["role"] == "human":
@@ -532,7 +530,7 @@ def main():
             wandb.login(key=wandb_api_key)
 
             # Initialize wandb
-            wandb.init(project="alignment_as_translation", entity="claire-labo")
+            wandb.init(project="alignment_translation", entity="claire-labo")
 
             # Configure wandb logging within Accelerator
             accelerator_log_kwargs["log_with"] = args.report_to
@@ -595,7 +593,7 @@ def main():
     #for train
     # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line) -> for now
     updated_dataset_train = raw_datasets['train'].map(add_filtered_msgs)
-    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0)#.select(range(500)) # delete this
+    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0)#.select(range(300)) # delete this
 
     #for test
     updated_dataset_test = raw_datasets['test'].map(add_filtered_msgs)
@@ -895,6 +893,17 @@ def main():
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
         accelerator.init_trackers("open_instruct", experiment_config)
 
+    # Define custom step metric for evaluation
+    run_id = wandb.run.id
+
+    wandb.define_metric("eval_step")
+    # Define evaluation metrics with their respective custom step
+    wandb.define_metric("BLEURT_acc", step_metric="eval_step")
+    wandb.define_metric("bleu_acc", step_metric="eval_step")
+    wandb.define_metric("rouge1_acc", step_metric="eval_step")
+    wandb.define_metric("rouge2_acc", step_metric="eval_step")
+    wandb.define_metric("rougeL_acc", step_metric="eval_step")
+
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -968,9 +977,9 @@ def main():
             batch_size = len(batch['input_ids'])  # Assuming 'input_ids' is the key for input data
             epoch_data_count += batch_size
             with accelerator.accumulate(model):
-                print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
+                #print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
                 outputs = model(**batch, use_cache=False)
-                print(f"Memory allocated after forward pass: {memory_allocated() / 1e9} GB")
+                #print(f"Memory allocated after forward pass: {memory_allocated() / 1e9} GB")
 
                 if args.reduce_loss == 'mean':
                     loss = outputs.loss
@@ -1013,8 +1022,7 @@ def main():
                         total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_steps
                     logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
                     # Print number of examples processed so far in this epoch
-                    print(
-                        f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
+                    #print(f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
                     if args.with_tracking:
                         accelerator.log(
                             {
@@ -1047,12 +1055,25 @@ def main():
             print(output_dir)
 
             print(f"Running evaluation at the end of epoch {epoch + 1}")
-            run_evaluation_subprocess(output_dir)
+            run_evaluation_subprocess(args,output_dir, run_id)
             csv_path=output_dir+"/eval_results/summary.csv"
             print("log eval results to wandb")
-            log_eval_results_to_wandb(csv_path, accelerator)
-
-
+            metrics_log=log_eval_results_to_wandb(csv_path, epoch)
+            logger.info(f"Epoch {epoch} Evaluation Metrics: {metrics_log}")
+            if args.with_tracking:
+                # Log evaluation metrics
+                wandb.log(metrics_log)
+                metrics_table = wandb.Table(
+                    columns=["epoch", "BLEURT_acc", "bleu_acc", "rouge1_acc", "rouge2_acc", "rougeL_acc"])
+                metrics_table.add_data(
+                    metrics_log["eval_step"],
+                    metrics_log["BLEURT_acc"],
+                    metrics_log["bleu_acc"],
+                    metrics_log["rouge1_acc"],
+                    metrics_log["rouge2_acc"],
+                    metrics_log["rougeL_acc"]
+                )
+                wandb.log({"Verification Table": metrics_table})
 
     if args.output_dir is not None:
         if accelerator.is_main_process:
