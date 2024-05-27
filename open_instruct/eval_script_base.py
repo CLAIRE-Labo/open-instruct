@@ -1,6 +1,7 @@
 from argparse import Namespace
 import sys
 import os
+import wandb
 sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
 
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
@@ -20,16 +21,17 @@ def evaluate_models(base_path):
             evaluate_single_model(full_path)
 
 
-def evaluate_single_model(path):
+def evaluate_single_model(args):
+    path=args.base_path
     print(f"Evaluating model in {path}")
     filename = os.path.basename(path)
 
     eval_args = Namespace(
         model_name_or_path=path,
         tokenizer_name_or_path=path,
-        base_llm_model= "outputs/olmo1b_lora_merged_",
-        preference=False,
         data_dir="data/",
+        preference=False,
+        base_llm_model=None,
         save_dir=os.path.join(path, "eval_results"),  # Save results in a subdirectory
         metrics=['bleu', 'rouge', 'bleurt'],
         num_instances=None,
@@ -41,7 +43,9 @@ def evaluate_single_model(path):
         use_slow_tokenizer=None,
         load_in_8bit=False,
         gptq=False,
-        filename_answers=filename
+        filename_answers=filename,
+        wandb_run_id= args.wandb_run_id,
+        withToken=args.with_token
     )
     print(f"{filename} started to be evaluated")
     # Run the evaluation
@@ -54,6 +58,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate models from directories under a base path.")
     parser.add_argument("--base_path", type=str, required=True,
                         help="The base path containing model directories to evaluate.")
-
+    parser.add_argument("--base_model", type=str, default=None, help="Get the base model for comparison")
+    #parser.add_argument('--wandb_run_id', type=str, help="Wandb run ID if logging to an existing run")
+    parser.add_argument(
+        "--with_token",
+        action="store_true",
+        help="Set to enable token, no value needed"
+    )
     args = parser.parse_args()
-    evaluate_models(args.base_path)
+    wandb_api_key = os.getenv('WANDB_API_KEY')
+    wandb.login(key=wandb_api_key)
+
+    # Initialize wandb
+    wandb.init(project="alignment_translation", entity="claire-labo")
+
+    args.wandb_run_id = wandb.run.id
+    evaluate_single_model(args)
+    #evaluate_models(args.base_path)

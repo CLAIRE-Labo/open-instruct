@@ -207,74 +207,105 @@ def run_gpt3_mc(questions, engine, tag, preset='qa', batch_size=1, cache_path=No
         MC_calcs(tag, questions, idx, scores_true, scores_false, ref_true, ref_best) 
     return questions
 
-def create_prompt_without_new_token(original_questions, tag, bos="<|endoftext|>", eos="<|endoftext|>"):
+def create_prompt(original_questions, tag, withToken=False, bos="<|endoftext|>", eos="<|endoftext|>"):
     #system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given output."
     formatted_questions = []  # Use a different variable name to store results
-    for index, row in original_questions.iterrows():
-        message_text = ""
-        if pd.notna(row['Question']):
-            message_text += row['Question'].strip() + "\n"
-        if pd.notna(row[tag]):
-            message_text += "\n Current rejected answer: " + row[tag].strip() + "\n Corrected output: \n "
-            formatted_questions.append(message_text)  # append EOS here
-        else:
-            print("Something wrong in the structure")
+    if withToken:
+        for index, row in original_questions.iterrows():
+            message_text = ""
+            if pd.notna(row['Question']):
+                message_text += row['Question'].strip() + "\n"
+            if pd.notna(row[tag]):
+                message_text += "\n <|sample_answer|> " + row[tag].strip() + "\n <|sample_answer|> \n "
+                formatted_questions.append(message_text)  # append EOS here
+            else:
+                print("Something wrong in the structure")
+    else:
+        for index, row in original_questions.iterrows():
+            message_text = ""
+            if pd.notna(row['Question']):
+                message_text += row['Question'].strip() + "\n"
+            if pd.notna(row[tag]):
+                message_text += "\n Current rejected answer: " + row[tag].strip() + "\n Corrected output: \n "
+                formatted_questions.append(message_text)  # append EOS here
+            else:
+                print("Something wrong in the structure")
+
     return formatted_questions
 
-def run_hf_model_create_input(questions, model, tokenizer, tag, preset="qa", batch_size=1, max_new_tokens=50,
-                 chat_formatting_function=None, storage="tmp", idx_list=[]):
+
+def run_hf_model_create_input(withToken, questions, document, tag, preset="qa", batch_size=1, max_new_tokens=50,
+                              chat_formatting_function=None, storage="tmp", idx_list=[]):
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
-    print("entered run_hf_model_create_input model")
-    if tag not in questions.columns:
-        questions[tag] = ''
-    questions[tag].fillna('', inplace=True)
-    questions[tag] = questions[tag].astype(str)
-    prompts = [
-        format_prompt(questions.loc[idx], preset, format='general') for idx in questions.index
-    ]
-    if chat_formatting_function is not None:
-        for idx, prompt in enumerate(prompts):
-            messages = [{"role": "user", "content": prompt}]
-            prompts[idx] = chat_formatting_function(messages, tokenizer, add_bos=False)
-            prompt += "A:" if prompt[-1] in ["\n", " "] else " A:"
+    try:
+        # Check if the CSV already exists
+        if os.path.exists(document):
+            questions = pd.read_csv(document)
+            questions["modified_input"] = create_prompt(questions, tag, withToken=withToken, bos="", eos="")
 
-    # get the last token because the tokenizer may add space tokens at the start.
-    stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
-    completions = generate_completions(
-        model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
-        stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
-        do_sample=False,
-    )
-    assert len(completions) == len(prompts)
+        else:
+            print("entered run_hf_model_create_input model")
+            model = load_hf_lm(
+                model_name_or_path=args.base_llm_model,
+                load_in_8bit=args.load_in_8bit,
+                device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
+                gptq_model=args.gptq
+            )
+            tokenizer = load_hf_tokenizer(
+                model_name_or_path=args.base_llm_model,
+                tokenizer_name_or_path=args.base_llm_model,
+                use_fast_tokenizer=not args.use_slow_tokenizer,
+            )
+            if tag not in questions.columns:
+                questions[tag] = ''
+            questions[tag].fillna('', inplace=True)
+            questions[tag] = questions[tag].astype(str)
+            prompts = [
+                format_prompt(questions.loc[idx], preset, format='general') for idx in questions.index
+            ]
+            if chat_formatting_function is not None:
+                for idx, prompt in enumerate(prompts):
+                    messages = [{"role": "user", "content": prompt}]
+                    prompts[idx] = chat_formatting_function(messages, tokenizer, add_bos=False)
+                    prompt += "A:" if prompt[-1] in ["\n", " "] else " A:"
 
-    #print("Randomly selected prompt:", prompts[idx])
-    #print("Completion:", completions[idx])
-    row_data = []
+            # get the last token because the tokenizer may add space tokens at the start.
+            stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
+            completions = generate_completions(
+                model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
+                stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
+                do_sample=False,
+            )
+            assert len(completions) == len(prompts)
 
-    # Iterate over each index in idx_list to create a separate row_data for each
-    for idx in idx_list:
-        item = {
-            "epoch": storage,
-            "prompt_before":  questions['Question'][idx],
-            "prompt_after" : "",
-            "before_translation": completions[idx],
-            "after_translation": ""  # Placeholder for data to be filled later
-        }
-        row_data.append(item)
+            # Post-processing of completions
+            for idx, completion in zip(questions.index, completions):
+                x = trim_answer(completion)
+                questions.loc[idx, tag] = x if not chat_formatting_function else completion
 
-    # if it's not a chat format, we will do some post-processing for the answer to make sure it's valid
-    # otherwise, we will just store the completions as is
-    for idx, completion in zip(questions.index, completions):
-        x = trim_answer(completion)
+            questions["modified_input"] = create_prompt(questions, tag, withToken=withToken, bos="", eos="")
+            #questions.to_csv(csv_path, index=False)
 
-        questions.loc[idx, tag] = x if not chat_formatting_function else completion
+        row_data = []
+        # Extract row data for specific indices
+        if idx_list:
+            for idx in idx_list:
+                item = {
+                    "epoch": storage,
+                    "prompt_before": questions['Question'][idx],
+                    "prompt_after": "",
+                    "before_translation": questions[tag][idx],
+                    "after_translation": ""  # Placeholder for data to be filled later
+                }
+                row_data.append(item)
 
-    questions["modified_input"] = create_prompt_without_new_token(questions, tag, bos="<|endoftext|>", eos="<|endoftext|>")
-    return questions, row_data
+        return questions, row_data
+    except Exception as e:
+        print(f"An error occurred: {e}")
 
 
-def run_hf_model_preference(questions, model, tokenizer, tag, preset="qa", batch_size=1, max_new_tokens=50,
-                 chat_formatting_function=None, storage="tmp", idx_list=[], text_table=None, row_data={}):
+def run_hf_model_preference(save_dir, withToken, questions, model, tokenizer, tag, preset="qa", batch_size=1, max_new_tokens=50,
+                 chat_formatting_function=None, storage="tmp", idx_list=[], text_table=None, row_data={}, wandb_run=None):
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
     print("entered run hf model")
     if tag not in questions.columns:
@@ -282,10 +313,15 @@ def run_hf_model_preference(questions, model, tokenizer, tag, preset="qa", batch
     print(questions.columns)
     questions[tag].fillna('', inplace=True)
     questions[tag] = questions[tag].astype(str)
-
-    prompts = [
-        format_prompt(questions.loc[idx], preset="pref", format='general', use_manipulated=True) for idx in questions.index
-    ]
+    if withToken:
+        prompts = [
+            format_prompt(questions.loc[idx], preset="pref_with_token", format='general', use_manipulated=True) for idx in
+            questions.index
+        ]
+    else:
+        prompts = [
+            format_prompt(questions.loc[idx], preset="pref", format='general', use_manipulated=True) for idx in questions.index
+        ]
     system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
 
     if chat_formatting_function is not None:
@@ -302,6 +338,9 @@ def run_hf_model_preference(questions, model, tokenizer, tag, preset="qa", batch
         do_sample=False,
     )
     assert len(completions) == len(prompts)
+    if wandb_run:
+        text_table = wandb.Table(
+            columns=["epoch", "prompt_before", "prompt_after", "before_translation", "after_translation"])
 
     #print("Randomly selected prompt:", prompts[idx])
     #print("Completion:", completions[idx])
@@ -310,22 +349,20 @@ def run_hf_model_preference(questions, model, tokenizer, tag, preset="qa", batch
         row["prompt_after"] = prompts[idx]
         row["after_translation"] = completions[idx]
 
-    for row in row_data:
-        text_table.add_data(
-            row["epoch"],
-            row["prompt_before"],
-            row["prompt_after"],
-            row["before_translation"],
-            row["after_translation"]
-        )
-    print("before after comparison is logged")
-    wandb.log({"samples_evaluation" : text_table})
+    if wandb_run:
+        for row in row_data:
+            text_table.add_data(
+                row["epoch"],
+                row["prompt_before"],
+                row["prompt_after"],
+                row["before_translation"],
+                row["after_translation"]
+            )
+        print("before after comparison is logged")
+        wandb.log({f"samples_evaluation_{storage}" : text_table})
     # if it's not a chat format, we will do some post-processing for the answer to make sure it's valid
     # otherwise, we will just store the completions as is
-    directory_path = os.path.join('results', storage)
-    if not os.path.exists(directory_path):
-        os.makedirs(directory_path)
-    file_path = os.path.join(directory_path, 'before_after.json')
+    file_path = os.path.join(save_dir, 'before_after.json')
     with open(file_path, 'w', encoding='utf-8') as f:
         json.dump(row_data, f, indent=2)
 
@@ -334,7 +371,7 @@ def run_hf_model_preference(questions, model, tokenizer, tag, preset="qa", batch
 
         questions.loc[idx, tag] = x if not chat_formatting_function else completion
     print(questions.columns)
-    questions.to_csv(f"results/{storage}.csv", index=False)
+    questions.to_csv(f"{save_dir}/{storage}.csv", index=False)
     return questions
 
 def run_hf_model(questions, model, tokenizer, tag, preset="qa", batch_size=1, max_new_tokens=50, chat_formatting_function=None, storage="tmp"):
@@ -371,7 +408,7 @@ def run_hf_model(questions, model, tokenizer, tag, preset="qa", batch_size=1, ma
 
         questions.loc[idx, tag] = x if not chat_formatting_function else completion
     print(questions.columns)
-    questions.to_csv(f"results/{storage}.csv", index=False)
+    #questions.to_csv(f"results/{storage}.csv", index=False)
     return questions
 
 
@@ -435,10 +472,10 @@ def format_frame(results):
 def main(args):
     global bleurt_scorer
     os.makedirs(args.save_dir, exist_ok=True)
-    questions = pd.read_csv(os.path.join(args.data_dir, "TruthfulQA.csv"))
+    questions = pd.read_csv(os.path.join(args.data_dir, "TruthfulQA.csv"))#.head(10)
     random_indices = random.sample(range(len(questions)), 3)
-    wandb.init(project="alignment_translation", id=args.wandb_run_id, resume="allow")
-    text_table = wandb.Table(columns=["epoch", "prompt_before","prompt_after", "before_translation", "after_translation"])
+    if args.wandb_run_id is not None:
+        wandb.init(project="alignment_translation", id=args.wandb_run_id, resume="allow")
 
     if args.num_instances is not None:
         questions = questions.sample(args.num_instances, random_state=42)
@@ -447,21 +484,10 @@ def main(args):
         print("Loading model and tokenizer...")
 
         if args.preference and args.base_llm_model:
-            model = load_hf_lm(
-                model_name_or_path=args.base_llm_model,
-                load_in_8bit=args.load_in_8bit,
-                device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
-                gptq_model=args.gptq
-            )
-            tokenizer = load_hf_tokenizer(
-                model_name_or_path=args.base_llm_model,
-                tokenizer_name_or_path=args.base_llm_model,
-                use_fast_tokenizer=not args.use_slow_tokenizer,
-            )
             questions, row_data=run_hf_model_create_input(
+                args.withToken,
                 questions,
-                model,
-                tokenizer,
+                document=args.document,
                 tag=args.base_llm_model,
                 preset=args.preset,
                 batch_size=args.eval_batch_size,
@@ -470,7 +496,8 @@ def main(args):
                 storage=args.filename_answers,
                 idx_list= random_indices
             )
-
+        else:
+            print("no preference for now, get initial prompt answers")
 
         print(args.model_name_or_path)
         tokenizer = load_hf_tokenizer(
@@ -494,7 +521,7 @@ def main(args):
             tokenizer.model_max_length = model.config.max_position_embeddings
             print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
         if any(metric in allowable_metrics for metric in args.metrics) and args.preference==False:
-            print("Running generations!")
+            print("Running generations - no pref!")
             run_hf_model(
                 questions,
                 model,
@@ -509,6 +536,8 @@ def main(args):
         if any(metric in allowable_metrics for metric in args.metrics) and args.preference==True:
             print("Running generations preference!")
             run_hf_model_preference(
+                args.save_dir,
+                args.withToken,
                 questions,
                 model,
                 tokenizer,
@@ -519,7 +548,6 @@ def main(args):
                     args.chat_formatting_function)  if args.use_chat_format else None,
                 storage=args.filename_answers,
                 idx_list=random_indices,
-                text_table=text_table,
                 row_data=row_data
             )
         if "mc" in args.metrics:
@@ -655,6 +683,12 @@ def parse_args():
         help="The HuggingFace model to be evaluated as base llm."
     )
     parser.add_argument(
+        "--document",
+        type=str,
+        default=None,
+        help="csv path of the base (rejected) results."
+    )
+    parser.add_argument(
         "--preference",
         action="store_true",
         default=False,
@@ -771,7 +805,13 @@ def parse_args():
         help='A trained HuggingFace judge model name to be used for computing the metrics for `info` if it is specified.' \
              'Either `gpt_info_model_name` or `hf_info_model_name_or_path` should be specified for computing the metric.'
     )
-    parser.add_argument('--wandb_run_id', type=str, help="Wandb run ID if logging to an existing run")
+    parser.add_argument(
+        "--withToken",
+        action="store_true",
+        help="Set to enable token, no value needed"
+    )
+    parser.add_argument('--wandb_run_id', type=str, help="wandb_run_id to store")
+    parser.add_argument('--with_token', action='store_true', help="Set to enable token, no value needed")
 
     return parser.parse_args()
 

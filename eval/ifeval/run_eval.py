@@ -2,6 +2,7 @@
 This script is adapted from the official IFEVAL evaluation script:
 https://github.com/google-research/google-research/tree/master/instruction_following_eval
 '''
+import sys
 
 import argparse
 import os
@@ -9,10 +10,13 @@ import re
 import json
 import torch
 import random
-import vllm
+#import vllm
 import dataclasses
 import collections
 from typing import Dict, List, Optional, Union
+sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+import nltk
+nltk.download('punkt')
 
 from eval.utils import (
     load_hf_lm,
@@ -215,7 +219,7 @@ def main(args):
     random.seed(42)
 
     inputs = read_prompt_list(os.path.join(args.data_dir, "input_data.jsonl"))
-
+    #inputs=inputs[0:5]
     os.makedirs(args.save_dir, exist_ok=True)
 
     # Load model if not using OpenAI API
@@ -247,20 +251,55 @@ def main(args):
                 tokenizer.model_max_length = model.config.max_position_embeddings
                 print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
 
+    response_dict = {}
     if args.model_name_or_path:
-        # prepare prompts    
+        # prepare prompts
+
         if args.use_chat_format:
-            prompts = []
-            chat_formatting_function = dynamic_import_function(args.chat_formatting_function)
-            for inp in inputs:
-                prompts.append(
-                    chat_formatting_function(
-                        [{"role": "user", "content": inp.prompt}], tokenizer, add_bos=False
+            if args.preference:
+                base_response_dict={}
+                base_response_file_path = os.path.join(args.base_dir, "response_dict.jsonl")
+
+                # Check if the file exists
+                if os.path.exists(base_response_file_path):
+                    # If file exists, read the contents into the response_dict
+                    with open(base_response_file_path, 'r') as file:
+                        for line in file:
+                            data = json.loads(line)
+                            base_response_dict[data['prompt']] = data['response']
+
+                    formatted_questions = []
+                    for question, tag_response in base_response_dict.items():
+                        message_text = ""
+                        message_text = question.strip() + "\n"  #
+                        # Use the response from base_response_dict if it exists for the current question
+                        if question in base_response_dict:
+                            response = base_response_dict[question]
+                        else:
+                            raise ValueError("No response for the specific question")
+                        message_text += "\nCurrent rejected answer: " + response + "\nCorrected output: \n"
+                        formatted_questions.append(message_text)
+
+                    system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
+                    prompts = formatted_questions
+                    chat_formatting_function = dynamic_import_function(args.chat_formatting_function)
+                    for idx, prompt in enumerate(prompts):
+                        messages = [{"role": "system", "content": system_message},
+                                    {"role": "user", "content": prompt}]
+                        prompts[idx] = chat_formatting_function(messages, tokenizer, add_bos=False)
+
+            else:
+                prompts = []
+                chat_formatting_function = dynamic_import_function(args.chat_formatting_function)
+                for inp in inputs:
+                    prompts.append(
+                        chat_formatting_function(
+                            [{"role": "user", "content": inp.prompt}], tokenizer, add_bos=False
+                        )
                     )
-                )
         else:
             prompts = [inp.prompt for inp in inputs]
-
+        #prompts=prompts[0:5]
         # generate with vllm
         if args.use_vllm:
             sampling_params = vllm.SamplingParams(
@@ -275,14 +314,31 @@ def main(args):
             outputs = [prompt_to_output[prompt] if prompt in prompt_to_output else "" for prompt in prompts]
         # generate with hf model
         else:
-            outputs = generate_completions(
-                model=model,
-                tokenizer=tokenizer,
-                prompts=prompts,
-                max_new_tokens=2048,
-                temperature=0,
-                batch_size=args.eval_batch_size if args.eval_batch_size else 1,
-            )
+            response_file_path = os.path.join(args.save_dir, "response_dict.jsonl")
+
+            # Check if the file exists
+            if os.path.exists(response_file_path):
+                # If file exists, read the contents into the response_dict
+                with open(response_file_path, 'r') as file:
+                    for line in file:
+                        data = json.loads(line)
+                        response_dict[data['prompt']] = data['response']
+            else:
+                #file not exist generate!
+                batch_size=1
+                stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
+                outputs = generate_completions(
+                    model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=512,
+                    stop_id_sequences=[stop_sequence] if args.chat_formatting_function is None else None,
+                    do_sample=False,
+                )
+                response_dict = {inp.prompt: output for inp, output in zip(inputs, outputs)}
+                response_file_path = os.path.join(args.save_dir, "response_dict.jsonl")
+                with open(response_file_path, 'w') as file:
+                    for prompt, response in response_dict.items():
+                        json_obj = {'prompt': prompt, 'response': response}
+                        file.write(json.dumps(json_obj) + '\n')
+                print(f"Response dictionary saved to {response_file_path}")
     else:
         instances = []
         for i, inp in enumerate(inputs):
@@ -298,8 +354,14 @@ def main(args):
         )
         outputs = [result["output"] for result in results]
 
-    assert len(inputs) == len(outputs), "Number of inputs and outputs are not the same."
-    response_dict = {inp.prompt: output for inp, output in zip(inputs, outputs)}
+        #assert len(inputs) == len(outputs), "Number of inputs and outputs are not the same."
+        response_dict = {inp.prompt: output for inp, output in zip(inputs, outputs)}
+        response_file_path = os.path.join(args.save_dir, "response_dict.jsonl")
+        with open(response_file_path, 'w') as file:
+            for prompt, response in response_dict.items():
+                json_obj = {'prompt': prompt, 'response': response}
+                file.write(json.dumps(json_obj) + '\n')
+        print(f"Response dictionary saved to {response_file_path}")
 
     # get instruction following results
     results = {}
@@ -344,6 +406,12 @@ if __name__ == "__main__":
         "--save_dir", 
         type=str, 
         default="results/ifeval/"
+    )
+    parser.add_argument(
+        "--base_dir",
+        type=str,
+        default=None,
+        help="Specify the base directory"
     )
     parser.add_argument(
         "--model_name_or_path", 
@@ -396,18 +464,24 @@ if __name__ == "__main__":
         help="If given, we will use the vllm library, which will likely increase the inference throughput."
     )
     parser.add_argument(
-        "--use_chat_format", 
+        "--use_chat_format",
         action="store_true", 
         help="If given, we will use the chat format for the prompts."
     )
     parser.add_argument(
         "--chat_formatting_function", 
         type=str, 
-        default="eval.templates.create_prompt_with_tulu_chat_format", 
+        default="eval.templates.create_prompt_with_finetuned_olmo1b_chat_format",
         help="The function to use to create the chat format. This function will be dynamically imported. Please see examples in `eval/templates.py`."
     )
+    parser.add_argument(
+        "--preference",
+        action="store_true",
+        default=False,
+        help="Enable a specific preference. Default is False, pass this flag to enable."
+    )
     args = parser.parse_args()
-
+    print("ifeval eval started")
     # model_name_or_path and openai_engine cannot be both None or both not None.
     assert (args.model_name_or_path is None) != (args.openai_engine is None), "Either model_name_or_path or openai_engine should be specified."
     main(args)

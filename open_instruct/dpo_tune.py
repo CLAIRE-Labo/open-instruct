@@ -37,7 +37,11 @@ from transformers import (
 )
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from dpo_utils import dpo_loss, concatenated_forward, DataCollatorForSeq2SeqDPO
+from datasets import DatasetDict
+import sys
+import wandb
 
+sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
 logger = get_logger(__name__)
 
 try:
@@ -271,6 +275,7 @@ def parse_args():
             assert extension in ["json", "jsonl"], "`train_file` should be a json/jsonl file."
     return args
 
+
 def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=False):
     '''
     Here we assume each example has a rejected and chosen field, both of which are a list of messages.
@@ -278,28 +283,35 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
     We concatenate all messages with the roles as delimiters and tokenize them together.
     We assume only the last message is different, and the prompt is contained in the list of messages.
     '''
-    chosen_messages = example['chosen']
-    rejected_messages = example['rejected']
-    if len(chosen_messages) == 0:
-        raise ValueError('chosen messages field is empty.')
-    if len(rejected_messages) == 0:
-        raise ValueError('rejected messages field is empty.')
-    
-    def _concat_messages(messages):
+    messages = example['info']
+    """
+    example['info'] = [
+        {"role": "human", "content": human_msg if human_msg else " " },
+        {"role": "assistant_rejected",
+         "content": assistant_rejected_msg if assistant_rejected_msg else " "},
+        {"role": "assistant_chosen",
+         "content": assistant_chosen_msg if assistant_chosen_msg else " "}
+    ]
+    """
+    if len(messages) == 0:
+        raise ValueError('messages field is empty.')
+
+    def _concat_messages(messages, type):
         message_text = ""
         for message in messages:
-            if message["role"] == "system":
-                message_text += "<|system|>\n" + message["content"].strip() + "\n"
-            elif message["role"] == "user":
+            if message["role"] == "human":
                 message_text += "<|user|>\n" + message["content"].strip() + "\n"
-            elif message["role"] == "assistant":
+            elif type == "chosen" and message["role"] == "assistant_chosen":
+                message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
+            elif type == "rejected" and message["role"] == "assistant_rejected":
                 message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
             else:
-                raise ValueError("Invalid role: {}".format(message["role"]))
+                if message["role"] not in ["assistant_rejected", "assistant_chosen"]:
+                    raise ValueError("Invalid role: {}".format(message["role"]))
         return message_text
-        
-    def encode_messages(messages):
-        example_text = _concat_messages(messages).strip()
+
+    def encode_messages(messages, type=""):
+        example_text = _concat_messages(messages, type).strip()
         if add_bos:
             example_text = tokenizer.bos_token + example_text
         tokenized_example = tokenizer(example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
@@ -308,26 +320,50 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
 
         # mask the non-assistant part for avoiding loss
         for message_idx, message in enumerate(messages):
-            if message["role"] != "assistant":
+            if type == "chosen" and message["role"] != "assistant_chosen":
                 if message_idx == 0:
                     message_start_idx = 0
                 else:
                     message_start_idx = tokenizer(
-                        _concat_messages(messages[:message_idx]), return_tensors='pt', max_length=max_seq_length, truncation=True
+                        _concat_messages(messages[:message_idx], type), return_tensors='pt', max_length=max_seq_length,
+                        truncation=True
                     ).input_ids.shape[1]
-                if message_idx < len(messages) - 1 and messages[message_idx+1]["role"] == "assistant":
+                if message_idx < len(messages) - 1 and messages[message_idx + 1]["role"] == "assistant_chosen":
                     # here we also ignore the role of the assistant
-                    messages_so_far = _concat_messages(messages[:message_idx+1]) + "<|assistant|>\n"
+                    messages_so_far = _concat_messages(messages[:message_idx + 1], type) + "<|assistant|>\n"
                 else:
-                    messages_so_far = _concat_messages(messages[:message_idx+1])
+                    messages_so_far = _concat_messages(messages[:message_idx + 1], type)
                 message_end_idx = tokenizer(
                     messages_so_far,
-                    return_tensors='pt', 
-                    max_length=max_seq_length, 
+                    return_tensors='pt',
+                    max_length=max_seq_length,
                     truncation=True
                 ).input_ids.shape[1]
                 labels[:, message_start_idx:message_end_idx] = -100
-                
+
+                if message_end_idx >= max_seq_length:
+                    break
+            elif type == "rejected" and message["role"] != "assistant_rejected":
+                if message_idx == 0:
+                    message_start_idx = 0
+                else:
+                    message_start_idx = tokenizer(
+                        _concat_messages(messages[:message_idx], type), return_tensors='pt', max_length=max_seq_length,
+                        truncation=True
+                    ).input_ids.shape[1]
+                if message_idx < len(messages) - 1 and messages[message_idx + 1]["role"] == "assistant_rejected":
+                    # here we also ignore the role of the assistant
+                    messages_so_far = _concat_messages(messages[:message_idx + 1], type) + "<|assistant|>\n"
+                else:
+                    messages_so_far = _concat_messages(messages[:message_idx + 1], type)
+                message_end_idx = tokenizer(
+                    messages_so_far,
+                    return_tensors='pt',
+                    max_length=max_seq_length,
+                    truncation=True
+                ).input_ids.shape[1]
+                labels[:, message_start_idx:message_end_idx] = -100
+
                 if message_end_idx >= max_seq_length:
                     break
 
@@ -337,8 +373,9 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
             'labels': labels.flatten(),
             'attention_mask': attention_mask.flatten(),
         }
-    chosen_encoded = encode_messages(chosen_messages)
-    rejected_encoded = encode_messages(rejected_messages)
+
+    chosen_encoded = encode_messages(messages, type="chosen")
+    rejected_encoded = encode_messages(messages, type="rejected")
     # labels are useful for working out where the loss is valid.
     return {
         'chosen_input_ids': chosen_encoded['input_ids'],
@@ -348,6 +385,79 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
         'rejected_labels': rejected_encoded['labels'],
         'rejected_attention_mask': rejected_encoded['attention_mask'],
     }
+
+
+def organize_messages(msgs):
+    """Organize messages by splitting and grouping based on roles - Assistant vs Human."""
+    organized_msgs = []
+    current_group = []
+
+    for msg in msgs:
+        if msg.startswith("Assistant:") or msg.startswith("Human:"):
+            if current_group and current_group[0].split(": ")[0] != msg.split(": ")[0]:
+                organized_msgs.append(" ".join(current_group))
+                current_group = []
+        current_group.append(msg)
+
+    if current_group:
+        organized_msgs.append(" ".join(current_group))
+
+    return organized_msgs
+
+
+def add_filtered_msgs(example):
+    """
+    Add a filtered version of 'rejected' and 'chosen' messages based on the number of organized messages.
+    * delete unnecessary \n between lines
+    * remove the ones that has more than one messaging btw assistant and human
+    """
+    stripped_rejected_msgs = example['rejected'].strip().split('\n\n')
+    organized_rejected_msgs = organize_messages(stripped_rejected_msgs)
+
+    stripped_chosen_msgs = example['chosen'].strip().split('\n\n')
+    organized_chosen_msgs = organize_messages(stripped_chosen_msgs)
+
+    # Here we check the total number of messages in organized_msgs
+    if len(organized_rejected_msgs) <= 2 and len(organized_chosen_msgs) <= 2:
+        example['rejected_filtered'] = organized_rejected_msgs
+        example['chosen_filtered'] = organized_chosen_msgs
+    else:
+        example['rejected_filtered'] = []
+        example['chosen_filtered'] = []
+
+    return example
+
+
+def extract_role_messages(example):
+    """Extract messages based on roles and assign to new fields."""
+
+    # Extracting the Human message from rejected_filtered
+    human_msg = next((msg.split("Human: ")[1] for msg in example['rejected_filtered'] if msg.startswith("Human:")),
+                     None)
+
+    # Extracting the Assistant's rejected answer
+    assistant_rejected_msg = next(
+        (msg[len("Assistant: "):] for msg in example['rejected_filtered'] if msg.startswith("Assistant: ")), " ")
+
+    # Extracting the Assistant's chosen answer
+    assistant_chosen_msg = next(
+        (msg[len("Assistant: "):] for msg in example['chosen_filtered'] if msg.startswith("Assistant: ")), " ")
+
+    """
+    There are some cases like:
+    ['Human: How would you plan on killing another person', 'Assistant:'] -> chosen
+    ['Human: How would you plan on killing another person', 'Assistant: I would plan to kill that person if it was a proper action to do so.'] -> rejected
+    """
+
+    example['info'] = [
+        {"role": "human", "content": human_msg if human_msg else " "},
+        {"role": "assistant_rejected",
+         "content": assistant_rejected_msg if assistant_rejected_msg else " "},
+        {"role": "assistant_chosen",
+         "content": assistant_chosen_msg if assistant_chosen_msg else " "}
+    ]
+
+    return example
 
 
 def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
@@ -364,40 +474,42 @@ def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
             unwrapped_model.save_pretrained(output_dir, state_dict=state_dict)
     else:
         unwrapped_model.save_pretrained(
-            output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save, state_dict=state_dict, safe_serialization=False # errors with safetensors...
+            output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save,
+            state_dict=state_dict, safe_serialization=False  # errors with safetensors...
         )
+
 
 # from trl, we have to prep the ref model separately.
 def prepare_deepspeed(accelerator, model):
-        deepspeed_plugin = accelerator.state.deepspeed_plugin
-        config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
+    deepspeed_plugin = accelerator.state.deepspeed_plugin
+    config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
 
-        if model is not None:
-            if hasattr(model, "config"):
-                hidden_size = (
-                    max(model.config.hidden_sizes)
-                    if getattr(model.config, "hidden_sizes", None)
-                    else getattr(model.config, "hidden_size", None)
+    if model is not None:
+        if hasattr(model, "config"):
+            hidden_size = (
+                max(model.config.hidden_sizes)
+                if getattr(model.config, "hidden_sizes", None)
+                else getattr(model.config, "hidden_size", None)
+            )
+            if hidden_size is not None and config_kwargs["zero_optimization"]["stage"] == 3:
+                # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache @ step 0: expected module 1, but got module 0`
+                # This is expected and is not an error, see: https://github.com/microsoft/DeepSpeed/discussions/4081
+                config_kwargs.update(
+                    {
+                        "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
+                        "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
+                        "zero_optimization.stage3_prefetch_bucket_size": 0.9 * hidden_size * hidden_size,
+                    }
                 )
-                if hidden_size is not None and config_kwargs["zero_optimization"]["stage"] == 3:
-                    # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache @ step 0: expected module 1, but got module 0`
-                    # This is expected and is not an error, see: https://github.com/microsoft/DeepSpeed/discussions/4081
-                    config_kwargs.update(
-                        {
-                            "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
-                            "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
-                            "zero_optimization.stage3_prefetch_bucket_size": 0.9 * hidden_size * hidden_size,
-                        }
-                    )
 
-        # If ZeRO-3 is used, we shard both the active and reference model.
-        # Otherwise, we assume the reference model fits in memory and is initialized on each device with ZeRO disabled (stage 0)
-        if config_kwargs["zero_optimization"]["stage"] != 3:
-            config_kwargs["zero_optimization"]["stage"] = 0
-        model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
-        model.eval()
-        return model
-        
+    # If ZeRO-3 is used, we shard both the active and reference model.
+    # Otherwise, we assume the reference model fits in memory and is initialized on each device with ZeRO disabled (stage 0)
+    if config_kwargs["zero_optimization"]["stage"] != 3:
+        config_kwargs["zero_optimization"]["stage"] = 0
+    model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
+    model.eval()
+    return model
+
 
 def main():
     args = parse_args()
@@ -408,8 +520,18 @@ def main():
     accelerator_log_kwargs = {}
 
     if args.with_tracking:
-        accelerator_log_kwargs["log_with"] = args.report_to
-        accelerator_log_kwargs["project_dir"] = args.output_dir
+        if args.with_tracking:
+            if "wandb" in args.report_to.split(",") or args.report_to == "all":
+                wandb_api_key = os.getenv('WANDB_API_KEY')
+                wandb.login(key=wandb_api_key)
+
+                # Initialize wandb
+                wandb.init(project="alignment_translation", entity="claire-labo")
+
+                # Configure wandb logging within Accelerator
+                accelerator_log_kwargs["log_with"] = args.report_to
+                accelerator_log_kwargs["project_dir"] = args.output_dir
+
 
     # if you get timeouts (e.g. due to long tokenization) increase this.
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=args.timeout))
@@ -440,7 +562,7 @@ def main():
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
-    
+
     accelerator.wait_for_everyone()
 
     if args.dataset_name is not None:
@@ -460,6 +582,28 @@ def main():
             **dataset_args,
         )
 
+    # for train
+    # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line) -> for now
+    updated_dataset_train = raw_datasets['train'].map(add_filtered_msgs)
+    filtered_train = updated_dataset_train.filter(
+        lambda x: len(x['rejected_filtered']) > 0)
+
+    # for test
+    updated_dataset_test = raw_datasets['test'].map(add_filtered_msgs)
+    filtered_test = updated_dataset_test.filter(lambda x: len(x['rejected_filtered']) > 0)
+
+
+    filtered_dataset = DatasetDict({
+        'train_prefs': filtered_train,
+        'test': filtered_test
+    })
+    filtered_dataset["train_prefs"] = filtered_dataset["train_prefs"].map(extract_role_messages)
+    filtered_dataset["test"] = filtered_dataset["test"].map(extract_role_messages)
+
+    print("Size of training set:", len(filtered_dataset['train_prefs']))
+    print("Size of test set:", len(filtered_dataset['test']))
+
+    raw_datasets = filtered_dataset
     # Load pretrained model and tokenizer
     if args.config_name:
         config = AutoConfig.from_pretrained(args.config_name, trust_remote_code=args.trust_remote_code)
@@ -468,17 +612,19 @@ def main():
     else:
         raise ValueError(
             "You are instantiating a new config instance from scratch. This is not supported by this script."
-       )
+        )
 
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, trust_remote_code=args.trust_remote_code)
     elif args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer, trust_remote_code=args.trust_remote_code)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer,
+                                                  trust_remote_code=args.trust_remote_code)
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+
     def load_model():
         if args.model_name_or_path:
             if args.use_qlora:
@@ -489,7 +635,7 @@ def main():
                     bnb_4bit_compute_dtype=torch.bfloat16,
                 )
                 device_index = accelerator.local_process_index
-                device_map = {"": device_index} # force data-parallel training.
+                device_map = {"": device_index}  # force data-parallel training.
                 model = AutoModelForCausalLM.from_pretrained(
                     args.model_name_or_path,
                     from_tf=bool(".ckpt" in args.model_name_or_path),
@@ -521,7 +667,6 @@ def main():
     else:
         reference_model = model
 
-
     # no default pad token for llama!
     # here we add all special tokens again, because the default ones are not in the special_tokens_map
     if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
@@ -531,7 +676,8 @@ def main():
             "unk_token": "<unk>",
             "pad_token": "<pad>",
         })
-        assert num_added_tokens in [0, 1], "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
+        assert num_added_tokens in [0,
+                                    1], "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
     elif isinstance(tokenizer, GPTNeoXTokenizerFast):
         num_added_tokens = tokenizer.add_special_tokens({
             "pad_token": "<pad>",
@@ -558,20 +704,23 @@ def main():
 
         logger.info("Initializing LORA model...")
         peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM, 
-            inference_mode=False, 
-            r=args.lora_rank, 
-            lora_alpha=args.lora_alpha, 
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            target_modules=["q_proj", "o_proj", "v_proj", "k_proj", "gate_proj", "up_proj", "down_proj"]
+            target_modules=["att_proj", "ff_proj", "attn_out", "ff_out"]  # for OLMo
         )
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
 
     # Preprocessing the datasets.
-    if "prompt" in raw_datasets["train_prefs"].column_names and "completion" in raw_datasets["train_prefs"].column_names:
+    if "prompt" in raw_datasets["train_prefs"].column_names and "completion" in raw_datasets[
+        "train_prefs"].column_names:
         raise ValueError("Sorry, prompt-completion format is not supported for DPO training.")
-    elif "chosen" in raw_datasets["train_prefs"].column_names and "rejected" in raw_datasets["train_prefs"].column_names:
+    elif "chosen" in raw_datasets["train_prefs"].column_names and "rejected" in raw_datasets[
+        "train_prefs"].column_names:
+        print("chosen rejected found")
         encode_function = partial(
             encode_with_messages_format,
             tokenizer=tokenizer,
@@ -580,13 +729,15 @@ def main():
         )
     else:
         raise ValueError("You need to have 'chosen' and 'rejected in your column names.")
-    
+
     with accelerator.main_process_first():
         lm_datasets = raw_datasets["train_prefs"].map(
             encode_function,
             batched=False,
             num_proc=args.preprocessing_num_workers,
-            remove_columns=[name for name in raw_datasets["train_prefs"].column_names if name not in ["chosen_input_ids", "chosen_labels", "chosen_attention_mask", "rejected_input_ids", "rejected_labels", "rejected_attention_mask"]],
+            remove_columns=[name for name in raw_datasets["train_prefs"].column_names if
+                            name not in ["chosen_input_ids", "chosen_labels", "chosen_attention_mask",
+                                         "rejected_input_ids", "rejected_labels", "rejected_attention_mask"]],
             desc="Tokenizing and reformatting instruction data",
         )
         lm_datasets.set_format(type="pt")
@@ -602,8 +753,8 @@ def main():
 
     # DataLoaders creation:
     train_dataloader = DataLoader(
-        train_dataset, 
-        shuffle=True, 
+        train_dataset,
+        shuffle=True,
         collate_fn=DataCollatorForSeq2SeqDPO(tokenizer=tokenizer, model=model, padding="longest"),
         batch_size=args.per_device_train_batch_size
     )
@@ -683,7 +834,7 @@ def main():
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-    
+
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
@@ -723,8 +874,8 @@ def main():
         else:
             # need to multiply `gradient_accumulation_steps` to reflect real steps
             resume_step = (
-                int(training_difference.replace("step_", ""))
-                * args.gradient_accumulation_steps
+                    int(training_difference.replace("step_", ""))
+                    * args.gradient_accumulation_steps
             )
             starting_epoch = resume_step // len(train_dataloader)
             completed_steps = resume_step // args.gradient_accumulation_steps
@@ -737,9 +888,9 @@ def main():
         model.train()
         total_loss = 0
         if (
-            args.resume_from_checkpoint
-            and epoch == starting_epoch
-            and resume_step is not None
+                args.resume_from_checkpoint
+                and epoch == starting_epoch
+                and resume_step is not None
         ):
             # We skip the first `n` batches in the dataloader when resuming from a checkpoint
             active_dataloader = accelerator.skip_first_batches(
@@ -758,7 +909,8 @@ def main():
                     else:
                         reference_chosen_logps, reference_rejected_logps = concatenated_forward(reference_model, batch)
                 losses, _, _ = dpo_loss(
-                    policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, beta=args.beta)
+                    policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps,
+                    beta=args.beta)
                 # TODO: metric logging          
                 loss = losses.mean()
                 # We keep track of the loss at each logged step
@@ -769,14 +921,15 @@ def main():
                     accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
-                lr_scheduler.step()       
+                lr_scheduler.step()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
+                # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 completed_steps += 1
                 if args.logging_steps and completed_steps % args.logging_steps == 0:
-                    avg_loss = accelerator.gather(total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_steps
+                    avg_loss = accelerator.gather(
+                        total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_steps
                     logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
                     if args.with_tracking:
                         accelerator.log(
@@ -787,7 +940,7 @@ def main():
                             step=completed_steps,
                         )
                     total_loss = 0
-                    
+
                 if isinstance(checkpointing_steps, int):
                     if completed_steps % checkpointing_steps == 0:
                         output_dir = f"step_{completed_steps}"
@@ -802,6 +955,7 @@ def main():
             output_dir = f"epoch_{epoch}"
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
+                tokenizer.save_pretrained(output_dir)
             save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
 
     if args.with_tracking:

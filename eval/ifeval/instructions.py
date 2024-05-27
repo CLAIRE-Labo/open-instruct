@@ -443,21 +443,29 @@ class HighlightSectionChecker(Instruction):
     """Checks if the number of highlighted sections meets the requirement.
 
     Args:
-      value: a string repesenting the response. The response is expected to
+      value: a string representing the response. The response is expected to
         contain highlighted sections in the format of *highlighted*.
 
     Returns:
       True if the actual number of highlighted sections in the format of
-      *highlighed sections* meets the minimum requirement; otherwise False.
+      *highlighted sections* meets the minimum requirement; otherwise False.
     """
     num_highlights = 0
+    # Find all single highlighted sections
     highlights = re.findall(r"\*[^\n\*]*\*", value)
+    # Find all double highlighted sections
     double_highlights = re.findall(r"\*\*[^\n\*]*\*\*", value)
+
+    # Count single highlighted sections
     for highlight in highlights:
-      if highlight.strip("*").strip():
+      clean_highlight = highlight[1:-1].strip()  # Remove '*' from start and end and strip whitespace
+      if clean_highlight:
         num_highlights += 1
+
+    # Count double highlighted sections
     for highlight in double_highlights:
-      if highlight.removeprefix("**").removesuffix("**").strip():
+      clean_highlight = highlight[2:-2].strip()  # Remove '**' from start and end and strip whitespace
+      if clean_highlight:
         num_highlights += 1
 
     return num_highlights >= self._num_highlights
@@ -889,20 +897,26 @@ class JsonFormat(Instruction):
     return []
 
   def check_following(self, value):
-    value = (
-        value.strip()
-        .removeprefix("```json")
-        .removeprefix("```Json")
-        .removeprefix("```JSON")
-        .removeprefix("```")
-        .removesuffix("```")
-        .strip()
-    )
+    # Manually strip JSON code block indicators for compatibility with Python < 3.9
+    prefixes = ["```json", "```Json", "```JSON", "```"]
+    suffix = "```"
+
+    # Strip leading code block indicators
+    for prefix in prefixes:
+      if value.startswith(prefix):
+        value = value[len(prefix):].strip()
+        break  # Only one prefix will be present, break once removed
+
+    # Strip trailing code block indicator
+    if value.endswith(suffix):
+      value = value[:-len(suffix)].strip()
+
+    # Try parsing the JSON to check its validity
     try:
       json.loads(value)
-    except ValueError as _:
+      return True
+    except ValueError:
       return False
-    return True
 
 
 class ParagraphFirstWordCheck(Instruction):

@@ -43,7 +43,8 @@ def evaluate_single_model(args):
         load_in_8bit=False,
         gptq=False,
         filename_answers=filename,
-        wandb_run_id= args.wandb_run_id
+        wandb_run_id= args.wandb_run_id,
+        withToken=args.with_token
     )
     print(f"{filename} started to be evaluated")
     # Run the evaluation
@@ -58,7 +59,11 @@ if __name__ == "__main__":
                         help="The base path containing model directories to evaluate.")
     parser.add_argument("--base_model", type=str, default=None, help="Get the base model for comparison")
     parser.add_argument('--wandb_run_id', type=str, help="Wandb run ID if logging to an existing run")
-
+    parser.add_argument(
+        "--with_token",
+        action="store_true",
+        help="Set to enable token, no value needed"
+    )
     args = parser.parse_args()
     evaluate_single_model(args)
     #evaluate_models(args.base_path)

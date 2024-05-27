@@ -47,6 +47,9 @@ from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_tr
 #from eval.truthfulqa.run_eval import main as run_eval
 #from eval.truthfulqa.run_eval import parse_args as parse_args_eval
 #from open_instruct.merge_lora import main as merge_lora
+import os
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
 
 logger = get_logger(__name__)
 import pandas as pd
@@ -593,7 +596,7 @@ def main():
     #for train
     # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line) -> for now
     updated_dataset_train = raw_datasets['train'].map(add_filtered_msgs)
-    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0)#.select(range(300)) # delete this
+    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0)#.select(range(10)) # delete this
 
     #for test
     updated_dataset_test = raw_datasets['test'].map(add_filtered_msgs)
@@ -903,6 +906,8 @@ def main():
     wandb.define_metric("rouge1_acc", step_metric="eval_step")
     wandb.define_metric("rouge2_acc", step_metric="eval_step")
     wandb.define_metric("rougeL_acc", step_metric="eval_step")
+    metrics_table = wandb.Table(
+        columns=["epoch", "BLEURT_acc", "bleu_acc", "rouge1_acc", "rouge2_acc", "rougeL_acc"])
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1013,6 +1018,8 @@ def main():
                 optimizer.zero_grad()
                 lr_scheduler.step()
 
+                if step % 2000 == 0:
+                    torch.cuda.empty_cache()
                 # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
@@ -1022,7 +1029,7 @@ def main():
                         total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_steps
                     logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
                     # Print number of examples processed so far in this epoch
-                    #print(f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
+                    print(f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
                     if args.with_tracking:
                         accelerator.log(
                             {
@@ -1047,6 +1054,7 @@ def main():
         print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
         if args.checkpointing_steps == "epoch":
             output_dir = f"epoch_{epoch}"
+            torch.cuda.empty_cache()
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
                 tokenizer.save_pretrained(output_dir)
@@ -1063,8 +1071,8 @@ def main():
             if args.with_tracking:
                 # Log evaluation metrics
                 wandb.log(metrics_log)
-                metrics_table = wandb.Table(
-                    columns=["epoch", "BLEURT_acc", "bleu_acc", "rouge1_acc", "rouge2_acc", "rougeL_acc"])
+                #metrics_table = wandb.Table(
+                #    columns=["epoch", "BLEURT_acc", "bleu_acc", "rouge1_acc", "rouge2_acc", "rougeL_acc"])
                 metrics_table.add_data(
                     metrics_log["eval_step"],
                     metrics_log["BLEURT_acc"],
