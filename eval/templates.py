@@ -52,6 +52,24 @@ def create_prompt_with_finetuned_olmo1b_chat_format(messages, tokenizer, bos="<|
     formatted_text = bos + formatted_text  # forcibly add bos
     return formatted_text
 
+def create_prompt_with_phi3_chat_format(messages, tokenizer, bos="<s>", eos="<|end|>", add_bos=True):
+    formatted_text = ""
+    for message in messages:
+        if message["role"] == "system":
+            formatted_text += "<|system|>\n" + message["content"] + '<|end|>' + "\n"
+        elif message["role"] == "user":
+            formatted_text += "<|user|>\n" + message["content"] + '<|end|>' + "\n"
+        elif message["role"] == "assistant":
+            formatted_text += "<|assistant|>\n" + message["content"].strip() + '<|end|>' + "\n"
+        else:
+            raise ValueError(
+                "Phi3 chat template only supports 'system', 'user' and 'assistant' roles. Invalid role: {}.".format(
+                    message["role"])
+            )
+    formatted_text += "<|assistant|>\n"
+    formatted_text = bos + formatted_text  # forcibly add bos
+    return formatted_text
+
 def create_prompt_with_llama2_chat_format(messages, tokenizer, bos="<s>", eos="</s>", add_bos=True):
     '''
     This function is adapted from the official llama2 chat completion script: 
