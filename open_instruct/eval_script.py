@@ -1,7 +1,11 @@
 from argparse import Namespace
 import sys
 import os
-sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+
+"""
+To be able to import from other files, either use sys.path.append or declare the path as PYTHONPATH in environment variables.
+#sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+"""
 
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from eval.truthfulqa.run_eval import main as run_eval
@@ -32,13 +36,13 @@ def evaluate_single_model(args):
         preference=True,
         data_dir="data/",
         save_dir=os.path.join(path, "eval_results"),  # Save results in a subdirectory
-        metrics=['bleu', 'rouge', 'bleurt'],
+        #metrics=['bleu', 'rouge', 'bleurt'],
         num_instances=None,
         preset='qa',
         eval_batch_size=1,
         use_chat_format=True,
         openai_engine=None,
-        chat_formatting_function="eval.templates.create_prompt_with_finetuned_olmo1b_chat_format",
+        chat_formatting_function=args.chat_formatting_function,
         use_slow_tokenizer=None,
         load_in_8bit=False,
         gptq=False,
@@ -57,6 +61,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate models from directories under a base path.")
     parser.add_argument("--base_path", type=str, required=True,
                         help="The base path containing model directories to evaluate.")
+    parser.add_argument("--chat_formatting_function", type=str, default="eval.templates.create_prompt_with_finetuned_olmo1b_chat_format",
+                        help="The name of chat_formatting_function")
     parser.add_argument("--base_model", type=str, default=None, help="Get the base model for comparison")
     parser.add_argument('--wandb_run_id', type=str, help="Wandb run ID if logging to an existing run")
     parser.add_argument(
@@ -66,4 +72,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     evaluate_single_model(args)
-    #evaluate_models(args.base_path)
+    #evaluate_models(args.base_path) if we want to run for all epochs under a folder
