@@ -3,7 +3,7 @@
 '''
 DPO tuning script. Adapted from our finetuning script.
 '''
-
+import json
 import argparse
 import logging
 import math
@@ -40,8 +40,16 @@ from dpo_utils import dpo_loss, concatenated_forward, DataCollatorForSeq2SeqDPO
 from datasets import DatasetDict
 import sys
 import wandb
+import os
+import gc
+from peft import PeftConfig, PeftModel
 
-sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:64'
+
+"""
+To be able to import from other files, either use sys.path.append or declare the path as PYTHONPATH in environment variables.
+#sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+"""
 logger = get_logger(__name__)
 
 try:
@@ -285,6 +293,7 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
     '''
     messages = example['info']
     """
+    the info structure as follows:
     example['info'] = [
         {"role": "human", "content": human_msg if human_msg else " " },
         {"role": "assistant_rejected",
@@ -298,27 +307,46 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
 
     def _concat_messages(messages, type):
         message_text = ""
-        for message in messages:
-            if message["role"] == "human":
-                message_text += "<|user|>\n" + message["content"].strip() + "\n"
-            elif type == "chosen" and message["role"] == "assistant_chosen":
-                message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
-            elif type == "rejected" and message["role"] == "assistant_rejected":
-                message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
-            else:
-                if message["role"] not in ["assistant_rejected", "assistant_chosen"]:
-                    raise ValueError("Invalid role: {}".format(message["role"]))
+        if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+            # phi3 is a llama tokenizer and requires different template compared to OLMo
+            """
+            for phi3:
+              "chat_template": "{{ bos_token }}{% for message in messages %}{% if (message['role'] == 'user') %}{{'<|user|>' + '\n' + message['content'] + '<|end|>' + '\n' + '<|assistant|>' + '\n'}}
+              {% elif (message['role'] == 'assistant') %}{{message['content'] + '<|end|>' + '\n'}}{% endif %}{% endfor %}",
+            """
+            for message in messages:
+                if message["role"] == "human":
+                    message_text += "<|user|>\n" + message["content"].strip() +'<|end|>'+ "\n"
+                elif type == "chosen" and message["role"] == "assistant_chosen":
+                    message_text += "<|assistant|>\n" + message["content"].strip() + '<|end|>' + "\n"
+                elif type == "rejected" and message["role"] == "assistant_rejected":
+                    message_text += "<|assistant|>\n" + message["content"].strip() + '<|end|>' + "\n"
+                else:
+                    if message["role"] not in ["assistant_rejected", "assistant_chosen"]:
+                        raise ValueError("Invalid role: {}".format(message["role"]))
+        else:
+            for message in messages:
+                if message["role"] == "human":
+                    message_text += "<|user|>\n" + message["content"].strip() + "\n"
+                elif type == "chosen" and message["role"] == "assistant_chosen":
+                    message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
+                elif type == "rejected" and message["role"] == "assistant_rejected":
+                    message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
+                else:
+                    if message["role"] not in ["assistant_rejected", "assistant_chosen"]:
+                        raise ValueError("Invalid role: {}".format(message["role"]))
         return message_text
 
-    def encode_messages(messages, type=""):
+    def encode_messages(messages, type="", add_bos=False):
         example_text = _concat_messages(messages, type).strip()
+        tokenizer.bos_token = tokenizer.eos_token
         if add_bos:
             example_text = tokenizer.bos_token + example_text
         tokenized_example = tokenizer(example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
         input_ids = tokenized_example.input_ids
         labels = input_ids.clone()
 
-        # mask the non-assistant part for avoiding loss
+        # mask the non-assistant part for avoiding loss - each chosen and rejected
         for message_idx, message in enumerate(messages):
             if type == "chosen" and message["role"] != "assistant_chosen":
                 if message_idx == 0:
@@ -373,10 +401,9 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
             'labels': labels.flatten(),
             'attention_mask': attention_mask.flatten(),
         }
-
-    chosen_encoded = encode_messages(messages, type="chosen")
-    rejected_encoded = encode_messages(messages, type="rejected")
-    # labels are useful for working out where the loss is valid.
+    #encode appropriate assistant message based on type
+    chosen_encoded = encode_messages(messages, type="chosen", add_bos=add_bos)
+    rejected_encoded = encode_messages(messages, type="rejected", add_bos=add_bos)
     return {
         'chosen_input_ids': chosen_encoded['input_ids'],
         'chosen_labels': chosen_encoded['labels'],
@@ -385,6 +412,42 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
         'rejected_labels': rejected_encoded['labels'],
         'rejected_attention_mask': rejected_encoded['attention_mask'],
     }
+
+
+def save_with_accelerate_final(accelerator, model, tokenizer, output_dir, args, optimizer, scheduler):
+    unwrapped_model = accelerator.unwrap_model(model)
+    # When doing multi-gpu training, we need to use accelerator.get_state_dict(model) to get the state_dict.
+    # Otherwise, sometimes the model will be saved with only part of the parameters.
+    # Also, accelerator needs to use the wrapped model to get the state_dict.
+    state_dict = accelerator.get_state_dict(model)
+    if args.use_lora:
+        # When using lora, the unwrapped model is a PeftModel, which doesn't support the is_main_process
+        # and has its own save_pretrained function for only saving lora modules.
+        # We have to manually specify the is_main_process outside the save_pretrained function.
+        if accelerator.is_main_process:
+            unwrapped_model.save_pretrained(output_dir, state_dict=state_dict)
+    else:
+        # don't use safetensors for saving for now
+        unwrapped_model.save_pretrained(
+            output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save,
+            state_dict=state_dict,
+            safe_serialization=False
+        )
+    # Save the optimizer state
+    optimizer_state_file = os.path.join(output_dir, "optimizer_state.pt")
+    if accelerator.is_main_process:
+        torch.save(optimizer.state_dict(), optimizer_state_file)
+
+    # Save the scheduler state if a scheduler is used
+    if scheduler is not None:
+        scheduler_state_file = os.path.join(output_dir, "scheduler_state.pt")
+        if accelerator.is_main_process:
+            torch.save(scheduler.state_dict(), scheduler_state_file)
+
+    # Optionally, save training arguments or any other configs as a JSON
+    args_file = os.path.join(output_dir, "training_args.json")
+    with open(args_file, "w") as f:
+        json.dump(vars(args), f)
 
 
 def organize_messages(msgs):
@@ -467,7 +530,7 @@ def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
     # Also, accelerator needs to use the wrapped model to get the state_dict.
     state_dict = accelerator.get_state_dict(model)
     if args.use_lora:
-        # When using lora, the unwrapped model is a PeftModel, which doesn't support the is_main_process 
+        # When using lora, the unwrapped model is a PeftModel, which doesn't support the is_main_process
         # and has its own save_pretrained function for only saving lora modules.
         # We have to manually specify the is_main_process outside the save_pretrained function.
         if accelerator.is_main_process:
@@ -532,7 +595,6 @@ def main():
                 accelerator_log_kwargs["log_with"] = args.report_to
                 accelerator_log_kwargs["project_dir"] = args.output_dir
 
-
     # if you get timeouts (e.g. due to long tokenization) increase this.
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=args.timeout))
 
@@ -583,7 +645,7 @@ def main():
         )
 
     # for train
-    # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line) -> for now
+    # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line)
     updated_dataset_train = raw_datasets['train'].map(add_filtered_msgs)
     filtered_train = updated_dataset_train.filter(
         lambda x: len(x['rejected_filtered']) > 0)
@@ -591,7 +653,6 @@ def main():
     # for test
     updated_dataset_test = raw_datasets['test'].map(add_filtered_msgs)
     filtered_test = updated_dataset_test.filter(lambda x: len(x['rejected_filtered']) > 0)
-
 
     filtered_dataset = DatasetDict({
         'train_prefs': filtered_train,
@@ -602,6 +663,9 @@ def main():
 
     print("Size of training set:", len(filtered_dataset['train_prefs']))
     print("Size of test set:", len(filtered_dataset['test']))
+
+    del raw_datasets, updated_dataset_test, updated_dataset_train
+    gc.collect() #delete unnecessary variables
 
     raw_datasets = filtered_dataset
     # Load pretrained model and tokenizer
@@ -617,6 +681,7 @@ def main():
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, trust_remote_code=args.trust_remote_code)
     elif args.model_name_or_path:
+
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer,
                                                   trust_remote_code=args.trust_remote_code)
     else:
@@ -636,6 +701,7 @@ def main():
                 )
                 device_index = accelerator.local_process_index
                 device_map = {"": device_index}  # force data-parallel training.
+
                 model = AutoModelForCausalLM.from_pretrained(
                     args.model_name_or_path,
                     from_tf=bool(".ckpt" in args.model_name_or_path),
@@ -648,6 +714,7 @@ def main():
                     use_flash_attention_2=True if args.use_flash_attn else False,
                 )
             else:
+
                 model = AutoModelForCausalLM.from_pretrained(
                     args.model_name_or_path,
                     from_tf=bool(".ckpt" in args.model_name_or_path),
@@ -676,8 +743,18 @@ def main():
             "unk_token": "<unk>",
             "pad_token": "<pad>",
         })
+        # pad token is also equal to eos token in the case of phi3
         assert num_added_tokens in [0,
-                                    1], "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
+                                    1,
+                                    2], "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
+        # specific to phi3 case
+        # The padding token is set to the unknown token.
+        tokenizer.pad_token = tokenizer.unk_token
+
+        # The ID of the padding token is set to the ID of the unknown token.
+        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+        tokenizer.padding_side = 'left'
+
     elif isinstance(tokenizer, GPTNeoXTokenizerFast):
         num_added_tokens = tokenizer.add_special_tokens({
             "pad_token": "<pad>",
@@ -692,7 +769,7 @@ def main():
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
-    # gather deepspeed to get "real" embedding size    
+    # gather deepspeed to get "real" embedding size
     embeddings = model.get_input_embeddings()
     with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
         if len(tokenizer) > embeddings.weight.shape[0]:
@@ -703,14 +780,27 @@ def main():
             model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
 
         logger.info("Initializing LORA model...")
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            inference_mode=False,
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=["att_proj", "ff_proj", "attn_out", "ff_out"]  # for OLMo
-        )
+        if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                inference_mode=False,
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                #target_modules=["att_proj", "ff_proj", "attn_out", "ff_out"]  # for OLMo
+                target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]  # for phi3
+            )
+        else:
+            # olmo target modules are used
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                inference_mode=False,
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=["att_proj", "ff_proj", "attn_out", "ff_out"]  # for OLMo
+                #target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]  # for phi3
+            )
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
 
@@ -741,7 +831,7 @@ def main():
             desc="Tokenizing and reformatting instruction data",
         )
         lm_datasets.set_format(type="pt")
-        # our thresholding mighta meant some examples have no labels, remove.
+        # remove the ones labelled -100 for masking non-assistant parts
         lm_datasets = lm_datasets.filter(lambda example: (example['chosen_labels'] != -100).any())
         lm_datasets = lm_datasets.filter(lambda example: (example['rejected_labels'] != -100).any())
 
@@ -791,11 +881,11 @@ def main():
         overrode_max_train_steps = True
 
     # Create the learning rate scheduler.
-    # Note: the current accelerator.step() calls the .step() of the real scheduler for the `num_processes` times. This is because they assume 
+    # Note: the current accelerator.step() calls the .step() of the real scheduler for the `num_processes` times. This is because they assume
     # the user initialize the scheduler with the entire training set. In the case of data parallel training, each process only
-    # sees a subset (1/num_processes) of the training set. So each time the process needs to update the lr multiple times so that the total 
+    # sees a subset (1/num_processes) of the training set. So each time the process needs to update the lr multiple times so that the total
     # number of updates in the end matches the num_training_steps here.
-    # Here we need to set the num_training_steps to either using the entire training set (when epochs is specified) or we need to multiply the 
+    # Here we need to set the num_training_steps to either using the entire training set (when epochs is specified) or we need to multiply the
     # num_training_steps by num_processes so that the total number of updates matches the num_training_steps.
     num_training_steps_for_scheduler = args.max_train_steps if overrode_max_train_steps else args.max_train_steps * accelerator.num_processes
     lr_scheduler = get_scheduler(
@@ -805,12 +895,9 @@ def main():
         num_warmup_steps=int(num_training_steps_for_scheduler * args.warmup_ratio),
     )
 
-    # Prepare everything with `accelerator`.
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
-    )
     if not args.use_lora:
         reference_model = prepare_deepspeed(accelerator, reference_model)
+
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -823,14 +910,6 @@ def main():
     checkpointing_steps = args.checkpointing_steps
     if checkpointing_steps is not None and checkpointing_steps.isdigit():
         checkpointing_steps = int(checkpointing_steps)
-
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
-    if args.with_tracking:
-        experiment_config = vars(args)
-        # TensorBoard cannot log Enums, need the raw value
-        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("open_instruct", experiment_config)
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -846,7 +925,6 @@ def main():
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
     starting_epoch = 0
-
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
@@ -863,9 +941,36 @@ def main():
             path = os.path.basename(checkpoint_path)
 
         accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
-        accelerator.load_state(path)
+        model.load_adapter(checkpoint_path, adapter_name=checkpoint_path)
+        model.print_trainable_parameters()
+
+        """
+        There is a problem in the use of this loaded optimizer state. For now, it is commented out.
+        optimizer_state_file = os.path.join(checkpoint_path, 'optimizer_state.pt')
+
+        # Check if the optimizer state file exists before loading
+        if os.path.exists(optimizer_state_file):
+            optimizer_state_dict = torch.load(optimizer_state_file)
+            optimizer.load_state_dict(optimizer_state_dict)
+            print("Optimizer state loaded successfully.")
+        else:
+            print("Optimizer state file does not exist.")
+        """
+        # Path to the scheduler state file
+        #scheduler_state_file = 'scheduler_state.pt'
+
+        scheduler_state_file = os.path.join(checkpoint_path, 'scheduler_state.pt')
+
+        # Check if the scheduler state file exists before loading
+        if os.path.exists(scheduler_state_file):
+            scheduler_state_dict = torch.load(scheduler_state_file)
+            lr_scheduler.load_state_dict(scheduler_state_dict)
+            print("Scheduler state loaded successfully.")
+        else:
+            print("Scheduler state file does not exist.")
+
         # Extract `epoch_{i}` or `step_{i}`
-        training_difference = os.path.splitext(path)[0]
+        training_difference = path
 
         if "epoch" in training_difference:
             starting_epoch = int(training_difference.replace("epoch_", "")) + 1
@@ -884,9 +989,24 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
+    # Prepare everything with `accelerator`.
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
+    )
+
+    # We need to initialize the trackers we use, and also store our configuration.
+    # The trackers initializes automatically on the main process.
+    if args.with_tracking:
+        experiment_config = vars(args)
+        # TensorBoard cannot log Enums, need the raw value
+        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
+        accelerator.init_trackers("open_instruct", experiment_config)
+
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_loss = 0
+        epoch_data_count = 0  # To keep track of the number of data points in each epoch
+
         if (
                 args.resume_from_checkpoint
                 and epoch == starting_epoch
@@ -900,6 +1020,12 @@ def main():
             active_dataloader = train_dataloader
         for step, batch in enumerate(active_dataloader):
             # dpo forward pass & loss
+            # Print the size of each component in the batch
+            if step == 0:
+                # Print the keys of the batch dictionary
+                print("Keys in the batch:", batch.keys())
+            batch_size = len(batch['chosen_input_ids'])
+            epoch_data_count += batch_size
             with accelerator.accumulate(model):
                 policy_chosen_logps, policy_rejected_logps = concatenated_forward(model, batch)
                 with torch.no_grad():
@@ -911,7 +1037,7 @@ def main():
                 losses, _, _ = dpo_loss(
                     policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps,
                     beta=args.beta)
-                # TODO: metric logging          
+                # TODO: metric logging
                 loss = losses.mean()
                 # We keep track of the loss at each logged step
                 total_loss += loss.detach().float()
@@ -922,8 +1048,10 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad()
                 lr_scheduler.step()
+                #this step and cuda empty cache is for cuda out of memory error
+                if step % 50 == 0:
+                    torch.cuda.empty_cache()
 
-                # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 completed_steps += 1
@@ -931,6 +1059,8 @@ def main():
                     avg_loss = accelerator.gather(
                         total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_steps
                     logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
+                    print(f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
+
                     if args.with_tracking:
                         accelerator.log(
                             {
@@ -956,7 +1086,9 @@ def main():
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
                 tokenizer.save_pretrained(output_dir)
-            save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
+            save_with_accelerate_final(accelerator, model, tokenizer, output_dir, args, optimizer,
+                                       lr_scheduler)  # to be able to recover
+            #no evaluation for now
 
     if args.with_tracking:
         accelerator.end_training()
@@ -965,7 +1097,8 @@ def main():
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
-        save_with_accelerate(accelerator, model, tokenizer, args.output_dir, args)
+        save_with_accelerate_final(accelerator, model, tokenizer, args.output_dir, args, optimizer,
+                                   lr_scheduler)  # to be able to recover
 
 
 if __name__ == "__main__":

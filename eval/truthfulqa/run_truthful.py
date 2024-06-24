@@ -1,16 +1,12 @@
 import os
 import subprocess
-
+"""
+This file is created to run evaluations for multiple epochs or a specific model
+"""
 def run_evaluation_epoch(base_path):
     # List all directories within the base_path that start with "epoch"
     epochs = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d)) and d.startswith('epoch')]
-    #epochs=[base_path]
-    epochs.remove('epoch_0')
-    epochs.remove('epoch_1')
-    epochs.remove('epoch_2')
-    epochs.remove('epoch_3')
-    epochs.remove('epoch_4')
-    epochs.remove('epoch_5')
+
     # Loop through each found epoch directory
     for epoch in epochs:
         epoch_path = os.path.join(base_path, epoch)

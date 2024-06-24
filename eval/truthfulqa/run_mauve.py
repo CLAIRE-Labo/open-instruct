@@ -7,6 +7,9 @@ import sys
 
 # to find mauve_lib
 sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation')
+"""
+This file is created to run evaluations for multiple epochs or a specific model
+"""
 
 from mauve_lib.src.mauve.compute_mauve import compute_mauve
 import json

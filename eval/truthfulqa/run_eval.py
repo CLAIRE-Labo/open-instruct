@@ -34,7 +34,7 @@ def get_gpu_memory():
 
 # Get total memory of the first GPU in MB
 total_memory = get_gpu_memory()[0]
-memory_limit_percentage = 0.1
+memory_limit_percentage = 0.1 # limit it to use only 10% percent of memory for BLEURT
 memory_limit = int(total_memory * memory_limit_percentage)
 
 # Configure the GPU memory allocation
@@ -49,8 +49,10 @@ if gpus:
     except RuntimeError as e:
         print("Error setting memory limit:", e)
 
-sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
-
+"""
+To be able to import from other files, either use sys.path.append or declare the path as PYTHONPATH in environment variables.
+#sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+"""
 import warnings
 from eval.utils import (
     load_hf_lm,

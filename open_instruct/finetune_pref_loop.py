@@ -1,5 +1,11 @@
 #!/usr/bin/env python
 # coding=utf-8
+"""
+This script is specifically written for self-improvement ATT.
+In this case, we eliminated the use of Accelerate library since it causes some problems to
+get the predictions from the model. -> so, can only be used with 1 GPU
+not adapted for phi3
+"""
 from torch.cuda import memory_allocated
 import argparse
 import logging
@@ -67,8 +73,10 @@ class KeyWordsCriteria(StoppingCriteria):
         return all(sequences_should_be_stopped)
 
 
-sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
-
+"""
+To be able to import from other files, either use sys.path.append or declare the path as PYTHONPATH in environment variables.
+#sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+"""
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 # from eval.truthfulqa.run_eval import main as run_eval
 # from eval.truthfulqa.run_eval import parse_args as parse_args_eval
@@ -97,42 +105,6 @@ else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
 
-def save_with_accelerate_final(accelerator, model, tokenizer, output_dir, args, optimizer, scheduler):
-    unwrapped_model = accelerator.unwrap_model(model)
-    # When doing multi-gpu training, we need to use accelerator.get_state_dict(model) to get the state_dict.
-    # Otherwise, sometimes the model will be saved with only part of the parameters.
-    # Also, accelerator needs to use the wrapped model to get the state_dict.
-    state_dict = accelerator.get_state_dict(model)
-    if args.use_lora:
-        # When using lora, the unwrapped model is a PeftModel, which doesn't support the is_main_process
-        # and has its own save_pretrained function for only saving lora modules.
-        # We have to manually specify the is_main_process outside the save_pretrained function.
-        if accelerator.is_main_process:
-            unwrapped_model.save_pretrained(output_dir, state_dict=state_dict)
-    else:
-        # don't use safetensors for saving for now
-        unwrapped_model.save_pretrained(
-            output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save,
-            state_dict=state_dict,
-            safe_serialization=False
-        )
-    # Save the optimizer state
-    optimizer_state_file = os.path.join(output_dir, "optimizer_state.pt")
-    if accelerator.is_main_process:
-        torch.save(optimizer.state_dict(), optimizer_state_file)
-
-    # Save the scheduler state if a scheduler is used
-    if scheduler is not None:
-        scheduler_state_file = os.path.join(output_dir, "scheduler_state.pt")
-        if accelerator.is_main_process:
-            torch.save(scheduler.state_dict(), scheduler_state_file)
-
-    # Optionally, save training arguments or any other configs as a JSON
-    args_file = os.path.join(output_dir, "training_args.json")
-    with open(args_file, "w") as f:
-        json.dump(vars(args), f)
-
-
 def save_without_accelerate_final(model, tokenizer, output_dir, args, optimizer, scheduler):
     # Ensure the output directory exists
     os.makedirs(output_dir, exist_ok=True)
@@ -149,51 +121,10 @@ def save_without_accelerate_final(model, tokenizer, output_dir, args, optimizer,
         scheduler_state_file = os.path.join(output_dir, "scheduler_state.pt")
         torch.save(scheduler.state_dict(), scheduler_state_file)
 
-    # Optionally, save training arguments or any other configs as a JSON
+    # save training arguments or any other configs as a JSON
     args_file = os.path.join(output_dir, "training_args.json")
     with open(args_file, "w") as f:
         json.dump(vars(args), f)
-
-def log_eval_results_to_wandb(csv_path, epoch):
-    # Load the summary CSV file
-    try:
-        # Load the summary CSV file
-        results_df = pd.read_csv(csv_path)
-        metrics = {}
-        # Assume there's only one row of metrics, typical in a summarised results CSV
-        if not results_df.empty:
-            results_dict = results_df.iloc[0].to_dict()  # Convert the first row to a dictionary
-            metrics = {
-                "BLEURT_acc": results_dict.get('BLEURT acc', None),
-                "bleu_acc": results_dict.get('bleu acc', None),
-                "rouge1_acc": results_dict.get('rouge1 acc', None),
-                "rouge2_acc": results_dict.get('rouge2 acc', None),
-                "rougeL_acc": results_dict.get('rougeL acc', None),
-                "eval_step": epoch + 1
-            }
-
-        else:
-            print("No data found in the CSV file.")
-        return metrics
-    except Exception as e:
-        print(f"Failed to read or log evaluation results: {e}")
-
-
-import subprocess
-
-
-def run_evaluation_subprocess(args, base_path, run_id):
-    """ Run the evaluation script as a subprocess. """
-    # Construct the command to execute the Python script
-    command = [
-        'python',
-        '/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct/open_instruct/eval_script.py',
-        '--base_path', base_path,
-        '--base_model', args.base_model_dir,
-        '--wandb_run_id', run_id
-    ]
-    # Run the command
-    subprocess.run(command, capture_output=True, text=True)
 
 
 def parse_args():
@@ -450,8 +381,6 @@ def encode_with_rejected_chosen(example, tokenizer, max_seq_length, add_bos=Fals
     if len(messages) == 0:
         raise ValueError('messages field is empty.')
 
-    assistant_chosen_content = ""  # Initialize an empty string to store the chosen response
-
     def _concat_messages(messages):
         message_text = ""
         system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
@@ -512,6 +441,7 @@ from transformers import DataCollatorForSeq2Seq, GenerationConfig
 @torch.no_grad()
 def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequences=None, add_special_tokens=True,
                          disable_tqdm=False, **generation_kwargs):
+    """this function is taken from eval folder in order to see and track the changes it is copied to here."""
     generations = []
 
     num_return_sequences = generation_kwargs.get("num_return_sequences", 1)
@@ -526,10 +456,6 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
             batch_input_ids = batch_input_ids.cuda()
             attention_mask = attention_mask.cuda()
 
-        #print("generation_kwargs:", generation_kwargs)
-        # Debug: Print the shapes of the inputs to the model
-        #print(f"Batch input ids shape: {batch_input_ids.shape}")
-        #print(f"Attention mask shape: {attention_mask.shape}")
         try:
             batch_outputs = model.generate(
                 input_ids=batch_input_ids,
@@ -539,8 +465,6 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
                 **generation_kwargs
             )
 
-            # Debug: Print the shape of the outputs from the model
-            #print(f"Batch outputs shape: {batch_outputs.shape}")
 
             # the stopping criteria is applied at batch level, so if other examples are not stopped, the entire batch will continue to generate.
             # so some outputs still have the stop sequence, which we need to remove.
@@ -583,28 +507,6 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
     assert len(generations) == len(
         prompts) * num_return_sequences, "number of generations should be equal to number of prompts * num_return_sequences"
     return generations
-
-
-def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
-    unwrapped_model = accelerator.unwrap_model(model)
-    # When doing multi-gpu training, we need to use accelerator.get_state_dict(model) to get the state_dict.
-    # Otherwise, sometimes the model will be saved with only part of the parameters.
-    # Also, accelerator needs to use the wrapped model to get the state_dict.
-    state_dict = accelerator.get_state_dict(model)
-    if args.use_lora:
-        # When using lora, the unwrapped model is a PeftModel, which doesn't support the is_main_process
-        # and has its own save_pretrained function for only saving lora modules.
-        # We have to manually specify the is_main_process outside the save_pretrained function.
-        if accelerator.is_main_process:
-            unwrapped_model.save_pretrained(output_dir, state_dict=state_dict)
-    else:
-        # don't use safetensors for saving for now
-        unwrapped_model.save_pretrained(
-            output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save,
-            state_dict=state_dict,
-            safe_serialization=False
-        )
-
 
 def save_without_accelerate(model, tokenizer, output_dir):
     # Ensure the output directory exists
@@ -798,11 +700,6 @@ def convert_batch_to_list_of_dicts(batch):
 def main():
     args = parse_args()
 
-    # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
-    # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
-    # in the environment
-    accelerator_log_kwargs = {}
-
     model_name_or_path = args.model_name_or_path
     config = AutoConfig.from_pretrained(
         model_name_or_path,
@@ -820,13 +717,12 @@ def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path,
-
         trust_remote_code=True,
         use_fast=True,
         revision="main"
     )
-    tokenizer.pad_token = "<|padding|>"
-    tokenizer.padding_side = "left"
+    #tokenizer.pad_token = "<|padding|>"
+    #tokenizer.padding_side = "left"
 
 
 
@@ -863,8 +759,6 @@ def main():
             args.dataset_name,
             args.dataset_config_name,
         )
-        allocated = torch.cuda.memory_allocated(0)
-        reserved = torch.cuda.memory_reserved(0)
 
     else:
         data_files = {}
@@ -948,6 +842,7 @@ def main():
         )
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
+
     elif args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -991,7 +886,7 @@ def main():
         data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest", return_tensors="pt")
         batch_tensors = data_collator(batch)
 
-        # Reinsert 'info' field into the batch if it was originally there
+        # Reinsert 'info' field into the batch
         if infos:
             batch_tensors['info'] = infos
 
@@ -1002,7 +897,7 @@ def main():
         train_dataset,
         batch_size=args.per_device_train_batch_size,
         shuffle=True,
-        collate_fn=lambda b: custom_collate_fn(b, tokenizer=tokenizer, model=model)
+        collate_fn=lambda b: custom_collate_fn(b, tokenizer=tokenizer, model=model) #create custom function to dynamically handle the batch
     )
 
     # Optimizer
@@ -1116,7 +1011,6 @@ def main():
                 stop_id_sequences=None,
                 do_sample=False
             )
-            #print(f"Generated Responses: {generated_responses}")  # Debugging statement
 
             # Retrieve 'chosen response' from the dataset, assuming you have a method to select it
             responses = get_prompts_and_responses(infos)
@@ -1137,10 +1031,11 @@ def main():
                 encoded_example = encode_with_rejected_chosen(new_example, tokenizer, args.max_seq_length)
                 encoding_list.append(encoded_example)
 
+            # since the padding performed based on "longest", we need to give them as whole.
             batch = convert_batch_to_list_of_dicts(batch)
             batch = custom_collate_fn(batch, tokenizer, model, new_data=encoding_list)
 
-            if  len(batch['input_ids'])!=prev_len_batch*2:
+            if  len(batch['input_ids'])!=prev_len_batch*2: #the size of batch must be doubled.
                 raise ValueError("problem in generation of updated batch")
 
             epoch_data_count += batch_size
@@ -1177,6 +1072,8 @@ def main():
             optimizer.zero_grad()
             lr_scheduler.step()
 
+
+            #for cuda out of memory
             if step % 1000 == 0:
                 torch.cuda.empty_cache()
 

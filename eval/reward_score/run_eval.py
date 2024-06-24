@@ -6,6 +6,9 @@ import os
 from tqdm import tqdm  # Make sure to import tqdm at the top of your script
 import torch.nn.functional as F
 import torch
+"""
+This script calculates the scores over already extracted predictions from files.
+"""
 def calculate_percentage_of_high_values(tensor):
     # Ensure the tensor is on the CPU and detach it from the computation graph
     tensor = tensor.detach()

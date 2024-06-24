@@ -14,7 +14,10 @@ import random
 import dataclasses
 import collections
 from typing import Dict, List, Optional, Union
-sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+"""
+To be able to import from other files, either use sys.path.append or declare the path as PYTHONPATH in environment variables.
+#sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+"""
 import nltk
 nltk.download('punkt')
 
@@ -81,7 +84,7 @@ def test_instruction_following_strict(
     inp,
     prompt_to_response,
 ):
-    """Tests response to see if instrutions are followed."""
+    """Tests response to see if instructions are followed."""
     response = prompt_to_response[inp.prompt]
     instruction_list = inp.instruction_id_list
     is_following_list = []
@@ -252,17 +255,21 @@ def main(args):
                 print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
 
     response_dict = {}
+    print("loading ended")
     if args.model_name_or_path:
         # prepare prompts
 
         if args.use_chat_format:
             if args.preference:
+                print("preference started")
                 base_response_dict={}
                 base_response_file_path = os.path.join(args.base_dir, "response_dict.jsonl")
-
+                print(base_response_file_path)
+                print(os.path.exists(base_response_file_path))
                 # Check if the file exists
                 if os.path.exists(base_response_file_path):
                     # If file exists, read the contents into the response_dict
+                    print("file is read from the initial responses")
                     with open(base_response_file_path, 'r') as file:
                         for line in file:
                             data = json.loads(line)
@@ -282,6 +289,7 @@ def main(args):
 
                     system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
                     prompts = formatted_questions
+                    print(formatted_questions[0])
                     chat_formatting_function = dynamic_import_function(args.chat_formatting_function)
                     for idx, prompt in enumerate(prompts):
                         messages = [{"role": "system", "content": system_message},

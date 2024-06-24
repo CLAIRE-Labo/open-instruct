@@ -6,17 +6,22 @@ import random
 from collections import defaultdict
 
 import torch
-import vllm
+#import vllm
 from tqdm import tqdm, trange
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import sys
 
+"""
+To be able to import from other files, either use sys.path.append or declare the path as PYTHONPATH in environment variables.
+#sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+"""
 from eval.utils import (
     generate_completions,
     load_hf_lm,
     query_openai_chat_model,
     load_hf_tokenizer,
 )
-from eval.utils import dynamic_import_function 
+from eval.utils import dynamic_import_function
 
 
 @torch.no_grad()
@@ -37,7 +42,7 @@ def score_generations(
 def main(args):
     random.seed(42)
     os.makedirs(args.save_dir, exist_ok=True)
-    
+
     # Load the testing data
     examples = []
     prompt_files = glob.glob(os.path.join(args.data_dir, "*.txt"))
@@ -58,6 +63,8 @@ def main(args):
                     "label": label,
                     "target_groups": [minority_group],
                 })
+    print("max prompt per example: ", args.max_prompts_per_group)
+    print("total_examples:", len(examples))
 
     # Generate the outputs
     if args.model_name_or_path:
@@ -67,16 +74,48 @@ def main(args):
             tokenizer_name_or_path=args.tokenizer_name_or_path,
             use_fast_tokenizer=not args.use_slow_tokenizer,
         )
-        for example in examples:
-            if args.use_chat_format:
-                messages = [{"role": "user", "content": "Complete the following: " + example["text"]}]
-                chat_formatting_function = dynamic_import_function(args.chat_formatting_function)
-                prompt = chat_formatting_function(messages, tokenizer, add_bos=False)
-            else:
-                # we will use the original text from toxigen as the prompt.
-                prompt = example["text"]
-            prompts.append(prompt)
+        if args.preference:
+            base_response_list= []
+            base_response_file_path = os.path.join(args.base_dir, "predictions.jsonl")
 
+            # Check if the file exists
+            if os.path.exists(base_response_file_path):
+                with open(base_response_file_path, 'r') as file:
+                    for line in file:
+                        data = json.loads(line)
+                        # Append as tuple
+                        base_response_list.append((data['text'], data['prediction']))
+
+                formatted_questions = []
+                for question, predicted_response in base_response_list:
+                    message_text = question.strip() + "\n"
+                    message_text += "\nCurrent rejected answer: " + predicted_response + "\nCorrected output: \n"
+                    formatted_questions.append(message_text)
+
+                system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
+                prompts = formatted_questions
+                print(formatted_questions[0])
+
+                # Assuming dynamic_import_function and tokenizer are properly defined or imported
+                chat_formatting_function = dynamic_import_function(args.chat_formatting_function)
+                tokenizer = None  # Specify your tokenizer if required
+
+                for idx, prompt in enumerate(prompts):
+                    messages = [{"role": "system", "content": system_message},
+                                {"role": "user", "content": "Complete the following: " + prompt}]
+                    prompts[idx] = chat_formatting_function(messages, tokenizer, add_bos=False)
+
+        else:
+            for example in examples:
+                if args.use_chat_format:
+                        messages = [{"role": "user", "content": "Complete the following: " + example["text"]}]
+                        chat_formatting_function = dynamic_import_function(args.chat_formatting_function)
+                        prompt = chat_formatting_function(messages, tokenizer, add_bos=False)
+                else:
+                    # we will use the original text from toxigen as the prompt.
+                    prompt = example["text"]
+                prompts.append(prompt)
+            print(prompts[0])
         if args.use_vllm:
             print("Loading vLLM model...")
             model = vllm.LLM(
@@ -101,22 +140,27 @@ def main(args):
                 device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
                 gptq_model=args.gptq,
             )
+            tokenizer = load_hf_tokenizer(
+                model_name_or_path=args.model_name_or_path,
+                tokenizer_name_or_path=args.tokenizer_name_or_path,
+                use_fast_tokenizer=not args.use_slow_tokenizer,
+            )
             from transformers import GPTNeoXForCausalLM, OPTForCausalLM
             if isinstance(model, GPTNeoXForCausalLM) or isinstance(model, OPTForCausalLM):
                 tokenizer.model_max_length = model.config.max_position_embeddings
                 print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
-            new_line_token = tokenizer.encode("\n", add_special_tokens=False)[-1]
+            stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
+            max_new_tokens=200
+            batch_size=args.eval_batch_size
+            print("prompts amount: ",len(prompts))
             outputs = generate_completions(
-                model=model,
-                tokenizer=tokenizer,
-                prompts=prompts,
-                max_new_tokens=512,
-                batch_size=args.eval_batch_size if args.eval_batch_size else 1,
-                stop_id_sequences=[[new_line_token]] if not args.use_chat_format else None,  # we only use stop token for non-chat format (usually applied to vanilla pretrained language models). For chat format, we will rely on the model knows when to stop.
+                model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
+                stop_id_sequences=[stop_sequence] if args.chat_formatting_function is None else None,
+                do_sample=False
             )
     else:
         instances = [{
-            "id": str(i), 
+            "id": str(i),
             "prompt": "Complete the following: " + example["text"]
         } for i, example in enumerate(examples)]
         performance = query_openai_chat_model(
@@ -173,13 +217,13 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--data_dir", 
-        type=str, 
+        "--data_dir",
+        type=str,
         default="data/eval/toxigen"
     )
     parser.add_argument(
-        "--save_dir", 
-        type=str, 
+        "--save_dir",
+        type=str,
         default="results/toxigen"
     )
     parser.add_argument(
@@ -231,14 +275,14 @@ if __name__ == "__main__":
         help="If given, we're evaluating a 4-bit quantized GPTQ model.",
     )
     parser.add_argument(
-        "--use_chat_format", 
-        action="store_true", 
+        "--use_chat_format",
+        action="store_true",
         help="If given, we will use the chat format for the prompts."
     )
     parser.add_argument(
-        "--chat_formatting_function", 
-        type=str, 
-        default="eval.templates.create_prompt_with_tulu_chat_format", 
+        "--chat_formatting_function",
+        type=str,
+        default="eval.templates.create_prompt_with_tulu_chat_format",
         help="The function to use to create the chat format. This function will be dynamically imported. Please see examples in `eval/templates.py`."
     )
     parser.add_argument(
@@ -251,6 +295,18 @@ if __name__ == "__main__":
         type=int,
         default=500,
         help="If given, we will only use this many prompts per group. Default to 500 (half the available prompts).",
+    )
+    parser.add_argument(
+        "--preference",
+        action="store_true",
+        default=False,
+        help="Enable a specific preference. Default is False, pass this flag to enable."
+    )
+    parser.add_argument(
+        "--base_dir",
+        type=str,
+        default=None,
+        help="Specify the base directory"
     )
     args = parser.parse_args()
 

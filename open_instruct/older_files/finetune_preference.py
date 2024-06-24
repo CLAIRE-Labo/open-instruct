@@ -21,7 +21,7 @@ import deepspeed
 import wandb
 from argparse import Namespace
 from datasets import DatasetDict
-import subprocess
+
 
 import transformers
 from transformers import (
@@ -41,16 +41,15 @@ from transformers import (
 import sys
 import subprocess
 
-"""
-To be able to import from other files, either use sys.path.append or declare the path as PYTHONPATH in environment variables.
-#sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
-"""
+sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 #from eval.truthfulqa.run_eval import main as run_eval
 #from eval.truthfulqa.run_eval import parse_args as parse_args_eval
+#from open_instruct.merge_lora import main as merge_lora
 import os
 
-#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256" - Cuda out of memory
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
 
 logger = get_logger(__name__)
 import pandas as pd
@@ -96,18 +95,17 @@ def log_eval_results_to_wandb(csv_path, epoch):
     except Exception as e:
         print(f"Failed to read or log evaluation results: {e}")
 
-def run_evaluation_subprocess(args,base_path, run_id, tokenizer):
+import subprocess
+
+def run_evaluation_subprocess(args,base_path, run_id):
     """ Run the evaluation script as a subprocess. """
+    # Construct the command to execute the Python script
     command = [
-        'python', '../open-instruct/open_instruct/eval_script.py',
+        'python', '/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct/open_instruct/eval_script.py',
         '--base_path', base_path,
         '--base_model', args.base_model_dir,
-        '--wandb_run_id', run_id,
+        '--wandb_run_id', run_id
     ]
-    if isinstance(tokenizer, (LlamaTokenizer, LlamaTokenizerFast)):
-        # If tokenizer is an instance of LlamaTokenizer or LlamaTokenizerFast, use phi3 chat format
-        chat_format = "eval.templates.create_prompt_with_phi3_chat_format"
-        command.extend(['--chat_formatting_function', chat_format])
     # Run the command
     subprocess.run(command, capture_output=True, text=True)
 
@@ -369,30 +367,16 @@ def encode_with_rejected_chosen(example, tokenizer, max_seq_length, add_bos=Fals
     def _concat_messages(messages):
         message_text = ""
         system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
-        if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
-            message_text += "<|system|>\n" + system_message + +'<|end|>'+ "\n"
-            for message in messages:
-                if message["role"] == "human":
-                    message_text += "<|user|>\n Prompt: " + message[
-                        "content"].strip() + +'<|end|>'+ "\n" # between prompt and assistant rejected \n\n double space
-                elif message["role"] == "assistant_rejected":
-                    message_text += "\n Current rejected answer: " + message[
-                        "content"].strip() + "\n Corrected output: \n" +'<|end|>'+ "\n"
-                elif message["role"] == "assistant_chosen":
-                    message_text += "<|assistant|>\n" + message["content"].strip() + +'<|end|>'+ "\n"
-                else:
-                    raise ValueError("Invalid role: {}".format(message["role"]))
-        else:
-            message_text += "<|system|>\n" + system_message + "\n"
-            for message in messages:
-                if message["role"] == "human":
-                    message_text += "<|user|>\n Prompt: " + message["content"].strip() + "\n"  # between prompt and assistant rejected \n\n double space
-                elif message["role"] =="assistant_rejected":
-                    message_text += "\n Current rejected answer: " + message["content"].strip() + "\n Corrected output: \n"
-                elif message["role"] == "assistant_chosen":
-                    message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
-                else:
-                    raise ValueError("Invalid role: {}".format(message["role"]))
+        message_text += "<|system|>\n" + system_message + "\n"
+        for message in messages:
+            if message["role"] == "human":
+                message_text += "<|user|>\n Prompt: " + message["content"].strip() + "\n"  # between prompt and assistant rejected \n\n double space
+            elif message["role"] =="assistant_rejected":
+                message_text += "\n Current rejected answer: " + message["content"].strip() + "\n Corrected output: \n"
+            elif message["role"] == "assistant_chosen":
+                message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
+            else:
+                raise ValueError("Invalid role: {}".format(message["role"]))
         return message_text
 
     example_text = _concat_messages(messages).strip()
@@ -593,6 +577,11 @@ def main():
             args.dataset_name,
             args.dataset_config_name,
         )
+        allocated = torch.cuda.memory_allocated(0)
+        reserved = torch.cuda.memory_reserved(0)
+
+        #print(f"Memory Allocated after loading dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+        #print(f"Memory Reserved after loading dataset: {reserved / (1024 ** 3)} GB")
     else:
         data_files = {}
         dataset_args = {}
@@ -676,7 +665,11 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+    allocated = torch.cuda.memory_allocated(0)
+    reserved = torch.cuda.memory_reserved(0)
 
+    #print(f"Memory Allocated after loading model and tokenizer: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+    #print(f"Memory Reserved after loading model and tokenizer: {reserved / (1024 ** 3)} GB")
     if args.model_name_or_path:
         if args.use_qlora:
             bnb_config = BitsAndBytesConfig(
@@ -722,18 +715,8 @@ def main():
             "unk_token": "<unk>",
             "pad_token": "<pad>",
         })
-        # pad token is also equal to eos token in the case of phi3
         assert num_added_tokens in [0,
-                                    1,
-                                    2], "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
-        # specific to phi3 case
-        # The padding token is set to the unknown token.
-        tokenizer.pad_token = tokenizer.unk_token
-
-        # The ID of the padding token is set to the ID of the unknown token.
-        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
-        tokenizer.padding_side = 'left'
-
+                                    1], "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
     elif isinstance(tokenizer, GPTNeoXTokenizerFast):
         num_added_tokens = tokenizer.add_special_tokens({
             "pad_token": "<pad>",
@@ -751,6 +734,23 @@ def main():
     # gather deepspeed to get "real" embedding size
     embeddings = model.get_input_embeddings()
 
+    """
+    num_tokens, embedding_dim = embeddings.weight.size()
+
+    # Create a new embedding tensor for the additional token
+    new_embeddings = torch.nn.Embedding(num_tokens + 1, embedding_dim)
+
+    # Compute the average of all existing embeddings
+    average_embedding = embeddings.weight.data.mean(dim=0)
+
+    # Initialize the last token's embeddings (the new token) with this average
+    new_embeddings.weight.data[-1] = average_embedding
+
+    model.set_input_embeddings(new_embeddings)
+
+    embeddings =model.get_input_embeddings()
+
+    """
 
     with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
         embedding_size = embeddings.weight.shape[0]
@@ -762,27 +762,15 @@ def main():
             model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
 
         logger.info("Initializing LORA model...")
-        if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
-            peft_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                inference_mode=False,
-                r=args.lora_rank,
-                lora_alpha=args.lora_alpha,
-                lora_dropout=args.lora_dropout,
-                # target_modules=["att_proj", "ff_proj", "attn_out", "ff_out"]  # for OLMo
-                target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]  # for phi3
-            )
-        else:
-            # olmo target modules are used
-            peft_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                inference_mode=False,
-                r=args.lora_rank,
-                lora_alpha=args.lora_alpha,
-                lora_dropout=args.lora_dropout,
-                target_modules=["att_proj", "ff_proj", "attn_out", "ff_out"]  # for OLMo
-                # target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]  # for phi3
-            )
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=["att_proj", "ff_proj", "attn_out", "ff_out"]  # for OLMo
+            # target_modules=["q_proj", "o_proj", "v_proj", "k_proj", "gate_proj", "up_proj", "down_proj"] # was for Llama
+        )
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
     elif args.gradient_checkpointing:
@@ -800,7 +788,11 @@ def main():
     else:
         raise ValueError("You need to have either 'rejected'&'chosen' in your column names.")
 
+    allocated = torch.cuda.memory_allocated(0)
+    reserved = torch.cuda.memory_reserved(0)
 
+    #print(f"Memory Allocated after processing dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+    #print(f"Memory Reserved after processing dataset: {reserved / (1024 ** 3)} GB")
     with accelerator.main_process_first():
         lm_datasets = filtered_dataset.map(
             encode_function,
@@ -813,7 +805,11 @@ def main():
         )
         lm_datasets.set_format(type="pt")
         lm_datasets = lm_datasets.filter(lambda example: (example['labels'] != -100).any())
+        allocated = torch.cuda.memory_allocated(0)
+        reserved = torch.cuda.memory_reserved(0)
 
+        #print(f"Memory Allocated after tokenizing and reformatting dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
+        #print(f"Memory Reserved after tokenizing and reformatting  dataset: {reserved / (1024 ** 3)} GB")
 
     train_dataset = lm_datasets["train"]
 
@@ -875,6 +871,11 @@ def main():
         num_warmup_steps=int(num_training_steps_for_scheduler * args.warmup_ratio),
     )
 
+    # Prepare everything with `accelerator`.
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
+    )
+
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -905,6 +906,8 @@ def main():
     wandb.define_metric("rouge1_acc", step_metric="eval_step")
     wandb.define_metric("rouge2_acc", step_metric="eval_step")
     wandb.define_metric("rougeL_acc", step_metric="eval_step")
+    metrics_table = wandb.Table(
+        columns=["epoch", "BLEURT_acc", "bleu_acc", "rouge1_acc", "rouge2_acc", "rougeL_acc"])
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -937,36 +940,9 @@ def main():
             path = os.path.basename(checkpoint_path)
 
         accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
-        model.load_adapter(checkpoint_path, adapter_name=checkpoint_path)
-        model.print_trainable_parameters()
-
-        """
-        There is a problem in the use of this loaded optimizer state. For now, it is commented out.
-        optimizer_state_file = os.path.join(checkpoint_path, 'optimizer_state.pt')
-
-        # Check if the optimizer state file exists before loading
-        if os.path.exists(optimizer_state_file):
-            optimizer_state_dict = torch.load(optimizer_state_file)
-            optimizer.load_state_dict(optimizer_state_dict)
-            print("Optimizer state loaded successfully.")
-        else:
-            print("Optimizer state file does not exist.")
-        """
-        # Path to the scheduler state file
-        # scheduler_state_file = 'scheduler_state.pt'
-
-        scheduler_state_file = os.path.join(checkpoint_path, 'scheduler_state.pt')
-
-        # Check if the scheduler state file exists before loading
-        if os.path.exists(scheduler_state_file):
-            scheduler_state_dict = torch.load(scheduler_state_file)
-            lr_scheduler.load_state_dict(scheduler_state_dict)
-            print("Scheduler state loaded successfully.")
-        else:
-            print("Scheduler state file does not exist.")
-
+        accelerator.load_state(path)
         # Extract `epoch_{i}` or `step_{i}`
-        training_difference = path
+        training_difference = os.path.splitext(path)[0]
 
         if "epoch" in training_difference:
             starting_epoch = int(training_difference.replace("epoch_", "")) + 1
@@ -984,11 +960,6 @@ def main():
 
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
-
-    # Prepare everything with `accelerator`.
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
-    )
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
@@ -1047,9 +1018,9 @@ def main():
                 optimizer.zero_grad()
                 lr_scheduler.step()
 
-                #for cuda out of memory
                 if step % 2000 == 0:
                     torch.cuda.empty_cache()
+                # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 completed_steps += 1
@@ -1092,7 +1063,7 @@ def main():
             print(output_dir)
 
             print(f"Running evaluation at the end of epoch {epoch + 1}")
-            run_evaluation_subprocess(args,output_dir, run_id, tokenizer)
+            run_evaluation_subprocess(args,output_dir, run_id)
             csv_path=output_dir+"/eval_results/summary.csv"
             print("log eval results to wandb")
             metrics_log=log_eval_results_to_wandb(csv_path, epoch)
@@ -1100,6 +1071,17 @@ def main():
             if args.with_tracking:
                 # Log evaluation metrics
                 wandb.log(metrics_log)
+                #metrics_table = wandb.Table(
+                #    columns=["epoch", "BLEURT_acc", "bleu_acc", "rouge1_acc", "rouge2_acc", "rougeL_acc"])
+                metrics_table.add_data(
+                    metrics_log["eval_step"],
+                    metrics_log["BLEURT_acc"],
+                    metrics_log["bleu_acc"],
+                    metrics_log["rouge1_acc"],
+                    metrics_log["rouge2_acc"],
+                    metrics_log["rougeL_acc"]
+                )
+                wandb.log({"Verification Table": metrics_table})
 
     if args.output_dir is not None:
         if accelerator.is_main_process:

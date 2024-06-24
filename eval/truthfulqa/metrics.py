@@ -14,6 +14,8 @@ from eval.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
 from bleurt import score
 import warnings
 import logging
+from mauve_lib.src.mauve.compute_mauve import compute_mauve
+
 logger = logging.getLogger()
 logger.setLevel(logging.CRITICAL)
 
@@ -372,4 +374,39 @@ def run_BLEURT(model_key, frame, bleurt_scorer=None, cache_dir=None):
                     frame.loc[idx, col_name] = int(max(scores_true) > max(scores_false))
 
     return frame
+def run_MAUVE(model_key, frame, args):
+    """
+    Uses Mauve to compare model outputs to the reference human answers.
 
+    model_key: Column name of model answers (populate before running metrics)
+    frame: DataFrame containing the data
+    args: additional arguments like model_name for feature computation
+    """
+
+    # Initialize Mauve column if not present
+    col_name = f"{model_key} Mauve"
+    if col_name not in frame.columns:
+        frame[col_name] = np.nan
+
+    # Process each entry in the DataFrame
+    for idx in tqdm(frame.index, desc="Calculating Mauve scores"):
+        if pd.isnull(frame.loc[idx, col_name]):
+            # Check if model's answers and human references are available
+            if pd.isnull(frame.loc[idx, model_key]) or not len(frame.loc[idx, model_key]):
+                print(f"Model answers missing for index {idx}!")
+                continue
+
+            human_answers = frame.loc[idx, 'human_answers']  # Assuming a column for human answers
+            if pd.isnull(human_answers) or not len(human_answers):
+                print(f"Human answers missing for index {idx}!")
+                continue
+
+            # Compute Mauve score
+            try:
+                mauve_result = compute_mauve(p_text=human_answers, q_text=frame.loc[idx, model_key],
+                                             device_id=0, verbose=False, featurize_model_name=args.model_name)
+                frame.loc[idx, col_name] = mauve_result.mauve
+            except Exception as err:
+                print(f"Error computing Mauve for index {idx}: {err}")
+
+    return frame

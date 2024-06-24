@@ -1,5 +1,11 @@
 #!/usr/bin/env python
 # coding=utf-8
+"""
+This script specifically designed for the ATT with special token case.
+In this script, we have added new special token as a seperator <|sample_answer|> and
+initialized it as the average of other items.
+Note: This script is not adapted for Phi3 usage.
+"""
 from torch.cuda import memory_allocated
 import argparse
 import logging
@@ -41,7 +47,10 @@ import sys
 import subprocess
 import gc  # Import the garbage collector moduleos.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
 
-sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+"""
+To be able to import from other files, either use sys.path.append or declare the path as PYTHONPATH in environment variables.
+#sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
+"""
 
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 
@@ -50,7 +59,8 @@ from eval.truthfulqa.run_eval import parse_args as parse_args_eval
 from open_instruct.merge_lora import main as merge_lora
 import pandas as pd
 logger = get_logger(__name__)
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
+
+#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256" -> for cuda out of memory error
 
 try:
     from hf_olmo import OLMoTokenizerFast
@@ -70,45 +80,41 @@ if api_key_file:
 else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
+def save_with_accelerate_final(accelerator, model, tokenizer, output_dir, args, optimizer,scheduler):
+    unwrapped_model = accelerator.unwrap_model(model)
+    # When doing multi-gpu training, we need to use accelerator.get_state_dict(model) to get the state_dict.
+    # Otherwise, sometimes the model will be saved with only part of the parameters.
+    # Also, accelerator needs to use the wrapped model to get the state_dict.
+    state_dict = accelerator.get_state_dict(model)
+    if args.use_lora:
+        # When using lora, the unwrapped model is a PeftModel, which doesn't support the is_main_process
+        # and has its own save_pretrained function for only saving lora modules.
+        # We have to manually specify the is_main_process outside the save_pretrained function.
+        if accelerator.is_main_process:
+            unwrapped_model.save_pretrained(output_dir, state_dict=state_dict)
+    else:
+        # don't use safetensors for saving for now
+        unwrapped_model.save_pretrained(
+            output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save,
+            state_dict=state_dict,
+            safe_serialization=False
+        )
+    # Save the optimizer state
+    optimizer_state_file = os.path.join(output_dir, "optimizer_state.pt")
+    if accelerator.is_main_process:
+        torch.save(optimizer.state_dict(), optimizer_state_file)
 
-def log_eval_results_to_wandb(csv_path, epoch):
-    # Load the summary CSV file
-    try:
-        # Load the summary CSV file
-        results_df = pd.read_csv(csv_path)
-        metrics={}
-        # Assume there's only one row of metrics, typical in a summarised results CSV
-        if not results_df.empty:
-            results_dict = results_df.iloc[0].to_dict()  # Convert the first row to a dictionary
-            metrics={
-                "BLEURT_acc": results_dict.get('BLEURT acc', None),
-                "bleu_acc": results_dict.get('bleu acc', None),
-                "rouge1_acc": results_dict.get('rouge1 acc', None),
-                "rouge2_acc": results_dict.get('rouge2 acc', None),
-                "rougeL_acc": results_dict.get('rougeL acc', None),
-                "eval_step": epoch + 1
-            }
+    # Save the scheduler state if a scheduler is used
+    if scheduler is not None:
+        scheduler_state_file = os.path.join(output_dir, "scheduler_state.pt")
+        if accelerator.is_main_process:
+            torch.save(scheduler.state_dict(), scheduler_state_file)
 
-        else:
-            print("No data found in the CSV file.")
-        return metrics
-    except Exception as e:
-        print(f"Failed to read or log evaluation results: {e}")
+    # Optionally, save training arguments or any other configs as a JSON
+    args_file = os.path.join(output_dir, "training_args.json")
+    with open(args_file, "w") as f:
+        json.dump(vars(args), f)
 
-import subprocess
-
-def run_evaluation_subprocess(args,base_path, run_id):
-    """ Run the evaluation script as a subprocess. """
-    # Construct the command to execute the Python script
-    command = [
-        'python', '/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct/open_instruct/eval_script.py',
-        '--base_path', base_path,
-        '--base_model', args.base_model_dir,
-        '--wandb_run_id', run_id,
-        '--with_token'
-    ]
-    # Run the command
-    subprocess.run(command, capture_output=True, text=True)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -383,7 +389,6 @@ def encode_with_rejected_chosen(example, tokenizer, max_seq_length, add_bos=Fals
         return message_text
 
     example_text = _concat_messages(messages).strip()
-    # print(example_text) #to be commented out
 
     if add_bos:
         example_text = tokenizer.bos_token + example_text
@@ -578,11 +583,7 @@ def main():
             args.dataset_name,
             args.dataset_config_name,
         )
-        allocated = torch.cuda.memory_allocated(0)
-        reserved = torch.cuda.memory_reserved(0)
 
-        # print(f"Memory Allocated after loading dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-        # print(f"Memory Reserved after loading dataset: {reserved / (1024 ** 3)} GB")
     else:
         data_files = {}
         dataset_args = {}
@@ -595,10 +596,10 @@ def main():
         )
 
     # for train
-    # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line) -> for now
+    # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line)
     updated_dataset_train = raw_datasets['train'].map(add_filtered_msgs)
     filtered_train = updated_dataset_train.filter(
-        lambda x: len(x['rejected_filtered']) > 0)#.select(range(100)) # delete this
+        lambda x: len(x['rejected_filtered']) > 0)
 
     # for test
     updated_dataset_test = raw_datasets['test'].map(add_filtered_msgs)
@@ -667,11 +668,7 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
-    allocated = torch.cuda.memory_allocated(0)
-    reserved = torch.cuda.memory_reserved(0)
 
-    # print(f"Memory Allocated after loading model and tokenizer: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-    # print(f"Memory Reserved after loading model and tokenizer: {reserved / (1024 ** 3)} GB")
     if args.model_name_or_path:
         if args.use_qlora:
             bnb_config = BitsAndBytesConfig(
@@ -814,11 +811,7 @@ def main():
     else:
         raise ValueError("You need to have either 'rejected'&'chosen' in your column names.")
 
-    allocated = torch.cuda.memory_allocated(0)
-    reserved = torch.cuda.memory_reserved(0)
 
-    # print(f"Memory Allocated after processing dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-    # print(f"Memory Reserved after processing dataset: {reserved / (1024 ** 3)} GB")
     with accelerator.main_process_first():
         lm_datasets = filtered_dataset.map(
             encode_function,
@@ -831,11 +824,6 @@ def main():
         )
         lm_datasets.set_format(type="pt")
         lm_datasets = lm_datasets.filter(lambda example: (example['labels'] != -100).any())
-        allocated = torch.cuda.memory_allocated(0)
-        reserved = torch.cuda.memory_reserved(0)
-
-        # print(f"Memory Allocated after tokenizing and reformatting dataset: {allocated / (1024 ** 3)} GB")  # Convert bytes to GB
-        # print(f"Memory Reserved after tokenizing and reformatting  dataset: {reserved / (1024 ** 3)} GB")
 
     train_dataset = lm_datasets["train"]
 
@@ -925,8 +913,6 @@ def main():
     # Define custom step metric for evaluation
     run_id = wandb.run.id
 
-    metrics_table = wandb.Table(
-        columns=["epoch", "BLEURT_acc", "bleu_acc", "rouge1_acc", "rouge2_acc", "rougeL_acc"])
     wandb.define_metric("eval_step")
     # Define evaluation metrics with their respective custom step
     wandb.define_metric("BLEURT_acc", step_metric="eval_step")
@@ -966,9 +952,36 @@ def main():
             path = os.path.basename(checkpoint_path)
 
         accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
-        accelerator.load_state(path)
+        model.load_adapter(checkpoint_path, adapter_name=checkpoint_path)
+        model.print_trainable_parameters()
+
+        """
+        There is a problem in the use of this loaded optimizer state. For now, it is commented out.
+        optimizer_state_file = os.path.join(checkpoint_path, 'optimizer_state.pt')
+
+        # Check if the optimizer state file exists before loading
+        if os.path.exists(optimizer_state_file):
+            optimizer_state_dict = torch.load(optimizer_state_file)
+            optimizer.load_state_dict(optimizer_state_dict)
+            print("Optimizer state loaded successfully.")
+        else:
+            print("Optimizer state file does not exist.")
+        """
+        # Path to the scheduler state file
+        # scheduler_state_file = 'scheduler_state.pt'
+
+        scheduler_state_file = os.path.join(checkpoint_path, 'scheduler_state.pt')
+
+        # Check if the scheduler state file exists before loading
+        if os.path.exists(scheduler_state_file):
+            scheduler_state_dict = torch.load(scheduler_state_file)
+            lr_scheduler.load_state_dict(scheduler_state_dict)
+            print("Scheduler state loaded successfully.")
+        else:
+            print("Scheduler state file does not exist.")
+
         # Extract `epoch_{i}` or `step_{i}`
-        training_difference = os.path.splitext(path)[0]
+        training_difference = path
 
         if "epoch" in training_difference:
             starting_epoch = int(training_difference.replace("epoch_", "")) + 1
@@ -986,6 +999,11 @@ def main():
 
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
+
+    # Prepare everything with `accelerator`.
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
+    )
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
@@ -1008,9 +1026,7 @@ def main():
             batch_size = len(batch['input_ids'])  # Assuming 'input_ids' is the key for input data
             epoch_data_count += batch_size
             with accelerator.accumulate(model):
-                #print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
                 outputs = model(**batch, use_cache=False)
-                #print(f"Memory allocated after forward pass: {memory_allocated() / 1e9} GB")
 
                 if args.reduce_loss == 'mean':
                     loss = outputs.loss
@@ -1044,10 +1060,10 @@ def main():
                 optimizer.zero_grad()
                 lr_scheduler.step()
 
-                if step % 500 == 0:
+                #for cuda out of memory issues
+                if step % 2000 == 0:
                     torch.cuda.empty_cache()
 
-                # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 completed_steps += 1
@@ -1080,41 +1096,23 @@ def main():
                     break
 
         print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
+
         if args.checkpointing_steps == "epoch":
             output_dir = f"epoch_{epoch}"
-            torch.cuda.empty_cache()
+
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
                 tokenizer.save_pretrained(output_dir)
-            save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
-            accelerator.wait_for_everyone()  # ensure that the files are created
-            print(output_dir)
 
-            print(f"Running evaluation at the end of epoch {epoch + 1}")
-            run_evaluation_subprocess(args, output_dir, run_id)
-            csv_path = output_dir + "/eval_results/summary.csv"
-            print("log eval results to wandb")
-            metrics_log = log_eval_results_to_wandb(csv_path, epoch)
-            logger.info(f"Epoch {epoch} Evaluation Metrics: {metrics_log}")
-            if args.with_tracking:
-                # Log evaluation metrics
-                wandb.log(metrics_log)
-                #metrics_table = wandb.Table(
-                #    columns=["epoch", "BLEURT_acc", "bleu_acc", "rouge1_acc", "rouge2_acc", "rougeL_acc"])
-                metrics_table.add_data(
-                    metrics_log["eval_step"],
-                    metrics_log["BLEURT_acc"],
-                    metrics_log["bleu_acc"],
-                    metrics_log["rouge1_acc"],
-                    metrics_log["rouge2_acc"],
-                    metrics_log["rougeL_acc"]
-                )
-                wandb.log({"Verification Table": metrics_table})
+            #save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
+            save_with_accelerate_final(accelerator, model, tokenizer, output_dir, args, optimizer,
+                                       lr_scheduler)
 
     if args.output_dir is not None:
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
-        save_with_accelerate(accelerator, model, tokenizer, args.output_dir, args)
+        save_with_accelerate_final(accelerator, model, tokenizer, args.output_dir, args, optimizer,
+                                   lr_scheduler)  # to be able to recover
 
     accelerator.wait_for_everyone()
     if args.with_tracking:
