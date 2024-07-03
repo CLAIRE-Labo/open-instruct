@@ -263,18 +263,15 @@ def create_prompt(original_questions, tag, withToken=False, bos="<|endoftext|>",
 def run_hf_model_create_input(withToken, questions, document, tag, preset="qa", batch_size=1, max_new_tokens=50,
                               chat_formatting_function=None, storage="tmp", idx_list=[]):
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
-    print(document)
-    print(os.path.exists(document))
     try:
         # Check if the CSV already exists
         if document is not None and os.path.exists(document):
             questions = pd.read_csv(document)
-
             questions["modified_input"] = create_prompt(questions, tag, withToken=withToken, bos="", eos="")
             print(questions["modified_input"].to_list()[0])
-            print("first stage is taken")
+            print("first stage input creation done")
         else:
-            print("entered run_hf_model_create_input model")
+            print("get initial responses from base llm")
             model = load_hf_lm(
                 model_name_or_path=args.base_llm_model,
                 load_in_8bit=args.load_in_8bit,
@@ -286,7 +283,7 @@ def run_hf_model_create_input(withToken, questions, document, tag, preset="qa", 
                 tokenizer_name_or_path=args.base_llm_model,
                 use_fast_tokenizer=not args.use_slow_tokenizer,
             )
-            if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+            if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast): #for phi3
                 tokenizer.padding_side = 'left'
                 num_added_tokens = tokenizer.add_special_tokens({
                     "bos_token": "<s>",
@@ -304,6 +301,7 @@ def run_hf_model_create_input(withToken, questions, document, tag, preset="qa", 
 
                 # The ID of the padding token is set to the ID of the unknown token.
                 tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+                tokenizer.padding_side = 'left'
 
             if tag not in questions.columns:
                 questions[tag] = ''
@@ -317,24 +315,15 @@ def run_hf_model_create_input(withToken, questions, document, tag, preset="qa", 
                     messages = [{"role": "user", "content": prompt}]
                     prompts[idx] = chat_formatting_function(messages, tokenizer, add_bos=False)
                     prompt += "A:" if prompt[-1] in ["\n", " "] else " A:"
-            phi3 = True
+
             # get the last token because the tokenizer may add space tokens at the start.
-            if phi3:
-                tokenizer.padding_side = 'left'
-                stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
-                completions = generate_completions(
-                    model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
-                    stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
-                    do_sample=True, top_k=50, top_p=0.95
-                )
-            else:
-                # get the last token because the tokenizer may add space tokens at the start.
-                stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
-                completions = generate_completions(
-                    model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
-                    stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
-                    do_sample=False,
-                )
+            stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
+            completions = generate_completions(
+                model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
+                stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
+                do_sample=False,
+                # do_sample=True, top_k=50, top_p=0.95 for phi 3 case
+            )
             assert len(completions) == len(prompts)
 
             # Post-processing of completions
@@ -342,16 +331,15 @@ def run_hf_model_create_input(withToken, questions, document, tag, preset="qa", 
                 questions.loc[idx, tag] = trim_answer(completion)
 
             questions["modified_input"] = create_prompt(questions, tag, withToken=withToken, bos="", eos="")
-            # questions.to_csv(f"results/1b_sft_results_withToken.csv", index=False)
-            print(questions['modified_input'].to_list()[0])
-            print("*****")
+            print("modified input sample:" ,questions['modified_input'].to_list()[0])
+
 
         row_data = []
         # Extract row data for specific indices
         if idx_list:
             for idx in idx_list:
                 item = {
-                    "epoch": storage,
+                    "epoch":"",
                     "prompt_before": questions['Question'][idx],
                     "prompt_after": "",
                     "before_translation": questions[tag][idx],
@@ -365,7 +353,7 @@ def run_hf_model_create_input(withToken, questions, document, tag, preset="qa", 
 
 
 def run_hf_model_preference(save_dir, withToken, questions, model, tokenizer, tag, preset="qa", batch_size=1,
-                            max_new_tokens=50, chat_formatting_function=None, storage="tmp", idx_list=[],
+                            max_new_tokens=50, chat_formatting_function=None, idx_list=[],
                             text_table=None, row_data={}, wandb_run=None):
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
     print("entered run hf model")
@@ -392,27 +380,12 @@ def run_hf_model_preference(save_dir, withToken, questions, model, tokenizer, ta
             messages = [{"role": "system", "content": system_message}, {"role": "user", "content": prompt}]
             prompts[idx] = chat_formatting_function(messages, tokenizer, add_bos=False)
             prompt += "Prompt:" if prompt[-1] in ["\n", " "] else " Prompt:"
-    print(prompts[0])
-    phi3 = True
-    # get the last token because the tokenizer may add space tokens at the start.
-    if phi3:
-        tokenizer.padding_side = 'left'
-        stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
-        completions = generate_completions(
-            model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
-            stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
-            do_sample=True, top_k=50, top_p=0.95
-        )
-    else:
-        # [0]) get the last token because the tokenizer may add space tokens at the start.
-        # prompts=prompts[0:4]
-        # stop_sequence=tokenizer.encode(tokenizer.eos_token)
-        stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
-        completions = generate_completions(
-            model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
-            stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
-            do_sample=False,
-        )
+    stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
+    completions = generate_completions(
+        model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
+        stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
+        do_sample=False,
+    )
     assert len(completions) == len(prompts)
     if wandb_run:
         text_table = wandb.Table(
@@ -422,6 +395,7 @@ def run_hf_model_preference(save_dir, withToken, questions, model, tokenizer, ta
     # print("Completion:", completions[idx])
     for row, idx in zip(row_data, idx_list):
         # Update the 'after_translation' field
+        row["epoch"]=tag.split('/')[-1]
         row["prompt_after"] = prompts[idx]
         row["after_translation"] = completions[idx]
 
@@ -435,7 +409,7 @@ def run_hf_model_preference(save_dir, withToken, questions, model, tokenizer, ta
                 row["after_translation"]
             )
         print("before after comparison is logged")
-        wandb.log({f"samples_evaluation_{storage}": text_table})
+        wandb.log({f"samples_evaluation_{tag.split('/')[-1]}": text_table})
     # if it's not a chat format, we will do some post-processing for the answer to make sure it's valid
     # otherwise, we will just store the completions as is
     file_path = os.path.join(save_dir, 'before_after.json')
@@ -445,17 +419,14 @@ def run_hf_model_preference(save_dir, withToken, questions, model, tokenizer, ta
     for idx, completion in zip(questions.index, completions):
         questions.loc[idx, tag] = trim_answer(completion)
     print(questions.columns)
-    questions.to_csv(f"{save_dir}/{storage}.csv", index=False)
     return questions
 
 
 def run_hf_model_preference_recursive(save_dir, withToken, questions, model, tokenizer, tag, preset="qa", batch_size=1,
-                                      max_new_tokens=20500,
-                                      chat_formatting_function=None, storage="tmp", idx_list=[], row_data={}):
+                                      max_new_tokens=500,
+                                      chat_formatting_function=None, document=None):
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
-    document = "outputs/finalized_truthful/consec_att2/olmo7b_pref_5epochs_merged_2.csv"
-    # tag="olmo7b_pref_5epochs_merged_0"
-    print(os.path.exists(document))
+
     if document is not None and os.path.exists(document):
         print("found doc")
         questions = pd.read_csv(document)
@@ -492,49 +463,36 @@ def run_hf_model_preference_recursive(save_dir, withToken, questions, model, tok
                 messages = [{"role": "system", "content": system_message}, {"role": "user", "content": prompt}]
                 prompts[idx] = chat_formatting_function(messages, tokenizer, add_bos=False)
                 prompt += "Prompt:" if prompt[-1] in ["\n", " "] else " Prompt:"
-        print(prompts[0])
-        # [0]) get the last token because the tokenizer may add space tokens at the start.
-        phi3 = False
+
         # get the last token because the tokenizer may add space tokens at the start.
-        if phi3:
-            tokenizer.padding_side = 'left'
-            stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
-            completions = generate_completions(
-                model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
-                stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
-                do_sample=True, top_k=50, top_p=0.95
-            )
-        else:
-            stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
-            completions = generate_completions(
-                model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
-                stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
-                do_sample=False,
-            )
+        stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
+        completions = generate_completions(
+            model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
+            stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
+            do_sample=False,
+        )
         assert len(completions) == len(prompts)
 
         for idx, completion in zip(questions.index, completions):
             questions.loc[idx, tag] = trim_answer(completion)
 
         print(questions.columns)
+        filename_to_store = tag.split('/')[-1]
         questions.to_csv(f"{save_dir}/{storage}.csv", index=False)
+
         questions["modified_input"] = create_prompt(questions, tag, withToken=withToken, bos="", eos="")
 
     return questions, tag
 
 
 def run_hf_model(questions, model, tokenizer, tag, preset="qa", batch_size=1, max_new_tokens=50,
-                 chat_formatting_function=None, storage="tmp", document=None):
+                 chat_formatting_function=None, document=None):
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
-    print("entered run hf model")
-    if document is not None and os.path.exists(document):
+
+    if document is not None and os.path.exists(document): #document is used to directly read existing stored predictions
         questions = pd.read_csv(document)
-        print(questions.columns)
-        print("perform eval on hf model document")
-        print(questions[tag].to_list()[0])
-        # questions["modified_input"] = create_prompt(questions, tag, withToken=withToken, bos="", eos="")
+        print(questions[tag].to_list()[0]) # a sample to see
     else:
-        print("else")
         if tag not in questions.columns:
             questions[tag] = ''
         print(questions.columns)
@@ -550,39 +508,26 @@ def run_hf_model(questions, model, tokenizer, tag, preset="qa", batch_size=1, ma
                 prompts[idx] = chat_formatting_function(messages, tokenizer, add_bos=False)
                 prompt += "A:" if prompt[-1] in ["\n", " "] else " A:"
 
-        # prompts=prompts[0:5]
-        phi3 = True
-        # get the last token because the tokenizer may add space tokens at the start.
-        if phi3:
-            tokenizer.padding_side = 'left'
-            stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
-            completions = generate_completions(
-                model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
-                stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
-                do_sample=True, top_k=50, top_p=0.95
-            )
-        else:
-            # stop_sequence=tokenizer.encode(tokenizer.eos_token)
-            stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
-            print(stop_sequence)
-            completions = generate_completions(
-                model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
-                stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
-                do_sample=False,
-            )
+        # stop_sequence=tokenizer.encode(tokenizer.eos_token)
+        stop_sequence = tokenizer.encode("\n\n", add_special_tokens=False)[-2:]
+        print(stop_sequence)
+        completions = generate_completions(
+            model, tokenizer, prompts, batch_size=batch_size, max_new_tokens=max_new_tokens,
+            stop_id_sequences=[stop_sequence] if chat_formatting_function is None else None,
+            do_sample=False,
+        )
         assert len(completions) == len(prompts)
 
         # if it's not a chat format, we will do some post-processing for the answer to make sure it's valid
         # otherwise, we will just store the completions as is
         for idx, completion in zip(questions.index, completions):
             questions.loc[idx, tag] = trim_answer(completion)
-        print(questions.columns)
         if questions[tag].isnull().any():
             print("There are NaN values in the completions.")
         else:
             print("No NaN values in the completions.")
-        storage = "phi3_Sft_res"
-        questions.to_csv(f"results/{storage}.csv", index=False)
+        filename_to_store= tag.split('/')[-1]
+        questions.to_csv(f"results/{filename_to_store}.csv", index=False)
     return questions
 
 
@@ -648,7 +593,7 @@ def main(args):
     os.makedirs(args.save_dir, exist_ok=True)
     questions = pd.read_csv(os.path.join(args.data_dir, "TruthfulQA.csv"))  # .head(10)
     random_indices = random.sample(range(len(questions)), 3)
-    if args.wandb_run_id is not None:
+    if args.wandb_run_id is not None: #to store results if needed
         wandb.init(project="alignment_translation", id=args.wandb_run_id, resume="allow")
 
     if args.num_instances is not None:
@@ -667,14 +612,12 @@ def main(args):
                 batch_size=args.eval_batch_size,
                 chat_formatting_function=dynamic_import_function(
                     args.chat_formatting_function) if args.use_chat_format else None,
-                storage=args.filename_answers,
-                idx_list=random_indices
+                idx_list=random_indices #random prompt ids for before-after comparison
             )
-            # questions=questions.head(10)
         else:
-            print("no preference for now, get initial prompt answers")
+            print("no preference for now")
 
-        print(args.model_name_or_path)
+
         tokenizer = load_hf_tokenizer(
             model_name_or_path=args.model_name_or_path,
             tokenizer_name_or_path=args.tokenizer_name_or_path,
@@ -686,7 +629,7 @@ def main(args):
             device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
             gptq_model=args.gptq,
         )
-        if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+        if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast): #phi3
             tokenizer.padding_side = 'left'
             num_added_tokens = tokenizer.add_special_tokens({
                 "bos_token": "<s>",
@@ -704,7 +647,7 @@ def main(args):
 
             # The ID of the padding token is set to the ID of the unknown token.
             tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
-        # model.eval()
+
 
         args.hf_truth_model_name_or_path = args.model_name_or_path
         args.hf_info_model_name_or_path = args.model_name_or_path
@@ -728,7 +671,6 @@ def main(args):
                 batch_size=args.eval_batch_size,
                 chat_formatting_function=dynamic_import_function(
                     args.chat_formatting_function) if args.use_chat_format else None,
-                storage=args.filename_answers,
                 document=args.document
             )
         if any(metric in allowable_metrics for metric in args.metrics) and args.preference == True:
@@ -745,9 +687,6 @@ def main(args):
                     batch_size=args.eval_batch_size,
                     chat_formatting_function=dynamic_import_function(
                         args.chat_formatting_function) if args.use_chat_format else None,
-                    storage=args.filename_answers,
-                    idx_list=random_indices,
-                    row_data=row_data
                 )
             else:
                 run_hf_model_preference(
@@ -761,7 +700,6 @@ def main(args):
                     batch_size=args.eval_batch_size,
                     chat_formatting_function=dynamic_import_function(
                         args.chat_formatting_function) if args.use_chat_format else None,
-                    storage=args.filename_answers,
                     idx_list=random_indices,
                     row_data=row_data
                 )
