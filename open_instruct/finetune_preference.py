@@ -41,10 +41,8 @@ from transformers import (
 import sys
 import subprocess
 
-"""
-To be able to import from other files, either use sys.path.append or declare the path as PYTHONPATH in environment variables.
-#sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
-"""
+sys.path.append(Path(__file__).parents[1].absolute().as_posix())
+
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 #from eval.truthfulqa.run_eval import main as run_eval
 #from eval.truthfulqa.run_eval import parse_args as parse_args_eval

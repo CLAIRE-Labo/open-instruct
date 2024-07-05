@@ -49,10 +49,8 @@ if gpus:
     except RuntimeError as e:
         print("Error setting memory limit:", e)
 
-"""
-To be able to import from other files, either use sys.path.append or declare the path as PYTHONPATH in environment variables.
-#sys.path.append('/claire-rcp-scratch/home/tandogan/alignment-as-translation/open-instruct')
-"""
+sys.path.append(Path(__file__).parents[1].absolute().as_posix())
+
 import warnings
 from eval.utils import (
     load_hf_lm,
