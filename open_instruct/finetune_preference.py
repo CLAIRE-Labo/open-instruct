@@ -40,6 +40,7 @@ from transformers import (
 )
 import sys
 import subprocess
+from pathlib import Path
 
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 

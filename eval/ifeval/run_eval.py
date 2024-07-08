@@ -14,6 +14,8 @@ import random
 import dataclasses
 import collections
 from typing import Dict, List, Optional, Union
+from pathlib import Path
+
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 
 import nltk

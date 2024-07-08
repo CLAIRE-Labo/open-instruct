@@ -25,6 +25,7 @@ from transformers import (
     OPTForCausalLM,
     BitsAndBytesConfig,
 )
+from pathlib import Path
 
 
 def get_gpu_memory():

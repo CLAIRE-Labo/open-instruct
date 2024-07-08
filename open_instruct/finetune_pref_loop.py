@@ -54,6 +54,7 @@ import sys
 import subprocess
 from transformers import StoppingCriteria
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from pathlib import Path
 
 
 class KeyWordsCriteria(StoppingCriteria):

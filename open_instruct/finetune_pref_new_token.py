@@ -46,6 +46,7 @@ from transformers import (
 import sys
 import subprocess
 import gc  # Import the garbage collector moduleos.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
+from pathlib import Path
 
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 
