@@ -580,17 +580,16 @@ def main():
     accelerator_log_kwargs = {}
 
     if args.with_tracking:
-        if args.with_tracking:
-            if "wandb" in args.report_to.split(",") or args.report_to == "all":
-                wandb_api_key = os.getenv('WANDB_API_KEY')
-                wandb.login(key=wandb_api_key)
+        if "wandb" in args.report_to.split(",") or args.report_to == "all":
+            wandb_api_key = os.getenv('WANDB_API_KEY')
+            wandb.login(key=wandb_api_key)
 
-                # Initialize wandb
-                wandb.init(project="alignment_translation", entity="claire-labo")
+            # Initialize wandb
+            wandb.init(project="alignment_translation", entity="claire-labo")
 
-                # Configure wandb logging within Accelerator
-                accelerator_log_kwargs["log_with"] = args.report_to
-                accelerator_log_kwargs["project_dir"] = args.output_dir
+            # Configure wandb logging within Accelerator
+            accelerator_log_kwargs["log_with"] = args.report_to
+            accelerator_log_kwargs["project_dir"] = args.output_dir
 
     # if you get timeouts (e.g. due to long tokenization) increase this.
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=args.timeout))
@@ -942,7 +941,7 @@ def main():
         model.print_trainable_parameters()
 
         """
-        There is a problem in the use of this loaded optimizer state. For now, it is commented out.
+        There is a problem in the use of this loaded optimizer state. For now, it is commented out."""
         optimizer_state_file = os.path.join(checkpoint_path, 'optimizer_state.pt')
 
         # Check if the optimizer state file exists before loading
@@ -952,7 +951,7 @@ def main():
             print("Optimizer state loaded successfully.")
         else:
             print("Optimizer state file does not exist.")
-        """
+
         # Path to the scheduler state file
         #scheduler_state_file = 'scheduler_state.pt'
 
