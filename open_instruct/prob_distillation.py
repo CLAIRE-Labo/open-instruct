@@ -473,6 +473,9 @@ def main():
         # if you get timeouts (e.g. due to long tokenization) increase this.
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=args.timeout))
 
+    teacher_model_1 = AutoModelForCausalLM.from_pretrained(
+        args.teacher_model_name_or_path, trust_remote_code=args.trust_remote_code
+    )
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         **accelerator_log_kwargs,
@@ -513,6 +516,11 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(  #to be used as student model
         args.model_name_or_path, trust_remote_code=args.trust_remote_code
     )
+
+    print("teacher model wte:",teacher_model.model.transformer.wte)
+    print("teacher_model:", teacher_model.model.transformer.wte.weight.shape)
+    print("teacher model_1 wte:",teacher_model.model.transformer.wte)
+    print("teacher_model_1:",teacher_model_1.model.transformer.wte.weight.shape)
 
     ################
     # Dataset & Lora Config
@@ -686,7 +694,7 @@ def main():
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
-
+    teacher_model_1.to(accelerator.device)
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         """
@@ -722,6 +730,25 @@ def main():
                 student_logits = student_outputs.logits
 
                 with torch.no_grad():
+                    #when we use teacher_model_1 it works. But when teacher_model used we cannot find the weights
+                    '''
+                    Traceback (most recent call last):
+                      File "open-instruct/open_instruct/prob_distillation.py", line 728, in main
+                        teacher_outputs = teacher_model(**student_inputs, use_cache=False)
+                      File "/usr/local/lib/python3.8/dist-packages/torch/nn/modules/module.py", line 1501, in _call_impl
+                        return forward_call(*args, **kwargs)
+                      File "/usr/local/lib/python3.8/dist-packages/hf_olmo/modeling_olmo.py", line 70, in forward
+                        outputs = self.model.forward(
+                      File "/usr/local/lib/python3.8/dist-packages/olmo/model.py", line 1220, in forward
+                        x = self.transformer.wte(input_ids) if input_embeddings is None else input_embeddings  # type: ignore
+                      File "/usr/local/lib/python3.8/dist-packages/torch/nn/modules/module.py", line 1501, in _call_impl
+                        return forward_call(*args, **kwargs)
+                      File "/usr/local/lib/python3.8/dist-packages/torch/nn/modules/sparse.py", line 162, in forward
+                        return F.embedding(    ### YOU CAN PUT A DEBUG POINT HERE, self.weight is empty, it was not like that in student model
+                      File "/usr/local/lib/python3.8/dist-packages/torch/nn/functional.py", line 2210, in embedding
+                        return torch.embedding(weight, input, padding_idx, scale_grad_by_freq, sparse)
+                    RuntimeError: 'weight' must be 2-D
+                    '''
                     teacher_outputs = teacher_model(**student_inputs, use_cache=False)
                     teacher_logits = teacher_outputs.logits
                 teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
@@ -744,6 +771,14 @@ def main():
             loss.backward()
             optimizer.step()
             lr_scheduler.step()
+
+            # Update progress bar and completed steps
+            progress_bar.update(1)
+            completed_steps += 1
+
+            # Early stopping condition if needed
+            if completed_steps >= args.max_train_steps:
+                break
 
         print(f"Epoch {epoch}: Total Loss = {total_loss}")
 

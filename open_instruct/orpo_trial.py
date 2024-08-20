@@ -381,7 +381,7 @@ if __name__ == "__main__":
             target_modules=["att_proj", "ff_proj", "attn_out", "ff_out"]  # for OLMo
             # target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]  # for phi3
         )
-    collate_fn = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
+    #collate_fn = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
     # the one in use: DPODataCollatorWithPadding(pad_token_id=1, label_pad_token_id=-100, is_encoder_decoder=False)
     trainer = ORPOTrainer(
         model,
@@ -390,7 +390,7 @@ if __name__ == "__main__":
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         peft_config=peft_config,
-        data_collator=collate_fn,
+        #data_collator=collate_fn,
     )
 
     # train and save the model
