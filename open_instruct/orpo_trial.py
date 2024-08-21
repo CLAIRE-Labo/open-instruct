@@ -1,42 +1,3 @@
-"""
-Run the ORPO training script with the following command with some example arguments.
-In general, the optimal configuration for ORPO will be similar to that of DPO without the need for a reference model:
-
-# regular:
-python examples/scripts/orpo.py \
-    --model_name_or_path=gpt2 \
-    --per_device_train_batch_size 4 \
-    --max_steps 1000 \
-    --learning_rate 8e-6 \
-    --gradient_accumulation_steps 1 \
-    --logging_steps 10 \
-    --eval_steps 500 \
-    --output_dir="gpt2-aligned-orpo" \
-    --warmup_steps 150 \
-    --report_to wandb \
-    --bf16 \
-    --logging_first_step \
-    --no_remove_unused_columns
-
-# peft:
-python examples/scripts/orpo.py \
-    --dataset "Anthropic/hh-rlhf"
-    --model_name_or_path=gpt2 \
-    --per_device_train_batch_size 4 \
-    --learning_rate 1e-4 \
-    --gradient_accumulation_steps 1 \
-    --output_dir="outputs/gpt2-lora-aligned-orpo" \
-    --report_to wandb \
-    --use_peft \
-    --lora_rank 64 \
-    --lora_alpha 16 \
-    --lora_dropout 0.1 \
-    --max_seq_length 2048 \
-    --trust_remote_code
-    --add_bos
-    --num_train_epochs 5
-    --checkpointing_steps "epoch"
-"""
 import math
 
 from datasets import load_dataset
@@ -271,6 +232,8 @@ def add_filtered_msgs(example):
 
 def _concat_messages(messages, type, tokenizer, add_bos=False):
     message_text = ""
+    # mention the None case -> to confirm alignment with other implementations
+
     if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
         # phi3 is a llama tokenizer and requires different template compared to OLMo
         """
@@ -280,7 +243,7 @@ def _concat_messages(messages, type, tokenizer, add_bos=False):
         """
         for message in messages:
             if message["role"] == "human":
-                message_text += "<|user|>" + message["content"].strip() +'<|end|>'+ "\n"
+                message_text += "<|user|>\n" + message["content"].strip() +'<|end|>'+ "\n"
             elif type == "chosen" and message["role"] == "assistant_chosen":
                 message_text += "<|assistant|>\n" + message["content"].strip() + '<|end|>' + "\n"
             elif type == "rejected" and message["role"] == "assistant_rejected":
@@ -291,7 +254,7 @@ def _concat_messages(messages, type, tokenizer, add_bos=False):
     else:
         for message in messages:
             if message["role"] == "human":
-                message_text += "<|user|>" + message["content"].strip() + "\n"
+                message_text += "<|user|>\n" + message["content"].strip() + "\n"
             elif type == "chosen" and message["role"] == "assistant_chosen":
                 message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
             elif type == "rejected" and message["role"] == "assistant_rejected":
@@ -418,7 +381,7 @@ if __name__ == "__main__":
             target_modules=["att_proj", "ff_proj", "attn_out", "ff_out"]  # for OLMo
             # target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]  # for phi3
         )
-    collate_fn = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
+    #collate_fn = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
     # the one in use: DPODataCollatorWithPadding(pad_token_id=1, label_pad_token_id=-100, is_encoder_decoder=False)
     trainer = ORPOTrainer(
         model,

@@ -41,6 +41,8 @@ from transformers import (
 import sys
 import subprocess
 from eval.utils import KeyWordsCriteria
+from pathlib import Path
+import gc
 
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 
@@ -1067,7 +1069,7 @@ def main():
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
 
-    # If passed along, set the training seed now.
+    # If passed along, set the training seed now. -> use this to split 90% the same everytime.
     if args.seed is not None:
         set_seed(args.seed)
 
@@ -1285,6 +1287,9 @@ def main():
             tokenizer.save_pretrained(args.output_dir)
         save_with_accelerate(accelerator, lora_model, tokenizer, args.output_dir, args)
 
+    #delete the model to save memory
+    del lora_model
+    gc.collect()
     # ATT finetuning finished
     lora_path = os.path.join(epoch_output_dir, str(best_epoch))
 
