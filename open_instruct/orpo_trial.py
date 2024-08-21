@@ -14,7 +14,8 @@ from transformers import (
 )
 import argparse
 from peft import LoraConfig, TaskType
-
+import wandb
+import os
 # NOTE FOR TODO
 # pip install trl -> update the docker container - TODO
 # pip install --upgrade --no-cache-dir git+https://github.com/NVIDIA/apex.git -> update the docker container - TODO
@@ -23,6 +24,19 @@ try:
     from hf_olmo import OLMoTokenizerFast
 except ImportError:
     print("OLMo not installed. Ignore if using a different model.")
+
+# wandb login stage
+api_key_file = os.getenv('WANDB_API_KEY_FILE_AT')
+
+if api_key_file:
+    try:
+        with open(api_key_file, 'r') as file:
+            wandb_api_key = file.readline().strip()
+            os.environ['WANDB_API_KEY'] = wandb_api_key  # Set the API key in the environment
+    except Exception as e:
+        raise ValueError(f"An error occurred while reading the WANDB_API_KEY from file: {e}")
+else:
+    raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a language modeling task")
@@ -120,7 +134,11 @@ def parse_args():
             "Only applicable when `--with_tracking` is passed."
         ),
     )
-
+    parser.add_argument(
+        "--with_tracking",
+        action="store_true",
+        help="Whether to enable experiment trackers for logging.",
+    )
     parser.add_argument(
         "--gradient_checkpointing",
         action="store_true",
@@ -284,6 +302,13 @@ def format_chat_template(row, tokenizer, add_bos=False):
 if __name__ == "__main__":
     args = parse_args()
 
+    if args.with_tracking:
+        if "wandb" in args.report_to.split(",") or args.report_to == "all":
+            wandb_api_key = os.getenv('WANDB_API_KEY')
+            wandb.login(key=wandb_api_key)
+            # Initialize wandb
+            wandb.init(project="alignment_translation", entity="claire-labo")
+
     ################
     # Model & Tokenizer
     ################
@@ -304,7 +329,7 @@ if __name__ == "__main__":
     # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line)
     updated_dataset_train = ds['train'].map(add_filtered_msgs)
     filtered_train = updated_dataset_train.filter(
-        lambda x: len(x['rejected_filtered']) > 0).select(range(5000)) #delete afterwards
+        lambda x: len(x['rejected_filtered']) > 0)#.select(range(5000)) #delete afterwards
 
     # for test
     updated_dataset_test = ds['test'].map(add_filtered_msgs)
