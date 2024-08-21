@@ -1,6 +1,7 @@
 from argparse import Namespace
 import sys
 import os
+from pathlib import Path
 
 """
 To be able to import from other files, either use sys.path.append or declare the path as PYTHONPATH in environment variables.
@@ -34,6 +35,7 @@ def evaluate_single_model(args):
         model_name_or_path=path,
         tokenizer_name_or_path=path,
         base_llm_model= args.base_model,
+        document=None,  # Mikhail: run_eval expects this to be present
         preference=True,
         data_dir="data/",
         save_dir=os.path.join(path, "eval_results"),  # Save results in a subdirectory

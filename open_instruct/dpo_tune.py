@@ -3,6 +3,8 @@
 '''
 DPO tuning script. Adapted from our finetuning script.
 '''
+
+from typing import Optional, Union, Dict
 import json
 import argparse
 import logging
@@ -16,8 +18,9 @@ from functools import partial
 from datetime import timedelta
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed, InitProcessGroupKwargs
+from accelerate.utils import set_seed, InitProcessGroupKwargs, check_device_map
 from datasets import load_dataset
+from torch.cuda import device
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import deepspeed
@@ -46,14 +49,34 @@ from peft import PeftConfig, PeftModel
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:64'
 from pathlib import Path
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
+from finetune_preference import run_evaluation_subprocess, log_eval_results_to_wandb
+
 
 logger = get_logger(__name__)
 
 try:
     from hf_olmo import OLMoTokenizerFast
+    from hf_olmo.modeling_olmo import OLMoForCausalLM
 except ImportError:
     logger.warning("OLMo not installed. Ignore if using a different model.")
 
+from transformers.models.olmo.modeling_olmo import OlmoForCausalLM
+
+@classmethod
+def _autoset_attn_implementation_for_olmo(
+        cls,
+        config,
+        use_flash_attention_2: bool = False,
+        torch_dtype: Optional[torch.dtype] = None,
+        device_map: Optional[Union[str, Dict[str, int]]] = None,
+        check_device_map: bool = True,
+    ):
+    actually_use_attn = use_flash_attention_2 or config.flash_attention
+    config = super(OLMoForCausalLM, cls)._autoset_attn_implementation(config=config, use_flash_attention_2=False, torch_dtype=torch_dtype, device_map=device_map, check_device_map=check_device_map)
+    config.flash_attention = actually_use_attn
+    return config
+
+OLMoForCausalLM._autoset_attn_implementation = _autoset_attn_implementation_for_olmo
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -579,18 +602,18 @@ def main():
     # in the environment
     accelerator_log_kwargs = {}
 
-    if args.with_tracking:
-        if args.with_tracking:
-            if "wandb" in args.report_to.split(",") or args.report_to == "all":
-                wandb_api_key = os.getenv('WANDB_API_KEY')
-                wandb.login(key=wandb_api_key)
+    uses_wandb = args.with_tracking and ("wandb" in args.report_to.split(",") or args.report_to == "all")
+    if uses_wandb:
+        wandb_api_key = os.getenv('WANDB_API_KEY')
+        wandb.login(key=wandb_api_key)
 
-                # Initialize wandb
-                wandb.init(project="alignment_translation", entity="claire-labo")
+        # Initialize wandb
+        wandb.init(project="alignment_translation", entity="claire-labo")
+        run_id = wandb.run.id
 
-                # Configure wandb logging within Accelerator
-                accelerator_log_kwargs["log_with"] = args.report_to
-                accelerator_log_kwargs["project_dir"] = args.output_dir
+        # Configure wandb logging within Accelerator
+        accelerator_log_kwargs["log_with"] = args.report_to
+        accelerator_log_kwargs["project_dir"] = args.output_dir
 
     # if you get timeouts (e.g. due to long tokenization) increase this.
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=args.timeout))
@@ -719,6 +742,7 @@ def main():
                     trust_remote_code=args.trust_remote_code,
                     low_cpu_mem_usage=args.low_cpu_mem_usage,
                     use_flash_attention_2=True if args.use_flash_attn else False,
+                    # flash_attention=True if args.use_flash_attn else False
                 )
         else:
             logger.info("Training new model from scratch")
@@ -776,8 +800,21 @@ def main():
         if args.use_qlora:
             model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
 
+        print(model)
         logger.info("Initializing LORA model...")
-        if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+        # processing the HF version of OLMO separately, it has different modules
+        if args.model_name_or_path == "allenai/OLMo-1B-hf":
+            # olmo target modules are used
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                inference_mode=False,
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+                #target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]  # for phi3
+            )
+        elif isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 inference_mode=False,
@@ -1085,7 +1122,25 @@ def main():
                 tokenizer.save_pretrained(output_dir)
             save_with_accelerate_final(accelerator, model, tokenizer, output_dir, args, optimizer,
                                        lr_scheduler)  # to be able to recover
-            #no evaluation for now
+            output_dir = f"epoch_{epoch}"
+            torch.cuda.empty_cache()
+            if args.output_dir is not None:
+                output_dir = os.path.join(args.output_dir, output_dir)
+                tokenizer.save_pretrained(output_dir)
+            save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
+            accelerator.wait_for_everyone()  # ensure that the files are created
+            print(output_dir)
+
+            if uses_wandb:
+                print(f"Running evaluation at the end of epoch {epoch + 1}")
+                # TODO is this correct?
+                args.base_model_dir = args.model_name_or_path
+                run_evaluation_subprocess(args, output_dir, run_id, tokenizer)
+                csv_path=output_dir+"/eval_results/summary.csv"
+                print("log eval results to wandb")
+                metrics_log=log_eval_results_to_wandb(csv_path, epoch)
+                logger.info(f"Epoch {epoch} Evaluation Metrics: {metrics_log}")
+                wandb.log(metrics_log)
 
     if args.with_tracking:
         accelerator.end_training()

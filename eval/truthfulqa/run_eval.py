@@ -259,14 +259,14 @@ def create_prompt(original_questions, tag, withToken=False, bos="<|endoftext|>",
     return formatted_questions
 
 
-def run_hf_model_create_input(withToken, questions, document, tag, preset="qa", batch_size=1, max_new_tokens=50,
+def run_hf_model_create_input(args, questions, tag, batch_size=1, max_new_tokens=50,
                               chat_formatting_function=None, storage="tmp", idx_list=[]):
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
     try:
         # Check if the CSV already exists
-        if document is not None and os.path.exists(document):
-            questions = pd.read_csv(document)
-            questions["modified_input"] = create_prompt(questions, tag, withToken=withToken, bos="", eos="")
+        if args.document is not None and os.path.exists(args.document):
+            questions = pd.read_csv(args.document)
+            questions["modified_input"] = create_prompt(questions, tag, withToken=args.withToken, bos="", eos="")
             print(questions["modified_input"].to_list()[0])
             print("first stage input creation done")
         else:
@@ -307,7 +307,7 @@ def run_hf_model_create_input(withToken, questions, document, tag, preset="qa", 
             questions[tag].fillna('', inplace=True)
             questions[tag] = questions[tag].astype(str)
             prompts = [
-                format_prompt(questions.loc[idx], preset, format='general') for idx in questions.index
+                format_prompt(questions.loc[idx], args.preset, format='general') for idx in questions.index
             ]
             if chat_formatting_function is not None:
                 for idx, prompt in enumerate(prompts):
@@ -329,7 +329,7 @@ def run_hf_model_create_input(withToken, questions, document, tag, preset="qa", 
             for idx, completion in zip(questions.index, completions):
                 questions.loc[idx, tag] = trim_answer(completion)
 
-            questions["modified_input"] = create_prompt(questions, tag, withToken=withToken, bos="", eos="")
+            questions["modified_input"] = create_prompt(questions, tag, withToken=args.withToken, bos="", eos="")
             print("modified input sample:" ,questions['modified_input'].to_list()[0])
 
 
@@ -348,7 +348,8 @@ def run_hf_model_create_input(withToken, questions, document, tag, preset="qa", 
 
         return questions, row_data
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"An error occurred: {e}", flush=True)
+        print(e.__traceback__, flush=True)
 
 
 def run_hf_model_preference(save_dir, withToken, questions, model, tokenizer, tag, preset="qa", batch_size=1,
@@ -603,11 +604,9 @@ def main(args):
 
         if args.preference and args.base_llm_model:
             questions, row_data = run_hf_model_create_input(
-                args.withToken,
-                questions,
-                document=args.document,
+                args=args,
+                questions=questions,
                 tag=args.base_llm_model,
-                preset=args.preset,
                 batch_size=args.eval_batch_size,
                 chat_formatting_function=dynamic_import_function(
                     args.chat_formatting_function) if args.use_chat_format else None,

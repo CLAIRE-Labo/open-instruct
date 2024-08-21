@@ -95,10 +95,10 @@ def log_eval_results_to_wandb(csv_path, epoch):
     except Exception as e:
         print(f"Failed to read or log evaluation results: {e}")
 
-def run_evaluation_subprocess(args,base_path, run_id, tokenizer):
+def run_evaluation_subprocess(args, base_path, run_id, tokenizer):
     """ Run the evaluation script as a subprocess. """
     command = [
-        'python', '../open-instruct/open_instruct/eval_script.py',
+        'python', str(Path(__file__).parent / 'eval_script.py'),
         '--base_path', base_path,
         '--base_model', args.base_model_dir,
         '--wandb_run_id', run_id,
@@ -1091,7 +1091,7 @@ def main():
             print(output_dir)
 
             print(f"Running evaluation at the end of epoch {epoch + 1}")
-            run_evaluation_subprocess(args,output_dir, run_id, tokenizer)
+            run_evaluation_subprocess(args, output_dir, run_id, tokenizer)
             csv_path=output_dir+"/eval_results/summary.csv"
             print("log eval results to wandb")
             metrics_log=log_eval_results_to_wandb(csv_path, epoch)
