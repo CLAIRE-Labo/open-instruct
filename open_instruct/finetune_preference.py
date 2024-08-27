@@ -52,19 +52,13 @@ from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_tr
 from utils import add_common_training_args, parse_entry_anthropic_hh, merge_consecutive_messages_and_trim, \
     is_entry_ok_anthropic_hh, pretty_print_chatml
 
+from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
+
 # from eval.truthfulqa.run_eval import main as run_eval
 # from eval.truthfulqa.run_eval import parse_args as parse_args_eval
 
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256" - Cuda out of memory
 
-
-ATT_SYSTEM_PROMPT = "You are given a prompt and a response. The prompt may consist of multiple dialogue turns. Your task is to provide an improved final response."
-ATT_TEMPLATE = """{last_user_message}
-
-Current rejected answer:
-{rejected}
-
-Corrected output:"""
 
 logger = get_logger(__name__)
 import pandas as pd
@@ -72,7 +66,7 @@ import pandas as pd
 try:
     from hf_olmo import OLMoTokenizerFast
 except ImportError:
-    logger.warning("OLMo not installed. Ignore if using a different model."
+    logger.warning("OLMo not installed. Ignore if using a different model.")
 
 # wandb login stage
 api_key_file = os.getenv('WANDB_API_KEY_FILE_AT')
@@ -272,7 +266,7 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False):
     # The chat template used by Mistral is not convenient because it only adds the system prompt to the last
     # user message, and only does it if the last message in the conversation is indeed by the user. This would make it
     # painful to set up the labels for SFT. Hence, we just prepend the system prompt to the first user message instead.
-    if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+    if tokenizer.chat_template == BAD_MISTRAL_CHAT_TEMPLATE:
         messages[0]["content"] = ATT_SYSTEM_PROMPT + '\n\n' + messages[0]["content"]
     else:
         system_msg = {'role': 'system', 'content': ATT_SYSTEM_PROMPT}
@@ -417,6 +411,17 @@ def extract_role_messages(example):
     return example
 
 
+def target_lora_modules(model) -> List[str]:
+    if model.__class__.__name__ == "Phi3ForCausalLM":
+        return ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
+    elif model.__class__.__name__ == "OLMoForCausalLM":
+        return ["att_proj", "ff_proj", "attn_out", "ff_out"]
+    elif model.__class__.__name__ == "MistralForCausalLM":
+        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    else:
+        raise ValueError(f"Model type {type(model)} not added yet. Model:\n {model}")
+
+
 def main():
     args = parse_args()
 
@@ -512,6 +517,7 @@ def main():
                    from the model revision `{args.model_revision}`."""
         logger.warn(warning)
 
+    tokenizer_name = args.tokenizer_name if args.tokenizer_name else args.model_name_or_path
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer_name,
@@ -532,6 +538,7 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+
 
     ######################################## Data Preprocessing ########################################
     if args.dataset_name is not None:
@@ -638,7 +645,8 @@ def main():
                 from_tf=bool(".ckpt" in args.model_name_or_path),
                 config=config,
                 trust_remote_code=args.trust_remote_code,
-                low_cpu_mem_usage=args.low_cpu_mem_usage,
+                low_cpu_mem_usage=args.low_cpu_mem_usage,#
+                torch_dtype=torch.bfloat16,
                 use_flash_attention_2=True if args.use_flash_attn else False,
                 revision=args.model_revision
             )
@@ -660,12 +668,14 @@ def main():
         assert num_added_tokens in [0,
                                     1,
                                     2], "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
-        # specific to phi3 case
-        # The padding token is set to the unknown token.
-        tokenizer.pad_token = tokenizer.unk_token
 
-        # The ID of the padding token is set to the ID of the unknown token.
-        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+
+        # Taken from https://github.com/microsoft/Phi-3CookBook/blob/main/code/04.Finetuning/Phi-3-finetune-lora-python.ipynb
+        if model.__class__.__name__ == "Phi3ForCausalLM":
+            tokenizer.pad_token = tokenizer.unk_token
+            # The ID of the padding token is set to the ID of the unknown token.
+            tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+
         tokenizer.padding_side = 'left'
 
     elif isinstance(tokenizer, GPTNeoXTokenizerFast):
@@ -675,47 +685,38 @@ def main():
         assert num_added_tokens == 1, "GPTNeoXTokenizer should only add one special token - the pad_token."
     elif isinstance(tokenizer, GPT2Tokenizer) and isinstance(model, OPTForCausalLM):
         num_added_tokens = tokenizer.add_special_tokens({'unk_token': '<unk>'})
-    elif isinstance(tokenizer, OLMoTokenizerFast):
-        # only the eos for olmo, but we use it as bos
-        tokenizer.bos_token = tokenizer.eos_token
-        assert args.add_bos, "For OLMo, you must add bos token to the beginning of the input sequence."
+
+    # Now OLMo supports chat templates, so we don't need to add bos token
+    # elif isinstance(tokenizer, OLMoTokenizerFast):
+    #     # only the eos for olmo, but we use it as bos
+    #     tokenizer.bos_token = tokenizer.eos_token
+    #     assert args.add_bos, "For OLMo, you must add bos token to the beginning of the input sequence."
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     # gather deepspeed to get "real" embedding size
     embeddings = model.get_input_embeddings()
 
+    # padding will enable tensorcores, hopefully will make it faster
+    # https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#requirements-tc
     with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
-        embedding_size = embeddings.weight.shape[0]
+        # embedding_size = embeddings.weight.shape[0]
         if len(tokenizer) > embeddings.weight.shape[0]:
-            model.resize_token_embeddings(len(tokenizer))
+            model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=128)
+        embedding_size = embeddings.weight.shape[0]
 
     if args.use_lora:
         if args.use_qlora:
             model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
-
         logger.info("Initializing LORA model...")
-        if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
-            peft_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                inference_mode=False,
-                r=args.lora_rank,
-                lora_alpha=args.lora_alpha,
-                lora_dropout=args.lora_dropout,
-                # target_modules=["att_proj", "ff_proj", "attn_out", "ff_out"]  # for OLMo
-                target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]  # for phi3
-            )
-        else:
-            # olmo target modules are used
-            peft_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                inference_mode=False,
-                r=args.lora_rank,
-                lora_alpha=args.lora_alpha,
-                lora_dropout=args.lora_dropout,
-                target_modules=["att_proj", "ff_proj", "attn_out", "ff_out"]  # for OLMo
-                # target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]  # for phi3
-            )
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_lora_modules(model)
+        )
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
     elif args.gradient_checkpointing:
@@ -1020,3 +1021,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
