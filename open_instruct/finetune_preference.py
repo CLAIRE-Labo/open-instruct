@@ -1,36 +1,43 @@
 #!/usr/bin/env python
 # coding=utf-8
-from torch.cuda import memory_allocated
+import os
+import sys
+from heapq import merge
+from typing import Dict, List
+from pathlib import Path
 import argparse
+from argparse import Namespace
 import logging
 import math
 import ast
 import os
 import random
-import datasets
 from datetime import timedelta
 import torch
 from functools import partial
+import subprocess
+
+from torch.cuda import memory_allocated
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed, InitProcessGroupKwargs
+import datasets
 from datasets import load_dataset
+from datasets import DatasetDict
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import deepspeed
 import wandb
-from argparse import Namespace
-from datasets import DatasetDict
-import subprocess
+import huggingface_hub
 
 import transformers
 from transformers import (
     AutoConfig,
+    PretrainedConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     LlamaTokenizer,
     LlamaTokenizerFast,
-    SchedulerType,
     DataCollatorForSeq2Seq,
     get_scheduler,
     GPTNeoXTokenizerFast,
@@ -38,25 +45,34 @@ from transformers import (
     OPTForCausalLM,
     BitsAndBytesConfig,
 )
-import sys
-import subprocess
-from pathlib import Path
 
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-#from eval.truthfulqa.run_eval import main as run_eval
-#from eval.truthfulqa.run_eval import parse_args as parse_args_eval
-import os
+from utils import add_common_training_args, parse_entry_anthropic_hh, merge_consecutive_messages_and_trim, \
+    is_entry_ok_anthropic_hh, pretty_print_chatml
 
-#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256" - Cuda out of memory
+# from eval.truthfulqa.run_eval import main as run_eval
+# from eval.truthfulqa.run_eval import parse_args as parse_args_eval
+
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256" - Cuda out of memory
+
+
+ATT_SYSTEM_PROMPT = "You are given a prompt and a response. The prompt may consist of multiple dialogue turns. Your task is to provide an improved final response."
+ATT_TEMPLATE = """{last_user_message}
+
+Current rejected answer:
+{rejected}
+
+Corrected output:"""
 
 logger = get_logger(__name__)
 import pandas as pd
+
 try:
     from hf_olmo import OLMoTokenizerFast
 except ImportError:
-    logger.warning("OLMo not installed. Ignore if using a different model.")
+    logger.warning("OLMo not installed. Ignore if using a different model."
 
 # wandb login stage
 api_key_file = os.getenv('WANDB_API_KEY_FILE_AT')
@@ -71,16 +87,17 @@ if api_key_file:
 else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
+
 def log_eval_results_to_wandb(csv_path, epoch):
     # Load the summary CSV file
     try:
         # Load the summary CSV file
         results_df = pd.read_csv(csv_path)
-        metrics={}
+        metrics = {}
         # Assume there's only one row of metrics, typical in a summarised results CSV
         if not results_df.empty:
             results_dict = results_df.iloc[0].to_dict()  # Convert the first row to a dictionary
-            metrics={
+            metrics = {
                 "BLEURT_acc": results_dict.get('BLEURT acc', None),
                 "bleu_acc": results_dict.get('bleu acc', None),
                 "rouge1_acc": results_dict.get('rouge1 acc', None),
@@ -94,6 +111,7 @@ def log_eval_results_to_wandb(csv_path, epoch):
         return metrics
     except Exception as e:
         print(f"Failed to read or log evaluation results: {e}")
+
 
 def run_evaluation_subprocess(args, base_path, run_id, tokenizer):
     """ Run the evaluation script as a subprocess. """
@@ -113,236 +131,17 @@ def run_evaluation_subprocess(args, base_path, run_id, tokenizer):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default=None,
-        help="The name of the dataset to use (via the datasets library).",
-    )
-    parser.add_argument(
-        "--dataset_config_name",
-        type=str,
-        default=None,
-        help="The configuration name of the dataset to use (via the datasets library).",
-    )
-    parser.add_argument(
-        "--save_tokenizer",
-        type=bool,
-        default=True,
-        help="Whether to save the tokenizer (default: True)."
-    )
-    parser.add_argument(
-        "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
-    )
-    parser.add_argument(
-        "--model_name_or_path",
-        type=str,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=False,
-    )
-    parser.add_argument(
-        "--config_name",
-        type=str,
-        default=None,
-        help="Pretrained config name or path if not the same as model_name",
-    )
-    parser.add_argument(
-        "--model_revision",
-        help="""If given, specifies a model revision (for HuggingFace models). This will 
-        be applied to both the `model_name_or_path` and `config_name` args.""",
-        default="main",
-        required=False,
-    )
-    parser.add_argument(
-        "--use_lora",
-        action="store_true",
-        help="If passed, will use LORA (low-rank parameter-efficient training) to train the model.",
-    )
-    parser.add_argument(
-        "--lora_rank",
-        type=int,
-        default=64,
-        help="The rank of lora.",
-    )
-    parser.add_argument(
-        "--lora_alpha",
-        type=float,
-        default=16,
-        help="The alpha parameter of lora.",
-    )
-    parser.add_argument(
-        "--lora_dropout",
-        type=float,
-        default=0.1,
-        help="The dropout rate of lora modules.",
-    )
-    parser.add_argument(
-        "--use_flash_attn",
-        action="store_true",
-        help="If passed, will use flash attention to train the model.",
-    )
-    parser.add_argument(
-        "--tokenizer_name",
-        type=str,
-        default=None,
-        help="Pretrained tokenizer name or path if not the same as model_name",
-    )
-    parser.add_argument(
-        "--tokenizer_revision",
-        help="""Specifies a revision for the tokenizer. If not given, defaults
-             to the value of the `model_revision` arg. In most cases, the tokenizer
-             revision should be the same as the model revision and this flag shouldn't
-             be needed.""",
-        default=None,
-        required=False,
-    )
-    parser.add_argument(
-        "--use_slow_tokenizer",
-        action="store_true",
-        help="If passed, will use a slow tokenizer (not backed by the 🤗 Tokenizers library).",
-    )
-    parser.add_argument(
-        "--max_seq_length",
-        type=int,
-        default=512,
-        help="The maximum total sequence length (prompt+completion) of each training example.",
-    )
-    parser.add_argument(
-        "--per_device_train_batch_size",
-        type=int,
-        default=8,
-        help="Batch size (per device) for the training dataloader.",
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=5e-5,
-        help="Initial learning rate (after the potential warmup period) to use.",
-    )
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
-    parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
-    parser.add_argument(
-        "--max_train_steps",
-        type=int,
-        default=None,
-        help="Total number of training steps to perform. If provided, overrides num_train_epochs.",
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
-    )
-    parser.add_argument(
-        "--lr_scheduler_type",
-        type=SchedulerType,
-        default="linear",
-        help="The scheduler type to use.",
-        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
-    )
-    parser.add_argument(
-        "--warmup_ratio", type=float, default=0, help="Ratio of total training steps used for warmup."
-    )
-    parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
-    parser.add_argument("--base_model_dir", type=str, default=None, help="Get the base model for comparison")
-
-    parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
-    parser.add_argument(
-        "--preprocessing_num_workers",
-        type=int,
-        default=None,
-        help="The number of processes to use for the preprocessing.",
-    )
-    parser.add_argument(
-        "--overwrite_cache", action="store_true", help="Overwrite the cached training and evaluation sets"
-    )
-    parser.add_argument(
-        "--checkpointing_steps",
-        type=str,
-        default=None,
-        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
-    )
-    parser.add_argument(
-        "--logging_steps",
-        type=int,
-        default=None,
-        help="Log the training loss and learning rate every logging_steps steps.",
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        default=None,
-        help="If the training should continue from a checkpoint folder.",
-    )
-    parser.add_argument(
-        "--with_tracking",
-        action="store_true",
-        help="Whether to enable experiment trackers for logging.",
-    )
-    parser.add_argument(
-        "--report_to",
-        type=str,
-        default="all",
-        help=(
-            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`,'
-            ' `"wandb"`, `"comet_ml"` and `"clearml"`. Use `"all"` (default) to report to all integrations.'
-            "Only applicable when `--with_tracking` is passed."
-        ),
-    )
-    parser.add_argument(
-        "--low_cpu_mem_usage",
-        action="store_true",
-        help=(
-            "It is an option to create the model as an empty shell, then only materialize its parameters when the pretrained weights are loaded."
-            "If passed, LLM loading time and RAM consumption will be benefited."
-        ),
-    )
-    parser.add_argument(
-        "--gradient_checkpointing",
-        action="store_true",
-        help=(
-            "Turn on gradient checkpointing. Saves memory but slows training."
-        ),
-    )
-    parser.add_argument(
-        "--use_qlora",
-        action="store_true",
-        help=(
-            "Use qLoRA training - main thing is initialising model in quantised form. Not compatible with deepspeed."
-        ),
-    )
-    parser.add_argument(
-        '--clip_grad_norm',
-        type=float,
-        default=-1,
-        help='Clip gradient norm. Not compatible with deepspeed (use deepspeed config instead).',
-    )
-    parser.add_argument(
-        '--use_8bit_optimizer',
-        action='store_true',
-        help='Use 8bit optimizer from bitsandbytes. Not compatible with deepspeed (use deepspeed config instead).',
-    )
-    parser.add_argument(
-        '--add_bos',
-        action='store_true',
-        help='Forcibly add bos token to the beginning of the input sequence. Use only when tokenizer does not add bos token by default (e.g., olmo).',
-    )
-    parser.add_argument(
-        '--timeout',
-        type=int,
-        default=1800,
-        help='Timeout for the training process. Useful if tokenization process is long. Default is 1800 seconds (30 minutes).',
-    )
-    parser.add_argument(
-        '--trust_remote_code',
-        action='store_true',
-        help='Trust remote code when loading pretrained models and tokenizers. Use only when you trust the remote code.',
-    )
+    add_common_training_args(parser)
     parser.add_argument(
         '--reduce_loss',
         default='mean',
         choices=['mean', 'sum'],
         help='How to reduce loss over tokens. Default is mean, but using sum can improve chat model performance.',
+    )
+    parser.add_argument(
+        "--remove_multiturn_data",
+        action="store_true",
+        help="If set, only \"prompt-response\" data is used and multi-turn dialogue data is filtered out.",
     )
     args = parser.parse_args()
 
@@ -367,27 +166,30 @@ def encode_with_rejected_chosen(example, tokenizer, max_seq_length, add_bos=Fals
 
     def _concat_messages(messages):
         message_text = ""
-        system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
+        # system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
+        system_message = ATT_SYSTEM_PROMPT
         if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
-            message_text += "<|system|>\n" + system_message + +'<|end|>'+ "\n"
+            message_text += "<|system|>\n" + system_message + '<|end|>' + "\n"
             for message in messages:
                 if message["role"] == "human":
-                    message_text += "<|user|>\n Prompt: " + message[
-                        "content"].strip() + +'<|end|>'+ "\n" # between prompt and assistant rejected \n\n double space
+                    # between prompt and assistant rejected \n\n double space
+                    message_text += "<|user|>\n Prompt: " + message["content"].strip() + '<|end|>' + "\n"
                 elif message["role"] == "assistant_rejected":
-                    message_text += "\n Current rejected answer: " + message[
-                        "content"].strip() + "\n Corrected output: \n" +'<|end|>'+ "\n"
+                    message_text += "\n Current rejected answer: " + message["content"].strip() \
+                                    + "\n Corrected output: \n" + '<|end|>' + "\n"
                 elif message["role"] == "assistant_chosen":
-                    message_text += "<|assistant|>\n" + message["content"].strip() + +'<|end|>'+ "\n"
+                    message_text += "<|assistant|>\n" + message["content"].strip() + '<|end|>' + "\n"
                 else:
                     raise ValueError("Invalid role: {}".format(message["role"]))
         else:
             message_text += "<|system|>\n" + system_message + "\n"
             for message in messages:
                 if message["role"] == "human":
-                    message_text += "<|user|>\n Prompt: " + message["content"].strip() + "\n"  # between prompt and assistant rejected \n\n double space
-                elif message["role"] =="assistant_rejected":
-                    message_text += "\n Current rejected answer: " + message["content"].strip() + "\n Corrected output: \n"
+                    # between prompt and assistant rejected \n\n double space
+                    message_text += "<|user|>\n Prompt: " + message["content"].strip() + "\n"
+                elif message["role"] == "assistant_rejected":
+                    message_text += "\n Current rejected answer: " + message[
+                        "content"].strip() + "\n Corrected output: \n"
                 elif message["role"] == "assistant_chosen":
                     message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
                 else:
@@ -395,7 +197,7 @@ def encode_with_rejected_chosen(example, tokenizer, max_seq_length, add_bos=Fals
         return message_text
 
     example_text = _concat_messages(messages).strip()
-    #print(example_text) #to be commented out
+    # print(example_text) #to be commented out
 
     if add_bos:
         example_text = tokenizer.bos_token + example_text
@@ -431,6 +233,90 @@ def encode_with_rejected_chosen(example, tokenizer, max_seq_length, add_bos=Fals
                 break
 
     attention_mask = torch.ones_like(input_ids)
+    return {
+        'input_ids': input_ids.flatten(),
+        'labels': labels.flatten(),
+        'attention_mask': attention_mask.flatten(),
+    }
+
+
+# OLMo chat template handles the BOS token, so we don't need to fiddle with add_bos.
+# See https://huggingface.co/allenai/OLMo-7B-Instruct/commit/f09de2dc46d1e848f19dd7161bd998973e2b1272
+def apply_att_template(example, tokenizer, max_seq_length, debug_print=False):
+    chosen = example['chosen']
+    rejected = example['rejected']
+
+    assert len(chosen) == len(rejected), \
+        f"Chosen and rejected should have the same length, got {len(chosen)} and {len(rejected)}.\n" \
+        f"Chosen:\n{pretty_print_chatml(chosen)}\nRejected:\n{pretty_print_chatml(rejected)}"
+
+    assert len(chosen) > 1, f"Chosen and rejected should have at least 2 messages, got {len(chosen)}"
+    # All messages but the last one should be identical, like in the Anthropic HH data
+    for i, (mc, mr) in enumerate(zip(chosen[:-1], rejected[:-1])):
+        assert mc == mr, f"Chosen and rejected should be identical, got {mc} and {mr}"
+    assert chosen[-1]['role'] == 'assistant' and rejected[-1]['role'] == 'assistant', \
+        f"The last message in both chosen and rejected should be by the assistant, got {chosen[-1]['role']} and {rejected[-1]['role']}"
+
+    messages = chosen[:-2]
+    messages.append({
+        'role': 'user',
+        'content': ATT_TEMPLATE.format(last_user_message=chosen[-2]['content'], rejected=rejected[-1]['content'])
+    })
+
+    for i in range(0, len(messages) - 1):
+        assert messages[i]['role'] != messages[i + 1]['role'], \
+            f"Messages should alternate between user and assistant, got {messages[i]['role']} and {messages[i + 1]['role']}\n" \
+            f"You can use mege_consecutive_messages to achieve that. \n" \
+            f"Messages:\n{pretty_print_chatml(messages)}"
+
+    # The chat template used by Mistral is not convenient because it only adds the system prompt to the last
+    # user message, and only does it if the last message in the conversation is indeed by the user. This would make it
+    # painful to set up the labels for SFT. Hence, we just prepend the system prompt to the first user message instead.
+    if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+        messages[0]["content"] = ATT_SYSTEM_PROMPT + '\n\n' + messages[0]["content"]
+    else:
+        system_msg = {'role': 'system', 'content': ATT_SYSTEM_PROMPT}
+        messages = [system_msg] + messages
+
+    try:
+        prompt_text = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True,
+                                                    tokenize=False, max_length=max_seq_length)
+    except Exception as e:
+        logger.error(f"Error in apply_chat_template when generating the prompt: {e}")
+        logger.error("Messages:")
+        logger.error(pretty_print_chatml(messages))
+        raise e
+
+    if debug_print:
+        logger.info("The prompt:\n\"\"\"\n" + prompt_text + "\n\"\"\"")
+    tokens = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True,
+                                           max_length=max_seq_length)
+    end_idx = len(tokens)
+
+    messages.append(chosen[-1])
+
+    try:
+        response_text = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=False,
+                                                      tokenize=False, max_length=max_seq_length)
+    except Exception as e:
+        logger.error(f"Error in apply_chat_template when generating the response message: {e}")
+        logger.error("Messages:")
+        logger.error(pretty_print_chatml(messages))
+        raise e
+
+    assert prompt_text == response_text[:len(prompt_text)], \
+        f"Currently it is assumed that the prompt and response should be the same up to the end of the prompt," \
+        f" got \"{prompt_text}\" and \"{response_text}\""
+    if debug_print:
+        logger.info("Target response:\n\"\"\"\n" + response_text[len(prompt_text):] + "\n\"\"\"")
+
+    input_ids = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=False,
+                                              max_length=max_seq_length)
+    input_ids = torch.tensor([input_ids], dtype=torch.long)
+    labels = input_ids.clone()
+    labels[:, :end_idx] = -100
+    attention_mask = torch.ones_like(input_ids)
+
     return {
         'input_ids': input_ids.flatten(),
         'labels': labels.flatten(),
@@ -477,8 +363,7 @@ def organize_messages(msgs):
     return organized_msgs
 
 
-
-def add_filtered_msgs(example):
+def add_filtered_msgs(example, remove_multiturn_data=False):
     """
     Add a filtered version of 'rejected' and 'chosen' messages based on the number of organized messages.
     * delete unnecessary \n between lines
@@ -490,17 +375,16 @@ def add_filtered_msgs(example):
     stripped_chosen_msgs = example['chosen'].strip().split('\n\n')
     organized_chosen_msgs = organize_messages(stripped_chosen_msgs)
 
-    # Here we check the total number of messages in organized_msgs
-    if len(organized_rejected_msgs) <= 2 and len(organized_chosen_msgs)<=2:
-        example['rejected_filtered'] = organized_rejected_msgs
-        example['chosen_filtered'] = organized_chosen_msgs
-    else:
+    example['rejected_filtered'] = organized_rejected_msgs
+    example['chosen_filtered'] = organized_chosen_msgs
+    if remove_multiturn_data and (len(organized_rejected_msgs) > 2 or len(organized_chosen_msgs) > 2):
         example['rejected_filtered'] = []
-        example['chosen_filtered']=[]
+        example['chosen_filtered'] = []
 
     return example
 
 
+# I think only works for single-turn dialogue
 def extract_role_messages(example):
     """Extract messages based on roles and assign to new fields."""
 
@@ -512,10 +396,9 @@ def extract_role_messages(example):
     assistant_rejected_msg = next(
         (msg[len("Assistant: "):] for msg in example['rejected_filtered'] if msg.startswith("Assistant: ")), " ")
 
-
     # Extracting the Assistant's chosen answer
     assistant_chosen_msg = next(
-        (msg[len("Assistant: "):] for msg in example['chosen_filtered'] if msg.startswith("Assistant: ")),  " ")
+        (msg[len("Assistant: "):] for msg in example['chosen_filtered'] if msg.startswith("Assistant: ")), " ")
 
     """
     There are some cases like:
@@ -524,7 +407,7 @@ def extract_role_messages(example):
     """
 
     example['info'] = [
-        {"role": "human", "content": human_msg if human_msg else " " },
+        {"role": "human", "content": human_msg if human_msg else " "},
         {"role": "assistant_rejected",
          "content": assistant_rejected_msg if assistant_rejected_msg else " "},
         {"role": "assistant_chosen",
@@ -586,61 +469,35 @@ def main():
 
     accelerator.wait_for_everyone()
 
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-        )
-    else:
-        data_files = {}
-        dataset_args = {}
-        if args.train_file is not None:
-            data_files["train"] = args.train_file
-        raw_datasets = load_dataset(
-            "json",
-            data_files=data_files,
-            **dataset_args,
-        )
+    ######################################## Config and Tokenizer Loading ########################################
+    def try_load_config() -> PretrainedConfig:
+        # Load pretrained model and tokenizer
+        if args.config_name:
+            return AutoConfig.from_pretrained(
+                args.config_name,
+                trust_remote_code=args.trust_remote_code,
+                revision=args.model_revision,
+            )
+        elif args.model_name_or_path:
+            return AutoConfig.from_pretrained(
+                args.model_name_or_path,
+                trust_remote_code=args.trust_remote_code,
+                revision=args.model_revision,
+            )
+        else:
+            raise ValueError(
+                "You are instantiating a new config instance from scratch. This is not supported by this script."
+            )
 
-    #for train
-    # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line) -> for now
-    updated_dataset_train = raw_datasets['train'].map(add_filtered_msgs)
-    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0)#.select(range(10)) # delete this
+    try:
+        config = try_load_config()
+    except OSError as e:
+        print(f"Error loading config: {e}")
+        print("Assuming it was a login issue, logging into Huggingface...")
 
-    #for test
-    updated_dataset_test = raw_datasets['test'].map(add_filtered_msgs)
-    filtered_test = updated_dataset_test.filter(lambda x: len(x['rejected_filtered']) > 0)
-
-    filtered_dataset = DatasetDict({
-        'train': filtered_train,
-        'test': filtered_test
-    })
-
-    print("Size of training set:", len(filtered_dataset['train']))
-    print("Size of test set:", len(filtered_dataset['test']))
-
-    # add info column which will store human, assistant_rejected and assistant_chosen messages
-    filtered_dataset["train"] = filtered_dataset["train"].map(extract_role_messages)
-    filtered_dataset["test"] = filtered_dataset["test"].map(extract_role_messages)
-
-    # Load pretrained model and tokenizer
-    if args.config_name:
-        config = AutoConfig.from_pretrained(
-            args.config_name,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.model_revision,
-        )
-    elif args.model_name_or_path:
-        config = AutoConfig.from_pretrained(
-            args.model_name_or_path,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.model_revision,
-        )
-    else:
-        raise ValueError(
-            "You are instantiating a new config instance from scratch. This is not supported by this script."
-        )
+        assert 'HUGGINGFACE_HUB_TOKEN' in os.environ, "Please set the HUGGINGFACE_HUB_TOKEN environment variable."
+        huggingface_hub.login(token=os.getenv('HUGGINGFACE_HUB_TOKEN'))
+        config = try_load_config()
 
     tokenizer_revision = (
         args.model_revision
@@ -676,6 +533,83 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
+    ######################################## Data Preprocessing ########################################
+    if args.dataset_name is not None:
+        # Downloading and loading a dataset from the hub.
+        raw_datasets = load_dataset(
+            args.dataset_name,
+            args.dataset_config_name,
+        )
+    else:
+        data_files = {}
+        dataset_args = {}
+        if args.train_file is not None:
+            data_files["train"] = args.train_file
+        raw_datasets = load_dataset(
+            "json",
+            data_files=data_files,
+            **dataset_args,
+        )
+
+    dataset_train = raw_datasets['train'].map(parse_entry_anthropic_hh)
+    dataset_test = raw_datasets['test'].map(parse_entry_anthropic_hh)
+
+    dataset_train = dataset_train.filter(is_entry_ok_anthropic_hh)
+    dataset_test = dataset_test.filter(is_entry_ok_anthropic_hh)
+    print(f"After filtering, {len(dataset_train)} training examples and {len(dataset_test)} test examples remain.")
+
+    if args.remove_multiturn_data:
+        dataset_train = dataset_train.filter(lambda x: len(x['rejected']) == 2)
+        dataset_test = dataset_test.filter(lambda x: len(x['rejected']) == 2)
+
+    dataset_train = dataset_train.map(lambda x: {k: merge_consecutive_messages_and_trim(v) for k, v in x.items()})
+    dataset_test = dataset_test.map(lambda x: {k: merge_consecutive_messages_and_trim(v) for k, v in x.items()})
+
+    for i in range(10):
+        logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(dataset_train[i]['chosen'])}\n\n"
+                    f"Example {i} rejected:\n{pretty_print_chatml(dataset_train[i]['rejected'])}\n\n")
+        apply_att_template(dataset_test[i], tokenizer, args.max_seq_length, debug_print=True)
+
+    filtered_dataset = DatasetDict({
+        'train': dataset_train,
+        'test': dataset_test
+    })
+
+    print("Size of training set:", len(filtered_dataset['train']))
+    print("Size of test set:", len(filtered_dataset['test']))
+
+    # add info column which will store human, assistant_rejected and assistant_chosen messages
+    # filtered_dataset["train"] = filtered_dataset["train"].map(extract_role_messages)
+    # filtered_dataset["test"] = filtered_dataset["test"].map(extract_role_messages)
+
+    # encode_function = partial(
+    #     encode_with_rejected_chosen,
+    #     tokenizer=tokenizer,
+    #     max_seq_length=args.max_seq_length,
+    #     add_bos=args.add_bos,
+    # )
+    encode_function = partial(
+        apply_att_template,
+        tokenizer=tokenizer,
+        max_seq_length=args.max_seq_length
+    )
+
+    with accelerator.main_process_first():
+        lm_datasets = filtered_dataset.map(
+            encode_function,
+            batched=False,
+            num_proc=args.preprocessing_num_workers,
+            load_from_cache_file=not args.overwrite_cache,
+            remove_columns=[name for name in filtered_dataset["train"].column_names if
+                            name not in ["input_ids", "labels", "attention_mask"]],
+            desc="Tokenizing and reformatting instruction data",
+        )
+        lm_datasets.set_format(type="pt")
+        lm_datasets = lm_datasets.filter(lambda example: (example['labels'] != -100).any())
+
+    train_dataset = lm_datasets["train"]
+
+    ######################################## Model Loading ########################################
     if args.model_name_or_path:
         if args.use_qlora:
             bnb_config = BitsAndBytesConfig(
@@ -712,6 +646,7 @@ def main():
         logger.info("Training new model from scratch")
         model = AutoModelForCausalLM.from_config(config)
 
+    # Add special tokens if they are not already added
     # no default pad token for llama!
     # here we add all special tokens again, because the default ones are not in the special_tokens_map
     if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
@@ -750,7 +685,6 @@ def main():
     # gather deepspeed to get "real" embedding size
     embeddings = model.get_input_embeddings()
 
-
     with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
         embedding_size = embeddings.weight.shape[0]
         if len(tokenizer) > embeddings.weight.shape[0]:
@@ -787,39 +721,11 @@ def main():
     elif args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
-    # Preprocessing the datasets.
-
-    if "rejected" in filtered_dataset["train"].column_names and "chosen" in filtered_dataset["train"].column_names:
-        encode_function = partial(
-            encode_with_rejected_chosen,
-            tokenizer=tokenizer,
-            max_seq_length=args.max_seq_length,
-            add_bos=args.add_bos,
-        )
-    else:
-        raise ValueError("You need to have either 'rejected'&'chosen' in your column names.")
-
-
-    with accelerator.main_process_first():
-        lm_datasets = filtered_dataset.map(
-            encode_function,
-            batched=False,
-            num_proc=args.preprocessing_num_workers,
-            load_from_cache_file=not args.overwrite_cache,
-            remove_columns=[name for name in filtered_dataset["train"].column_names if
-                            name not in ["input_ids", "labels", "attention_mask"]],
-            desc="Tokenizing and reformatting instruction data",
-        )
-        lm_datasets.set_format(type="pt")
-        lm_datasets = lm_datasets.filter(lambda example: (example['labels'] != -100).any())
-
-
-    train_dataset = lm_datasets["train"]
-
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
+    ######################################## Training Setup ########################################
     # DataLoaders creation:
     train_dataloader = DataLoader(
         train_dataset,
@@ -920,6 +826,7 @@ def main():
     completed_steps = 0
     starting_epoch = 0
 
+    ######################################## Checkpointing ########################################
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
@@ -989,6 +896,7 @@ def main():
         model, optimizer, train_dataloader, lr_scheduler
     )
 
+    ######################################## Training Loop ########################################
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_loss = 0
@@ -1010,9 +918,9 @@ def main():
             batch_size = len(batch['input_ids'])  # Assuming 'input_ids' is the key for input data
             epoch_data_count += batch_size
             with accelerator.accumulate(model):
-                #print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
+                # print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
                 outputs = model(**batch, use_cache=False)
-                #print(f"Memory allocated after forward pass: {memory_allocated() / 1e9} GB")
+                # print(f"Memory allocated after forward pass: {memory_allocated() / 1e9} GB")
 
                 if args.reduce_loss == 'mean':
                     loss = outputs.loss
@@ -1046,7 +954,7 @@ def main():
                 optimizer.zero_grad()
                 lr_scheduler.step()
 
-                #for cuda out of memory
+                # for cuda out of memory
                 if step % 2000 == 0:
                     torch.cuda.empty_cache()
             if accelerator.sync_gradients:
@@ -1092,9 +1000,9 @@ def main():
 
             print(f"Running evaluation at the end of epoch {epoch + 1}")
             run_evaluation_subprocess(args, output_dir, run_id, tokenizer)
-            csv_path=output_dir+"/eval_results/summary.csv"
+            csv_path = output_dir + "/eval_results/summary.csv"
             print("log eval results to wandb")
-            metrics_log=log_eval_results_to_wandb(csv_path, epoch)
+            metrics_log = log_eval_results_to_wandb(csv_path, epoch)
             logger.info(f"Epoch {epoch} Evaluation Metrics: {metrics_log}")
             if args.with_tracking:
                 # Log evaluation metrics
@@ -1104,7 +1012,6 @@ def main():
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
         save_with_accelerate(accelerator, model, tokenizer, args.output_dir, args)
-
 
     accelerator.wait_for_everyone()
     if args.with_tracking:

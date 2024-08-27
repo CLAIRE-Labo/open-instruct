@@ -522,9 +522,14 @@ def main():
     print("teacher model_1 wte:",teacher_model.model.transformer.wte)
     print("teacher_model_1:",teacher_model_1.model.transformer.wte.weight.shape)
 
+    # ds_engine = deepspeed.init_inference(  #to be used as student model
+
+    # teacher_model.eval()
+
+
     ################
     # Dataset & Lora Config
-    ################
+    ###############e
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         raw_datasets = load_dataset(
@@ -691,10 +696,10 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
+    print("teacher_model pre-cooked:", teacher_model.model.transformer.wte.weight.shape)
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
-    teacher_model_1.to(accelerator.device)
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         """

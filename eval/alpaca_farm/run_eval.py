@@ -5,13 +5,22 @@ import logging
 import random
 import torch
 import datasets
-import vllm
+from transformers import AutoConfig
 from alpaca_eval import evaluate as alpaca_farm_evaluate
-from eval.utils import query_openai_chat_model, query_openai_model, generate_completions, dynamic_import_function, load_hf_lm, load_hf_tokenizer
+
+from eval.utils import query_openai_chat_model, query_openai_model, generate_completions, dynamic_import_function, \
+    load_hf_lm, load_hf_tokenizer
+
 
 def main(args):
     random.seed(42)
     os.makedirs(args.save_dir, exist_ok=True)
+
+    # if args.read_config:
+    #     # config = AutoConfig.from_pretrained(os.path.join(args.model_name_or_path, "config.json"))
+    #     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+    # else:
+    #     config = None
 
     logging.info("loading data and model...")
     alpaca_eval_data = datasets.load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval")["eval"]
@@ -24,18 +33,20 @@ def main(args):
     if args.model_name_or_path is not None:
         # we always load the tokenizer for vllm or hf models
         tokenizer = load_hf_tokenizer(
-                model_name_or_path=args.model_name_or_path,
-                tokenizer_name_or_path=args.tokenizer_name_or_path,
-                use_fast_tokenizer=not args.use_slow_tokenizer,
-            )
+            model_name_or_path=args.model_name_or_path,
+            tokenizer_name_or_path=args.tokenizer_name_or_path,
+            use_fast_tokenizer=not args.use_slow_tokenizer,
+        )
 
         if args.use_vllm:
+            import vllm
+
             model = vllm.LLM(
                 model=args.model_name_or_path,
                 tokenizer=args.tokenizer_name_or_path if args.tokenizer_name_or_path is not None else args.model_name_or_path,
                 tensor_parallel_size=torch.cuda.device_count(),
             )
-            
+
             sampling_params = vllm.SamplingParams(
                 temperature=0,  # greedy decoding
                 max_tokens=args.max_new_tokens,
@@ -48,7 +59,7 @@ def main(args):
                     formatted_prompt = chat_formatting_function(messages, tokenizer, add_bos=False)
                     formatted_prompts.append(formatted_prompt)
                 prompts = formatted_prompts
-                    
+
             outputs = model.generate(prompts, sampling_params)
             outputs = [it.outputs[0].text for it in outputs]
         else:
@@ -57,12 +68,15 @@ def main(args):
                 load_in_8bit=args.load_in_8bit,
                 device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
                 gptq_model=args.gptq,
+                # config=config,
+                trust_other_remote_code=True,
             )
             # modify tokenizer if required
             from transformers import GPTNeoXForCausalLM, OPTForCausalLM
             if isinstance(model, GPTNeoXForCausalLM) or isinstance(model, OPTForCausalLM):
                 tokenizer.model_max_length = model.config.max_position_embeddings
-                print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
+                print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(
+                    model.config.max_position_embeddings))
 
             # apply chat formatting
             if args.use_chat_format:
@@ -72,15 +86,16 @@ def main(args):
                     formatted_prompt = chat_formatting_function(messages, tokenizer, add_bos=False)
                     formatted_prompts.append(formatted_prompt)
                 prompts = formatted_prompts
-            outputs = generate_completions(
-                model=model,
-                tokenizer=tokenizer,
-                prompts=prompts,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                temperature=0,
-                batch_size=args.eval_batch_size if args.eval_batch_size else 1,
-            )
+            # outputs = generate_completions(
+            #     model=model,
+            #     tokenizer=tokenizer,
+            #     prompts=prompts,
+            #     max_new_tokens=args.max_new_tokens,
+            #     do_sample=False,
+            #     temperature=0,
+            #     batch_size=args.eval_batch_size if args.eval_batch_size else 1,
+            # )
+
     else:
         openai_query_cache_path = os.path.join(args.save_dir, "openai_query_cache.jsonl")
         openai_func = query_openai_model if args.openai_engine == "text-davinci-003" else query_openai_chat_model
@@ -96,18 +111,24 @@ def main(args):
         outputs = [result["output"] for result in results]
 
     model_name = os.path.basename(os.path.normpath(args.model_name_or_path)) if args.model_name_or_path is not None else args.openai_engine
-    model_results = []
-    with open(os.path.join(args.save_dir, f"{model_name}-greedy-long-output.json"), "w") as fout:
-        for example, output in zip(alpaca_eval_data, outputs):
-            example["output"] = output
-            example["generator"] = f"{model_name}-greedy-long"
-            fout.write(json.dumps(example) + "\n")
-            model_results.append(example)
+    # model_results = []
+    # with open(os.path.join(args.save_dir, f"{model_name}-greedy-long-output.json"), "w") as fout:
+    #     for example, output in zip(alpaca_eval_data, outputs):
+    #         example["output"] = output
+    #         example["generator"] = f"{model_name}-greedy-long"
+    #         fout.write(json.dumps(example) + "\n")
+    #         model_results.append(example)
+    with open(os.path.join(args.save_dir, f"{model_name}-greedy-long-output.json"), "r") as fin:
+        model_results = [json.loads(line) for line in fin]
+    # with open('model_results.json', 'r') as fout:
+    #     model_results = json.load(fout)
+
 
     if args.reference_path is not None:
         df_leaderboard, annotations = alpaca_farm_evaluate(
             model_outputs=model_results,
-            reference_outputs=args.reference_path,
+            # reference_outputs=args.reference_path,
+            reference_outputs=alpaca_eval_data,
             annotators_config="alpaca_eval_gpt4",
             output_path=args.save_dir,
             is_return_instead_of_print=True,
@@ -131,7 +152,6 @@ def main(args):
     # save to json
     with open(os.path.join(args.save_dir, f"metrics.json"), "w") as fout:
         json.dump(df_leaderboard.to_dict(), fout)
-        
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -148,7 +168,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--save_dir",
-        type=str, 
+        type=str,
         default="results/alpaca_farm")
     parser.add_argument(
         "--model_name_or_path",
@@ -156,6 +176,8 @@ if __name__ == "__main__":
         default=None,
         help="If specified, we will load the model to generate the predictions.",
     )
+    parser.add_argument("--read_config", action="store_true",
+                        help="If given, we will read the config file at model_name_or_path/config.json. Assumes that model_name_or_path is a path.")
     parser.add_argument(
         "--tokenizer_name_or_path",
         type=str,
@@ -180,9 +202,9 @@ if __name__ == "__main__":
         help="Maximum number of new tokens to generate."
     )
     parser.add_argument(
-        "--eval_batch_size", 
-        type=int, 
-        default=1, 
+        "--eval_batch_size",
+        type=int,
+        default=1,
         help="Batch size for evaluation."
     )
     parser.add_argument(
@@ -196,14 +218,14 @@ if __name__ == "__main__":
         help="If given, we're evaluating a 4-bit quantized GPTQ model.",
     )
     parser.add_argument(
-        "--use_chat_format", 
-        action="store_true", 
+        "--use_chat_format",
+        action="store_true",
         help="If given, we will use the chat format for the prompts."
     )
     parser.add_argument(
-        "--chat_formatting_function", 
-        type=str, 
-        default="eval.templates.create_prompt_with_tulu_chat_format", 
+        "--chat_formatting_function",
+        type=str,
+        default="eval.templates.create_prompt_with_tulu_chat_format",
         help="The function to use to create the chat format. This function will be dynamically imported. Please see examples in `eval/templates.py`."
     )
     parser.add_argument(
@@ -214,5 +236,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # model_name_or_path and openai_engine cannot be both None or both not None.
-    assert (args.model_name_or_path is None) != (args.openai_engine is None), "Either model_name_or_path or openai_engine should be specified."
+    assert (args.model_name_or_path is None) != (
+                args.openai_engine is None), "Either model_name_or_path or openai_engine should be specified."
     main(args)

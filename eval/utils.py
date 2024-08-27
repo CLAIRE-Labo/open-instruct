@@ -227,11 +227,13 @@ def load_hf_lm(
         convert_to_half=False,
         gptq_model=False,
         token=os.getenv("HF_TOKEN", None),
+        config=None,
+        trust_other_remote_code=False
 ):
     # Loading OLMo models from HF requires `trust_remote_code=True`.
     # TODO: Implement this via command-line flag rather than hardcoded list.
     trusted_models = ["allenai/OLMo-7B", "allenai/OLMo-7B-Twin-2T", "allenai/OLMo-1B"]
-    if model_name_or_path in trusted_models:
+    if model_name_or_path in trusted_models or trust_other_remote_code:
         trust_remote_code = True
     else:
         trust_remote_code = False
@@ -249,7 +251,8 @@ def load_hf_lm(
             device_map=device_map,
             load_in_8bit=True,
             token=token,
-            trust_remote_code=trust_remote_code
+            trust_remote_code=trust_remote_code,
+            config=config
         )
     else:
         if device_map:
@@ -259,6 +262,7 @@ def load_hf_lm(
                 torch_dtype=torch_dtype,
                 token=token,
                 trust_remote_code=trust_remote_code,
+                config=config
             )
         else:
             model = AutoModelForCausalLM.from_pretrained(
@@ -266,6 +270,7 @@ def load_hf_lm(
                 torch_dtype=torch_dtype,
                 token=token,
                 trust_remote_code=trust_remote_code,
+                config=config
             )
             if torch.cuda.is_available():
                 model = model.cuda()
