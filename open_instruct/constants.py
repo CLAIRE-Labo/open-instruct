@@ -2,7 +2,7 @@ ATT_SYSTEM_PROMPT = "You are given a prompt and a response. The prompt may consi
 
 ATT_TEMPLATE = """{last_user_message}
 
-Current rejected answer:
+Response to be improved:
 {rejected}
 
 Corrected output:"""

@@ -167,6 +167,24 @@ def add_common_training_args(parser: argparse.ArgumentParser):
         help="Log the training loss and learning rate every logging_steps steps.",
     )
     parser.add_argument(
+        "--logging_examples_steps",
+        type=int,
+        default=None,
+        help="Log example LM generations every logging_examples_steps steps.",
+    )
+    parser.add_argument(
+        "--logging_examples_max_length",
+        type=int,
+        default=64,
+        help="The maximum length of the generated examples to log.",
+    )
+    parser.add_argument(
+        "--logging_examples_top_p",
+        type=int,
+        default=0.9,
+        help="The top-p value to use for the generated examples.",
+    )
+    parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
         default=None,
@@ -194,6 +212,12 @@ def add_common_training_args(parser: argparse.ArgumentParser):
             "It is an option to create the model as an empty shell, then only materialize its parameters when the pretrained weights are loaded."
             "If passed, LLM loading time and RAM consumption will be benefited."
         ),
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default="claire-labo",
+        help="The entity to use for W&B logging.",
     )
     parser.add_argument(
         "--gradient_checkpointing",

@@ -2,6 +2,8 @@
 # coding=utf-8
 import os
 import sys
+import time
+import html
 from heapq import merge
 from typing import Dict, List
 from pathlib import Path
@@ -34,6 +36,7 @@ import transformers
 from transformers import (
     AutoConfig,
     PretrainedConfig,
+    GenerationConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     LlamaTokenizer,
@@ -301,8 +304,9 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False):
     assert prompt_text == response_text[:len(prompt_text)], \
         f"Currently it is assumed that the prompt and response should be the same up to the end of the prompt," \
         f" got \"{prompt_text}\" and \"{response_text}\""
+    expected_response_text = response_text[len(prompt_text):]
     if debug_print:
-        logger.info("Target response:\n\"\"\"\n" + response_text[len(prompt_text):] + "\n\"\"\"")
+        logger.info("Target response:\n\"\"\"\n" + expected_response_text + "\n\"\"\"")
 
     input_ids = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=False,
                                               max_length=max_seq_length)
@@ -431,16 +435,16 @@ def main():
     accelerator_log_kwargs = {}
 
     if args.with_tracking:
-        if "wandb" in args.report_to.split(",") or args.report_to == "all":
-            wandb_api_key = os.getenv('WANDB_API_KEY')
-            wandb.login(key=wandb_api_key)
+        assert args.report_to in ["wandb", "all"], "Currently only wandb is supported for tracking."
+        wandb_api_key = os.getenv('WANDB_API_KEY')
+        wandb.login(key=wandb_api_key)
 
-            # Initialize wandb
-            wandb.init(project="alignment_translation", entity="claire-labo")
+        # Initialize wandb
+        wandb.init(project="alignment_translation", entity="claire-labo")
 
-            # Configure wandb logging within Accelerator
-            accelerator_log_kwargs["log_with"] = args.report_to
-            accelerator_log_kwargs["project_dir"] = args.output_dir
+        # Configure wandb logging within Accelerator
+        accelerator_log_kwargs["log_with"] = args.report_to
+        accelerator_log_kwargs["project_dir"] = args.output_dir
 
     # if you get timeouts (e.g. due to long tokenization) increase this.
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=args.timeout))
@@ -539,7 +543,6 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
-
     ######################################## Data Preprocessing ########################################
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -582,9 +585,6 @@ def main():
         'test': dataset_test
     })
 
-    print("Size of training set:", len(filtered_dataset['train']))
-    print("Size of test set:", len(filtered_dataset['test']))
-
     # add info column which will store human, assistant_rejected and assistant_chosen messages
     # filtered_dataset["train"] = filtered_dataset["train"].map(extract_role_messages)
     # filtered_dataset["test"] = filtered_dataset["test"].map(extract_role_messages)
@@ -614,7 +614,11 @@ def main():
         lm_datasets.set_format(type="pt")
         lm_datasets = lm_datasets.filter(lambda example: (example['labels'] != -100).any())
 
+    print("Size of training set:", len(filtered_dataset['train']))
+    print("Size of test set:", len(filtered_dataset['test']))
+
     train_dataset = lm_datasets["train"]
+    test_dataset = lm_datasets["test"]
 
     ######################################## Model Loading ########################################
     if args.model_name_or_path:
@@ -645,7 +649,7 @@ def main():
                 from_tf=bool(".ckpt" in args.model_name_or_path),
                 config=config,
                 trust_remote_code=args.trust_remote_code,
-                low_cpu_mem_usage=args.low_cpu_mem_usage,#
+                low_cpu_mem_usage=args.low_cpu_mem_usage,  #
                 torch_dtype=torch.bfloat16,
                 use_flash_attention_2=True if args.use_flash_attn else False,
                 revision=args.model_revision
@@ -665,19 +669,17 @@ def main():
             "pad_token": "<pad>",
         })
         # pad token is also equal to eos token in the case of phi3
-        assert num_added_tokens in [0,
-                                    1,
-                                    2], "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
 
-
-        # Taken from https://github.com/microsoft/Phi-3CookBook/blob/main/code/04.Finetuning/Phi-3-finetune-lora-python.ipynb
         if model.__class__.__name__ == "Phi3ForCausalLM":
+            assert num_added_tokens <= 2
+            # Taken from https://github.com/microsoft/Phi-3CookBook/blob/main/code/04.Finetuning/Phi-3-finetune-lora-python.ipynb
             tokenizer.pad_token = tokenizer.unk_token
             # The ID of the padding token is set to the ID of the unknown token.
             tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
-
+        else:
+            assert num_added_tokens in [0, 1], "LlamaTokenizer should only add one special token - the pad_token," \
+                                               " or no tokens if pad token present."
         tokenizer.padding_side = 'left'
-
     elif isinstance(tokenizer, GPTNeoXTokenizerFast):
         num_added_tokens = tokenizer.add_special_tokens({
             "pad_token": "<pad>",
@@ -695,15 +697,27 @@ def main():
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     # gather deepspeed to get "real" embedding size
+
+    generation_config = GenerationConfig(
+        do_sample=True,
+        max_new_tokens=args.logging_examples_max_length,
+        top_p=args.logging_examples_top_p,
+        renormalize_logits=True,
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
     embeddings = model.get_input_embeddings()
 
     # padding will enable tensorcores, hopefully will make it faster
     # https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#requirements-tc
     with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
-        # embedding_size = embeddings.weight.shape[0]
         if len(tokenizer) > embeddings.weight.shape[0]:
             model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=128)
         embedding_size = embeddings.weight.shape[0]
+        # padding to multiples creates a few "shadow" tokens that we don't want to be generated
+        generation_config.suppress_tokens = list(range(len(tokenizer), embedding_size))
 
     if args.use_lora:
         if args.use_qlora:
@@ -722,9 +736,14 @@ def main():
     elif args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
-    # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+    # Log a few random samples from the training set
+
+    indices_train = random.sample(range(len(train_dataset)), 5)
+    indices_test = random.sample(range(len(test_dataset)), 5)
+    train_examples = [train_dataset[i] for i in indices_train]
+    test_examples = [test_dataset[i] for i in indices_test]
+    for index, ex in enumerate(train_examples):
+        logger.info(f"Sample {index} of the training set: {ex}.")
 
     ######################################## Training Setup ########################################
     # DataLoaders creation:
@@ -803,14 +822,6 @@ def main():
 
     # Define custom step metric for evaluation
     run_id = wandb.run.id
-
-    wandb.define_metric("eval_step")
-    # Define evaluation metrics with their respective custom step
-    wandb.define_metric("BLEURT_acc", step_metric="eval_step")
-    wandb.define_metric("bleu_acc", step_metric="eval_step")
-    wandb.define_metric("rouge1_acc", step_metric="eval_step")
-    wandb.define_metric("rouge2_acc", step_metric="eval_step")
-    wandb.define_metric("rougeL_acc", step_metric="eval_step")
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -897,7 +908,63 @@ def main():
         model, optimizer, train_dataloader, lr_scheduler
     )
 
+    example_tables = {
+        "train": [wandb.Table(columns=["step", "response"]) for _ in range(len(train_examples))],
+        "test": [wandb.Table(columns=["step", "response"]) for _ in range(len(test_examples))],
+    }
+
+    def log_examples_to_wandb(step: int):
+        def log(example, example_idx: int, prefix: str) -> float:
+            start_time = time.time()
+            is_prompt = example["labels"] == -100
+            is_response = ~is_prompt
+            prompt_ids = example["input_ids"][is_prompt]
+            # if prompt_ids.shape[0] >= args.logging_examples_max_length:
+            #     logger.warning(
+            #         f"Skipping logging of example {example_idx} because it is too long to log. "
+            #         f"Length: {prompt_ids.shape[0]}. Max length: {args.logging_examples_max_length}"
+            #     )
+            #     return
+            expected_response_ids = example["input_ids"][is_response]
+            prompt_text = tokenizer.decode(prompt_ids)
+            expected_response_text = tokenizer.decode(expected_response_ids)
+
+            if step == 0:
+                wandb.log(
+                    {f"{prefix}_example_{example_idx + 1}/prompt": wandb.Html(f"<p>{html.escape(prompt_text)}</p>")})
+                wandb.log({f"{prefix}_example_{example_idx + 1}/expected_response": wandb.Html(
+                    f"<p>{html.escape(expected_response_text)}</p>")})
+
+            outputs = model.generate(input_ids=prompt_ids.to(model.device)[None, :],
+                                     generation_config=generation_config)
+            response_text = tokenizer.decode(outputs[0])
+            if response_text[:len(prompt_text)] != prompt_text:
+                logger.warning(
+                    f"Response does not start with the prompt for example {example_idx}. "
+                    f"Prompt: \n\"\"\"\n{prompt_text}\n\"\"\"\n. Response: \n\"\"\"\n{response_text}\n\"\"\"\n"
+                )
+            else:
+                response_text = response_text[len(prompt_text):]
+
+            example_tables[prefix][example_idx].add_data(step, response_text)
+            wandb.log({f"{prefix}_example_{example_idx + 1}/responses": example_tables[prefix][example_idx]})
+            return time.time() - start_time
+
+        model.eval()
+        sum_time = 0.0
+        for i, ex in enumerate(train_examples):
+            sum_time += log(ex, i, "train")
+        for i, ex in enumerate(test_examples):
+            sum_time += log(ex, i, "test")
+
+        wandb.log(
+            {"log_examples_time": sum_time, "avg_example_time": sum_time / (len(train_examples) + len(test_examples))})
+
+        model.train()
+
     ######################################## Training Loop ########################################
+    if accelerator.sync_gradients:
+        log_examples_to_wandb(0)
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_loss = 0
@@ -978,6 +1045,9 @@ def main():
 
                     total_loss = 0
 
+                if args.logging_examples_steps and completed_steps % args.logging_examples_steps == 0:
+                    log_examples_to_wandb()
+
                 if isinstance(checkpointing_steps, int):
                     if completed_steps % checkpointing_steps == 0:
                         output_dir = f"step_{completed_steps}"
@@ -1021,4 +1091,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
