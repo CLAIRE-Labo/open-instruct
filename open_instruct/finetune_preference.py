@@ -437,11 +437,8 @@ def main():
     if args.with_tracking:
         assert args.report_to in ["wandb", "all"], "Currently only wandb is supported for tracking."
         wandb_api_key = os.getenv('WANDB_API_KEY')
-        wandb.login(key=wandb_api_key)
-
-        # Initialize wandb
-        wandb.init(project="alignment_translation", entity="claire-labo")
-
+        # This should be done in accelerator.init_trackers
+        # wandb.init(project="alignment_translation", entity="claire-labo")
         # Configure wandb logging within Accelerator
         accelerator_log_kwargs["log_with"] = args.report_to
         accelerator_log_kwargs["project_dir"] = args.output_dir
@@ -800,13 +797,6 @@ def main():
         num_warmup_steps=int(num_training_steps_for_scheduler * args.warmup_ratio),
     )
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
     # Figure out how many steps we should save the Accelerator states
     checkpointing_steps = args.checkpointing_steps
     if checkpointing_steps is not None and checkpointing_steps.isdigit():
@@ -818,10 +808,11 @@ def main():
         experiment_config = vars(args)
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("open_instruct", experiment_config)
+        accelerator.init_trackers(project_name="alignment_translation", config=experiment_config,
+                                  init_kwargs={"wandb": {"entity": "claire-labo"}})
 
     # Define custom step metric for evaluation
-    run_id = wandb.run.id
+    # run_id = wandb.run.id
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -833,6 +824,19 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+
+    # Prepare everything with `accelerator`.
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
+    )
+
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if overrode_max_train_steps:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    # Afterwards we recalculate our number of training epochs
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
@@ -903,15 +907,12 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
-    # Prepare everything with `accelerator`.
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
-    )
 
-    example_tables = {
-        "train": [wandb.Table(columns=["step", "response"]) for _ in range(len(train_examples))],
-        "test": [wandb.Table(columns=["step", "response"]) for _ in range(len(test_examples))],
-    }
+    # Cannot update an existing table in wandb (or its too painful)
+    # example_tables = {
+    #     "train": [wandb.Table(columns=["step", "response"]) for _ in range(len(train_examples))],
+    #     "test": [wandb.Table(columns=["step", "response"]) for _ in range(len(test_examples))],
+    # }
 
     def log_examples_to_wandb(step: int):
         def log(example, example_idx: int, prefix: str) -> float:
@@ -930,13 +931,13 @@ def main():
             expected_response_text = tokenizer.decode(expected_response_ids)
 
             if step == 0:
-                wandb.log(
+                accelerator.log(
                     {f"{prefix}_example_{example_idx + 1}/prompt": wandb.Html(f"<p>{html.escape(prompt_text)}</p>")})
-                wandb.log({f"{prefix}_example_{example_idx + 1}/expected_response": wandb.Html(
+                accelerator.log({f"{prefix}_example_{example_idx + 1}/expected_response": wandb.Html(
                     f"<p>{html.escape(expected_response_text)}</p>")})
 
-            outputs = model.generate(input_ids=prompt_ids.to(model.device)[None, :],
-                                     generation_config=generation_config)
+            outputs = accelerator.unwrap_model(model).generate(input_ids=prompt_ids.to(model.device)[None, :],
+                                                               generation_config=generation_config)
             response_text = tokenizer.decode(outputs[0])
             if response_text[:len(prompt_text)] != prompt_text:
                 logger.warning(
@@ -946,8 +947,9 @@ def main():
             else:
                 response_text = response_text[len(prompt_text):]
 
-            example_tables[prefix][example_idx].add_data(step, response_text)
-            wandb.log({f"{prefix}_example_{example_idx + 1}/responses": example_tables[prefix][example_idx]})
+            # example_tables[prefix][example_idx].add_data(step, response_text)
+            # accelerator.log({f"{prefix}_example_{example_idx + 1}/responses": example_tables[prefix][example_idx]})
+            accelerator.log({f"{prefix}_example_{example_idx + 1}/response": wandb.Html(f"<p>{html.escape(response_text)}</p>")})
             return time.time() - start_time
 
         model.eval()
@@ -957,7 +959,7 @@ def main():
         for i, ex in enumerate(test_examples):
             sum_time += log(ex, i, "test")
 
-        wandb.log(
+        accelerator.log(
             {"log_examples_time": sum_time, "avg_example_time": sum_time / (len(train_examples) + len(test_examples))})
 
         model.train()
@@ -1031,22 +1033,21 @@ def main():
                 if args.logging_steps and completed_steps % args.logging_steps == 0:
                     avg_loss = accelerator.gather(
                         total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_steps
-                    logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
+                    # logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
                     # Print number of examples processed so far in this epoch
-                    print(f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
+                    # print(f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
                     if args.with_tracking:
                         accelerator.log(
                             {
                                 "learning_rate": lr_scheduler.get_last_lr()[0],
                                 "train_loss": avg_loss,
                             },
-                            step=completed_steps,
                         )
 
                     total_loss = 0
 
                 if args.logging_examples_steps and completed_steps % args.logging_examples_steps == 0:
-                    log_examples_to_wandb()
+                    log_examples_to_wandb(completed_steps)
 
                 if isinstance(checkpointing_steps, int):
                     if completed_steps % checkpointing_steps == 0:
@@ -1059,25 +1060,25 @@ def main():
                     break
 
         print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
-        if args.checkpointing_steps == "epoch":
-            output_dir = f"epoch_{epoch}"
-            torch.cuda.empty_cache()
-            if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
-                tokenizer.save_pretrained(output_dir)
-            save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
-            accelerator.wait_for_everyone()  # ensure that the files are created
-            print(output_dir)
-
-            print(f"Running evaluation at the end of epoch {epoch + 1}")
-            run_evaluation_subprocess(args, output_dir, run_id, tokenizer)
-            csv_path = output_dir + "/eval_results/summary.csv"
-            print("log eval results to wandb")
-            metrics_log = log_eval_results_to_wandb(csv_path, epoch)
-            logger.info(f"Epoch {epoch} Evaluation Metrics: {metrics_log}")
-            if args.with_tracking:
-                # Log evaluation metrics
-                wandb.log(metrics_log)
+        # if args.checkpointing_steps == "epoch":
+        #     output_dir = f"epoch_{epoch}"
+        #     torch.cuda.empty_cache()
+        #     if args.output_dir is not None:
+        #         output_dir = os.path.join(args.output_dir, output_dir)
+        #         tokenizer.save_pretrained(output_dir)
+        #     save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
+        #     accelerator.wait_for_everyone()  # ensure that the files are created
+        #     print(output_dir)
+        #
+        #     print(f"Running evaluation at the end of epoch {epoch + 1}")
+        #     run_evaluation_subprocess(args, output_dir, run_id, tokenizer)
+        #     csv_path = output_dir + "/eval_results/summary.csv"
+        #     print("log eval results to wandb")
+        #     metrics_log = log_eval_results_to_wandb(csv_path, epoch)
+        #     logger.info(f"Epoch {epoch} Evaluation Metrics: {metrics_log}")
+        #     if args.with_tracking:
+        #         # Log evaluation metrics
+        #         accelerator.log(metrics_log)
 
     if args.output_dir is not None:
         if accelerator.is_main_process:
