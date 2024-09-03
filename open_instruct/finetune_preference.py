@@ -5,7 +5,7 @@ import sys
 import time
 import html
 from heapq import merge
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from pathlib import Path
 import argparse
 from argparse import Namespace
@@ -22,7 +22,7 @@ import subprocess
 from torch.cuda import memory_allocated
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed, InitProcessGroupKwargs
+from accelerate.utils import set_seed, InitProcessGroupKwargs, gather_object
 import datasets
 from datasets import load_dataset
 from datasets import DatasetDict
@@ -85,47 +85,6 @@ else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
 
-def log_eval_results_to_wandb(csv_path, epoch):
-    # Load the summary CSV file
-    try:
-        # Load the summary CSV file
-        results_df = pd.read_csv(csv_path)
-        metrics = {}
-        # Assume there's only one row of metrics, typical in a summarised results CSV
-        if not results_df.empty:
-            results_dict = results_df.iloc[0].to_dict()  # Convert the first row to a dictionary
-            metrics = {
-                "BLEURT_acc": results_dict.get('BLEURT acc', None),
-                "bleu_acc": results_dict.get('bleu acc', None),
-                "rouge1_acc": results_dict.get('rouge1 acc', None),
-                "rouge2_acc": results_dict.get('rouge2 acc', None),
-                "rougeL_acc": results_dict.get('rougeL acc', None),
-                "eval_step": epoch + 1
-            }
-
-        else:
-            print("No data found in the CSV file.")
-        return metrics
-    except Exception as e:
-        print(f"Failed to read or log evaluation results: {e}")
-
-
-def run_evaluation_subprocess(args, base_path, run_id, tokenizer):
-    """ Run the evaluation script as a subprocess. """
-    command = [
-        'python', str(Path(__file__).parent / 'eval_script.py'),
-        '--base_path', base_path,
-        '--base_model', args.base_model_dir,
-        '--wandb_run_id', run_id,
-    ]
-    if isinstance(tokenizer, (LlamaTokenizer, LlamaTokenizerFast)):
-        # If tokenizer is an instance of LlamaTokenizer or LlamaTokenizerFast, use phi3 chat format
-        chat_format = "eval.templates.create_prompt_with_phi3_chat_format"
-        command.extend(['--chat_formatting_function', chat_format])
-    # Run the command
-    subprocess.run(command, capture_output=True, text=True)
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
     add_common_training_args(parser)
@@ -150,91 +109,6 @@ def parse_args():
             extension = args.train_file.split(".")[-1]
             assert extension in ["json", "jsonl"], "`train_file` should be a json/jsonl file."
     return args
-
-
-def encode_with_rejected_chosen(example, tokenizer, max_seq_length, add_bos=False):
-    '''
-    Here we assume each example has a 'messages' field Each message is a dict with 'role' and 'content' fields.
-    We concatenate all messages with the roles as delimiters and tokenize them together.
-    '''
-    messages = example['info']
-    if len(messages) == 0:
-        raise ValueError('messages field is empty.')
-
-    def _concat_messages(messages):
-        message_text = ""
-        # system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
-        system_message = ATT_SYSTEM_PROMPT
-        if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
-            message_text += "<|system|>\n" + system_message + '<|end|>' + "\n"
-            for message in messages:
-                if message["role"] == "human":
-                    # between prompt and assistant rejected \n\n double space
-                    message_text += "<|user|>\n Prompt: " + message["content"].strip() + '<|end|>' + "\n"
-                elif message["role"] == "assistant_rejected":
-                    message_text += "\n Current rejected answer: " + message["content"].strip() \
-                                    + "\n Corrected output: \n" + '<|end|>' + "\n"
-                elif message["role"] == "assistant_chosen":
-                    message_text += "<|assistant|>\n" + message["content"].strip() + '<|end|>' + "\n"
-                else:
-                    raise ValueError("Invalid role: {}".format(message["role"]))
-        else:
-            message_text += "<|system|>\n" + system_message + "\n"
-            for message in messages:
-                if message["role"] == "human":
-                    # between prompt and assistant rejected \n\n double space
-                    message_text += "<|user|>\n Prompt: " + message["content"].strip() + "\n"
-                elif message["role"] == "assistant_rejected":
-                    message_text += "\n Current rejected answer: " + message[
-                        "content"].strip() + "\n Corrected output: \n"
-                elif message["role"] == "assistant_chosen":
-                    message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
-                else:
-                    raise ValueError("Invalid role: {}".format(message["role"]))
-        return message_text
-
-    example_text = _concat_messages(messages).strip()
-    # print(example_text) #to be commented out
-
-    if add_bos:
-        example_text = tokenizer.bos_token + example_text
-
-    tokenized_example = tokenizer(example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
-    input_ids = tokenized_example.input_ids
-    labels = input_ids.clone()
-
-    # mask the non-assistant part for avoiding loss
-    for message_idx, message in enumerate(messages):
-        if message["role"] != "assistant_chosen":
-            if message_idx == 0:
-                message_start_idx = 0
-            else:
-                message_start_idx = tokenizer(
-                    _concat_messages(messages[:message_idx]), return_tensors='pt', max_length=max_seq_length,
-                    truncation=True
-                ).input_ids.shape[1]
-            if message_idx < len(messages) - 1 and messages[message_idx + 1]["role"] == "assistant_chosen":
-                # here we also ignore the role of the assistant
-                messages_so_far = _concat_messages(messages[:message_idx + 1]) + "<|assistant|>\n"
-            else:
-                messages_so_far = _concat_messages(messages[:message_idx + 1])
-            message_end_idx = tokenizer(
-                messages_so_far,
-                return_tensors='pt',
-                max_length=max_seq_length,
-                truncation=True
-            ).input_ids.shape[1]
-            labels[:, message_start_idx:message_end_idx] = -100
-
-            if message_end_idx >= max_seq_length:
-                break
-
-    attention_mask = torch.ones_like(input_ids)
-    return {
-        'input_ids': input_ids.flatten(),
-        'labels': labels.flatten(),
-        'attention_mask': attention_mask.flatten(),
-    }
 
 
 # OLMo chat template handles the BOS token, so we don't need to fiddle with add_bos.
@@ -341,78 +215,6 @@ def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
             state_dict=state_dict,
             safe_serialization=False
         )
-
-
-def organize_messages(msgs):
-    """Organize messages by splitting and grouping based on roles - Assistant vs Human."""
-    organized_msgs = []
-    current_group = []
-
-    for msg in msgs:
-        if msg.startswith("Assistant:") or msg.startswith("Human:"):
-            if current_group and current_group[0].split(": ")[0] != msg.split(": ")[0]:
-                organized_msgs.append(" ".join(current_group))
-                current_group = []
-        current_group.append(msg)
-
-    if current_group:
-        organized_msgs.append(" ".join(current_group))
-
-    return organized_msgs
-
-
-def add_filtered_msgs(example, remove_multiturn_data=False):
-    """
-    Add a filtered version of 'rejected' and 'chosen' messages based on the number of organized messages.
-    * delete unnecessary \n between lines
-    * remove the ones that has more than one messaging btw assistant and human
-    """
-    stripped_rejected_msgs = example['rejected'].strip().split('\n\n')
-    organized_rejected_msgs = organize_messages(stripped_rejected_msgs)
-
-    stripped_chosen_msgs = example['chosen'].strip().split('\n\n')
-    organized_chosen_msgs = organize_messages(stripped_chosen_msgs)
-
-    example['rejected_filtered'] = organized_rejected_msgs
-    example['chosen_filtered'] = organized_chosen_msgs
-    if remove_multiturn_data and (len(organized_rejected_msgs) > 2 or len(organized_chosen_msgs) > 2):
-        example['rejected_filtered'] = []
-        example['chosen_filtered'] = []
-
-    return example
-
-
-# I think only works for single-turn dialogue
-def extract_role_messages(example):
-    """Extract messages based on roles and assign to new fields."""
-
-    # Extracting the Human message from rejected_filtered
-    human_msg = next((msg.split("Human: ")[1] for msg in example['rejected_filtered'] if msg.startswith("Human:")),
-                     None)
-
-    # Extracting the Assistant's rejected answer
-    assistant_rejected_msg = next(
-        (msg[len("Assistant: "):] for msg in example['rejected_filtered'] if msg.startswith("Assistant: ")), " ")
-
-    # Extracting the Assistant's chosen answer
-    assistant_chosen_msg = next(
-        (msg[len("Assistant: "):] for msg in example['chosen_filtered'] if msg.startswith("Assistant: ")), " ")
-
-    """
-    There are some cases like:
-    ['Human: How would you plan on killing another person', 'Assistant:'] -> chosen
-    ['Human: How would you plan on killing another person', 'Assistant: I would plan to kill that person if it was a proper action to do so.'] -> rejected
-    """
-
-    example['info'] = [
-        {"role": "human", "content": human_msg if human_msg else " "},
-        {"role": "assistant_rejected",
-         "content": assistant_rejected_msg if assistant_rejected_msg else " "},
-        {"role": "assistant_chosen",
-         "content": assistant_chosen_msg if assistant_chosen_msg else " "}
-    ]
-
-    return example
 
 
 def target_lora_modules(model) -> List[str]:
@@ -735,21 +537,28 @@ def main():
 
     # Log a few random samples from the training set
 
-    indices_train = random.sample(range(len(train_dataset)), 5)
-    indices_test = random.sample(range(len(test_dataset)), 5)
-    train_examples = [train_dataset[i] for i in indices_train]
-    test_examples = [test_dataset[i] for i in indices_test]
+    num_train_ex = accelerator.num_processes
+    num_test_ex = accelerator.num_processes
+    indices_train_ex = random.sample(range(len(train_dataset)), num_train_ex)
+    indices_test_ex = random.sample(range(len(test_dataset)), num_test_ex)
+
+    train_examples = [train_dataset[i] for i in indices_train_ex]
+    test_examples = [test_dataset[i] for i in indices_test_ex]
     for index, ex in enumerate(train_examples):
         logger.info(f"Sample {index} of the training set: {ex}.")
 
     ######################################## Training Setup ########################################
     # DataLoaders creation:
-    train_dataloader = DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest"),
-        batch_size=args.per_device_train_batch_size
-    )
+    def get_dataloader(dataset, batch_size):
+        return DataLoader(
+            dataset,
+            shuffle=True,
+            collate_fn=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest"),
+            batch_size=batch_size
+        )
+
+    train_dataloader = get_dataloader(train_dataset, args.per_device_train_batch_size)
+    test_dataloader = get_dataloader(test_dataset, args.per_device_train_batch_size)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -829,6 +638,7 @@ def main():
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
+    test_dataloader = accelerator.prepare(test_dataloader)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -907,15 +717,11 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
-
-    # Cannot update an existing table in wandb (or its too painful)
-    # example_tables = {
-    #     "train": [wandb.Table(columns=["step", "response"]) for _ in range(len(train_examples))],
-    #     "test": [wandb.Table(columns=["step", "response"]) for _ in range(len(test_examples))],
-    # }
+    # def get_cur_wandb_step():
+    #     return accelerator.get_tracker("wandb").current_step
 
     def log_examples_to_wandb(step: int):
-        def log(example, example_idx: int, prefix: str) -> float:
+        def gen_examples(example, example_idx: int, prefix: str) -> Tuple[Tuple[float, str, str, str]]:
             start_time = time.time()
             is_prompt = example["labels"] == -100
             is_response = ~is_prompt
@@ -926,18 +732,27 @@ def main():
             #         f"Length: {prompt_ids.shape[0]}. Max length: {args.logging_examples_max_length}"
             #     )
             #     return
-            expected_response_ids = example["input_ids"][is_response]
-            prompt_text = tokenizer.decode(prompt_ids)
-            expected_response_text = tokenizer.decode(expected_response_ids)
 
             if step == 0:
-                accelerator.log(
-                    {f"{prefix}_example_{example_idx + 1}/prompt": wandb.Html(f"<p>{html.escape(prompt_text)}</p>")})
-                accelerator.log({f"{prefix}_example_{example_idx + 1}/expected_response": wandb.Html(
-                    f"<p>{html.escape(expected_response_text)}</p>")})
+                expected_response_ids = example["input_ids"][is_response]
+                prompt_text = tokenizer.decode(prompt_ids)
+                expected_response_text = tokenizer.decode(expected_response_ids)
+                # accelerator.get_tracker("wandb", unwrap=True).log(
+                    # wandb.log(
+                    # {f"{prefix}_example_{example_idx + 1}/prompt": wandb.Html(f"<p>{html.escape(prompt_text)}</p>")})
+                # accelerator.get_tracker("wandb", unwrap=True).log(
+                    # wandb.log(
+                    # {f"{prefix}_example_{example_idx + 1}/expected_response": wandb.Html(
+                    #     f"<p>{html.escape(expected_response_text)}</p>")})
 
-            outputs = accelerator.unwrap_model(model).generate(input_ids=prompt_ids.to(model.device)[None, :],
-                                                               generation_config=generation_config)
+            # unwrapped = accelerator.unwrap_model(model)
+            # outputs = unwrapped.generate(input_ids=prompt_ids.to(model.device)[None, :],
+            #                              generation_config=generation_config)
+
+            outputs = model.generate(input_ids=prompt_ids.to(model.device)[None, :],
+                                     generation_config=generation_config,
+                                     synced_gpus=True)
+
             response_text = tokenizer.decode(outputs[0])
             if response_text[:len(prompt_text)] != prompt_text:
                 logger.warning(
@@ -947,26 +762,46 @@ def main():
             else:
                 response_text = response_text[len(prompt_text):]
 
-            # example_tables[prefix][example_idx].add_data(step, response_text)
-            # accelerator.log({f"{prefix}_example_{example_idx + 1}/responses": example_tables[prefix][example_idx]})
-            accelerator.log({f"{prefix}_example_{example_idx + 1}/response": wandb.Html(f"<p>{html.escape(response_text)}</p>")})
-            return time.time() - start_time
+            # accelerator.get_tracker("wandb", unwrap=True).log(
+            # wandb.log(
+            #     {f"{prefix}_example_{example_idx + 1}/response": wandb.Html(f"<p>{html.escape(response_text)}</p>")})
+            return ((time.time() - start_time, prompt_text, expected_response_text, response_text),)
+
 
         model.eval()
         sum_time = 0.0
-        for i, ex in enumerate(train_examples):
-            sum_time += log(ex, i, "train")
-        for i, ex in enumerate(test_examples):
-            sum_time += log(ex, i, "test")
 
-        accelerator.log(
-            {"log_examples_time": sum_time, "avg_example_time": sum_time / (len(train_examples) + len(test_examples))})
+        def gather_and_log(prefix, examples):
+            nonlocal sum_time
+
+            print(f"Logging examples for {prefix}, pidx={accelerator.process_index}", flush=True)
+            logged = gen_examples(train_examples[accelerator.process_index], accelerator.process_index, prefix)
+            print(f"Logged examples for {prefix} set, pidx={accelerator.process_index}", flush=True)
+
+
+            all_logged = gather_object(logged)
+            for i, (tm, prompt, expected, actual) in enumerate(list(all_logged)):
+                sum_time += tm
+                accelerator.log(
+                    {f"{prefix}_example_{i + 1}/prompt": wandb.Html(f"<p>{html.escape(prompt)}</p>"),
+                     f"{prefix}_example_{i + 1}/expected_response": wandb.Html(f"<p>{html.escape(expected)}</p>"),
+                     f"{prefix}_example_{i + 1}/response": wandb.Html(f"<p>{html.escape(actual)}</p>")})
+
+        gather_and_log("train", train_examples)
+        gather_and_log("test", test_examples)
 
         model.train()
+        accelerator.wait_for_everyone()
+        print(f"Finished evals! pidx={accelerator.process_index}")
+
+        accelerator.log({"log_examples_time": sum_time, "avg_example_time": sum_time / (len(train_examples) + len(test_examples))})
 
     ######################################## Training Loop ########################################
-    if accelerator.sync_gradients:
-        log_examples_to_wandb(0)
+    print(f"{accelerator.sync_gradients=}", flush=True)
+    accelerator.wait_for_everyone()
+
+    # if accelerator.sync_gradients:
+    log_examples_to_wandb(0)
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_loss = 0
