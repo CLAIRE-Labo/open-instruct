@@ -172,6 +172,7 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False):
         messages = [system_msg] + messages
 
     try:
+        # TODO Skander check max token length of HH data
         prompt_text = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True,
                                                     tokenize=False, max_length=max_seq_length)
     except Exception as e:
