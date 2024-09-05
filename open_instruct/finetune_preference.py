@@ -4,7 +4,9 @@ import os
 import sys
 import time
 import html
+import json
 from heapq import merge
+from copy import deepcopy
 from typing import Dict, List, Tuple
 from pathlib import Path
 import argparse
@@ -22,7 +24,7 @@ import subprocess
 from torch.cuda import memory_allocated
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed, InitProcessGroupKwargs, gather_object
+from accelerate.utils import set_seed, InitProcessGroupKwargs, gather_object, broadcast_object_list
 import datasets
 from datasets import load_dataset
 from datasets import DatasetDict
@@ -85,9 +87,34 @@ else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
-    add_common_training_args(parser)
+def get_hf_token() -> str:
+    if 'HUGGINGFACE_HUB_TOKEN' in os.environ:
+        return os.environ['HUGGINGFACE_HUB_TOKEN']
+    elif 'HUGGINGFACE_HUB_TOKEN_FILE_AT' in os.environ:
+        with open(os.environ['HUGGINGFACE_HUB_TOKEN_FILE_AT'], 'r') as file:
+            return file.read().strip()
+    else:
+        raise ValueError("Please set the HUGGINGFACE_HUB_TOKEN or HUGGINGFACE_HUB_TOKEN_FILE_AT variable.")
+
+
+def get_run_id(args: Namespace) -> str:
+    timestamp = time.strftime("%Y%m%d_%H%M%S") if not os.getenv('RUN_TIMESTAMP') else os.getenv('RUN_TIMESTAMP')
+    # try to get the git commit hash
+    # try:
+    #     git_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('utf-8').strip()
+    # except subprocess.CalledProcessError:
+    #     git_commit = "unknown"
+
+    # hashes are not the same across processes, no idea why
+    # arg_set = frozenset(vars(args).items())
+    # args_hash = abs(hash(arg_set))
+    # print(f"arg_set: {frozenset} args_hash: {args_hash}")
+    return f"{timestamp}"
+    # return f"{timestamp}_{args_hash}"
+    # return f"{timestamp}_{git_commit}_{args_hash}"
+
+
+def add_att_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         '--reduce_loss',
         default='mean',
@@ -99,19 +126,14 @@ def parse_args():
         action="store_true",
         help="If set, only \"prompt-response\" data is used and multi-turn dialogue data is filtered out.",
     )
-    args = parser.parse_args()
-
-    # Sanity checks
-    if args.dataset_name is None and args.train_file is None:
-        raise ValueError("Need either a dataset name or a training file.")
-    else:
-        if args.train_file is not None:
-            extension = args.train_file.split(".")[-1]
-            assert extension in ["json", "jsonl"], "`train_file` should be a json/jsonl file."
-    return args
+    parser.add_argument(
+        "--use_new_token_template",
+        action="store_true",
+        help="If set, the new token template is used for ATT taning."
+    )
 
 
-# OLMo chat template handles the BOS token, so we don't need to fiddle with add_bos.
+# OLMo chat template handles the BOS token, so we don'tk need to fiddle with add_bos.
 # See https://huggingface.co/allenai/OLMo-7B-Instruct/commit/f09de2dc46d1e848f19dd7161bd998973e2b1272
 def apply_att_template(example, tokenizer, max_seq_length, debug_print=False):
     chosen = example['chosen']
@@ -197,24 +219,44 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False):
 
 
 def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
+    logger.info(f"Saving model and tokenizer to {output_dir}", main_process_only=True)
+    if accelerator.is_main_process:
+        tokenizer_dir = Path(output_dir) / "tokenizer"
+        tokenizer_dir.mkdir(exist_ok=True, parents=True)
+        tokenizer.save_pretrained(tokenizer_dir)
+
     unwrapped_model = accelerator.unwrap_model(model)
+
+    accelerator.wait_for_everyone()
     # When doing multi-gpu training, we need to use accelerator.get_state_dict(model) to get the state_dict.
     # Otherwise, sometimes the model will be saved with only part of the parameters.
     # Also, accelerator needs to use the wrapped model to get the state_dict.
     state_dict = accelerator.get_state_dict(model)
+    model_dir = Path(output_dir) / "model"
+    if accelerator.is_main_process:
+        model_dir.mkdir(exist_ok=True, parents=True)
+    accelerator.wait_for_everyone()
     if args.use_lora:
         # When using lora, the unwrapped model is a PeftModel, which doesn't support the is_main_process
         # and has its own save_pretrained function for only saving lora modules.
         # We have to manually specify the is_main_process outside the save_pretrained function.
         if accelerator.is_main_process:
-            unwrapped_model.save_pretrained(output_dir, state_dict=state_dict)
+            unwrapped_model.save_pretrained(model_dir, state_dict=state_dict)
     else:
         # don't use safetensors for saving for now
         unwrapped_model.save_pretrained(
-            output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save,
+            model, is_main_process=accelerator.is_main_process, save_function=accelerator.save,
             state_dict=state_dict,
             safe_serialization=False
         )
+
+    state_dir = Path(output_dir) / "state"
+    if accelerator.is_main_process:
+        state_dir.mkdir(exist_ok=True)
+    accelerator.wait_for_everyone()
+    accelerator.save_state(state_dir)
+
+    logger.info(f"Checkpointing done!", main_process_only=True)
 
 
 def target_lora_modules(model) -> List[str]:
@@ -229,7 +271,10 @@ def target_lora_modules(model) -> List[str]:
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Finetune a transformers model using pairwise preference data.")
+    add_common_training_args(parser)
+    add_att_args(parser)
+    args = parser.parse_args()
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -253,6 +298,7 @@ def main():
         **accelerator_log_kwargs,
         kwargs_handlers=[timeout_kwargs]
     )
+
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -277,6 +323,29 @@ def main():
 
     accelerator.wait_for_everyone()
 
+    run_id = get_run_id(args)
+    checkpointing_dir = Path(args.output_dir) / run_id
+    # If the output directory already exists, the process was interrupted and restarted by the cluster.
+    # We should resume from the last checkpoint.
+
+    if accelerator.is_main_process:
+        checkpointing_dir_exists = checkpointing_dir.exists()
+        if not checkpointing_dir_exists:
+            checkpointing_dir.mkdir(parents=True)
+    else:
+        checkpointing_dir_exists = None
+
+    # Letting other processes know what the main process found. We don't want to create the directory multiple times.
+    checkpointing_dir_actually_exists = broadcast_object_list([checkpointing_dir_exists], 0)
+    if checkpointing_dir_actually_exists[0]:
+        logger.info(f"Output directory {checkpointing_dir} already exists. Resuming training...")
+        if args.resume_from_checkpoint is None:
+            ckpt_dirs = [x for x in checkpointing_dir.iterdir() if x.stem.startswith("step_") or x.stem.startswith("epoch_")]
+            if len(ckpt_dirs) > 0:
+                last_checkpoint = max(ckpt_dirs, key=os.path.getctime)
+                args.resume_from_checkpoint = last_checkpoint
+    logger.info(f"\n\n\nSaving checkpoints to {checkpointing_dir}\n\n\n")
+
     ######################################## Config and Tokenizer Loading ########################################
     def try_load_config() -> PretrainedConfig:
         # Load pretrained model and tokenizer
@@ -285,12 +354,14 @@ def main():
                 args.config_name,
                 trust_remote_code=args.trust_remote_code,
                 revision=args.model_revision,
+                force_download=args.ignore_model_cache,
             )
         elif args.model_name_or_path:
             return AutoConfig.from_pretrained(
                 args.model_name_or_path,
                 trust_remote_code=args.trust_remote_code,
                 revision=args.model_revision,
+                force_download=args.ignore_model_cache,
             )
         else:
             raise ValueError(
@@ -303,8 +374,7 @@ def main():
         print(f"Error loading config: {e}")
         print("Assuming it was a login issue, logging into Huggingface...")
 
-        assert 'HUGGINGFACE_HUB_TOKEN' in os.environ, "Please set the HUGGINGFACE_HUB_TOKEN environment variable."
-        huggingface_hub.login(token=os.getenv('HUGGINGFACE_HUB_TOKEN'))
+        huggingface_hub.login(token=get_hf_token())
         config = try_load_config()
 
     tokenizer_revision = (
@@ -320,13 +390,13 @@ def main():
                    from the model revision `{args.model_revision}`."""
         logger.warn(warning)
 
-    tokenizer_name = args.tokenizer_name if args.tokenizer_name else args.model_name_or_path
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer_name,
             trust_remote_code=args.trust_remote_code,
             use_fast=not args.use_slow_tokenizer,
-            revision=tokenizer_revision
+            revision=tokenizer_revision,
+            force_download=args.ignore_model_cache,
         )
     elif args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -334,7 +404,8 @@ def main():
             padding=True,
             trust_remote_code=args.trust_remote_code,
             use_fast=not args.use_slow_tokenizer,
-            revision=tokenizer_revision
+            revision=tokenizer_revision,
+            force_download=args.ignore_model_cache,
         )
     else:
         raise ValueError(
@@ -419,40 +490,53 @@ def main():
     train_dataset = lm_datasets["train"]
     test_dataset = lm_datasets["test"]
 
+    # COMMENT OUT! This is for debugging epoch checkpointing
+    # train_dataset = train_dataset.select(range(192))
+    # test_dataset = test_dataset.select(range(192))
+
     ######################################## Model Loading ########################################
     if args.model_name_or_path:
-        if args.use_qlora:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
-            )
-            device_index = accelerator.local_process_index
-            device_map = {"": device_index}  # force data-parallel training.
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
-                from_tf=bool(".ckpt" in args.model_name_or_path),
-                config=config,
-                load_in_4bit=True,
-                quantization_config=bnb_config,
-                device_map=device_map,
-                trust_remote_code=args.trust_remote_code,
-                torch_dtype=torch.bfloat16,
-                use_flash_attention_2=True if args.use_flash_attn else False,
-                revision=args.model_revision
-            )
-        else:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
-                from_tf=bool(".ckpt" in args.model_name_or_path),
-                config=config,
-                trust_remote_code=args.trust_remote_code,
-                low_cpu_mem_usage=args.low_cpu_mem_usage,  #
-                torch_dtype=torch.bfloat16,
-                use_flash_attention_2=True if args.use_flash_attn else False,
-                revision=args.model_revision
-            )
+        def try_load_model() -> AutoModelForCausalLM:
+            if args.use_qlora:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+                device_index = accelerator.local_process_index
+                device_map = {"": device_index}  # force data-parallel training.
+                return AutoModelForCausalLM.from_pretrained(
+                    args.model_name_or_path,
+                    from_tf=bool(".ckpt" in args.model_name_or_path),
+                    config=config,
+                    load_in_4bit=True,
+                    quantization_config=bnb_config,
+                    device_map=device_map,
+                    trust_remote_code=args.trust_remote_code,
+                    torch_dtype=torch.bfloat16,
+                    use_flash_attention_2=True if args.use_flash_attn else False,
+                    revision=args.model_revision,
+                    force_download=args.ignore_model_cache,
+                )
+            else:
+                return AutoModelForCausalLM.from_pretrained(
+                    args.model_name_or_path,
+                    from_tf=bool(".ckpt" in args.model_name_or_path),
+                    config=config,
+                    trust_remote_code=args.trust_remote_code,
+                    low_cpu_mem_usage=args.low_cpu_mem_usage,  #
+                    torch_dtype=torch.bfloat16,
+                    use_flash_attention_2=True if args.use_flash_attn else False,
+                    revision=args.model_revision,
+                    force_download=args.ignore_model_cache,
+                )
+
+        # Just a hack. Sometimes cache fails, and on the second time the model is loaded properly
+        try:
+            model = try_load_model()
+        except Exception as e:
+            model = try_load_model()
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForCausalLM.from_config(config)
@@ -493,19 +577,24 @@ def main():
     #     tokenizer.bos_token = tokenizer.eos_token
     #     assert args.add_bos, "For OLMo, you must add bos token to the beginning of the input sequence."
 
-    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
-    # on a small vocab and want a smaller embedding size, remove this test.
-    # gather deepspeed to get "real" embedding size
-
     generation_config = GenerationConfig(
-        do_sample=True,
         max_new_tokens=args.logging_examples_max_length,
-        top_p=args.logging_examples_top_p,
         renormalize_logits=True,
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        stop_strings=tokenizer.eos_token,
     )
+    generation_config_nucleus = deepcopy(generation_config)
+    generation_config_nucleus.do_sample = True
+    generation_config_nucleus.top_p = args.logging_examples_top_p
+
+    generation_config_greedy = deepcopy(generation_config)
+    generation_config_greedy.do_sample = False
+
+    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
+    # on a small vocab and want a smaller embedding size, remove this test.
+    # gather deepspeed to get "real" embedding size
 
     embeddings = model.get_input_embeddings()
 
@@ -654,52 +743,18 @@ def main():
 
     ######################################## Checkpointing ########################################
     # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
-            checkpoint_path = args.resume_from_checkpoint
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
-            dirs.sort(key=os.path.getctime)
-            path = dirs[
-                -1
-            ]  # Sorts folders by date modified, most recent checkpoint is the last
-            checkpoint_path = path
-            path = os.path.basename(checkpoint_path)
+    if args.resume_from_checkpoint is not None:
+        checkpoint_path = Path(args.resume_from_checkpoint)
+        path = os.path.basename(args.resume_from_checkpoint)
 
-        accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
-        model.load_adapter(checkpoint_path, adapter_name=checkpoint_path)
-        model.print_trainable_parameters()
-
-        """
-        There is a problem in the use of this loaded optimizer state. For now, it is commented out.
-        optimizer_state_file = os.path.join(checkpoint_path, 'optimizer_state.pt')
-
-        # Check if the optimizer state file exists before loading
-        if os.path.exists(optimizer_state_file):
-            optimizer_state_dict = torch.load(optimizer_state_file)
-            optimizer.load_state_dict(optimizer_state_dict)
-            print("Optimizer state loaded successfully.")
-        else:
-            print("Optimizer state file does not exist.")
-        """
-        # Path to the scheduler state file
-        # scheduler_state_file = 'scheduler_state.pt'
-
-        scheduler_state_file = os.path.join(checkpoint_path, 'scheduler_state.pt')
-
-        # Check if the scheduler state file exists before loading
-        if os.path.exists(scheduler_state_file):
-            scheduler_state_dict = torch.load(scheduler_state_file)
-            lr_scheduler.load_state_dict(scheduler_state_dict)
-            print("Scheduler state loaded successfully.")
-        else:
-            print("Scheduler state file does not exist.")
+        state_path = Path(checkpoint_path) / "state"
+        assert state_path.exists(), f"Checkpoint path {state_path} does not exist."
+        logger.info(f"Resuming from checkpoint: {state_path}", main_process_only=True)
+        accelerator.load_state(str(state_path))
+        logger.info(f"Accelerator state loaded", main_process_only=True)
 
         # Extract `epoch_{i}` or `step_{i}`
-        training_difference = path
-
+        training_difference = checkpoint_path.stem
         if "epoch" in training_difference:
             starting_epoch = int(training_difference.replace("epoch_", "")) + 1
             resume_step = None
@@ -721,7 +776,7 @@ def main():
     #     return accelerator.get_tracker("wandb").current_step
 
     def log_examples_to_wandb(step: int):
-        def gen_examples(example, example_idx: int, prefix: str) -> Tuple[Tuple[float, str, str, str]]:
+        def gen_examples(example, example_idx: int, gen_config: GenerationConfig) -> Tuple[Tuple[float, str, str, str]]:
             start_time = time.time()
             is_prompt = example["labels"] == -100
             is_response = ~is_prompt
@@ -733,24 +788,16 @@ def main():
             #     )
             #     return
 
-            if step == 0:
-                expected_response_ids = example["input_ids"][is_response]
-                prompt_text = tokenizer.decode(prompt_ids)
-                expected_response_text = tokenizer.decode(expected_response_ids)
-                # accelerator.get_tracker("wandb", unwrap=True).log(
-                    # wandb.log(
-                    # {f"{prefix}_example_{example_idx + 1}/prompt": wandb.Html(f"<p>{html.escape(prompt_text)}</p>")})
-                # accelerator.get_tracker("wandb", unwrap=True).log(
-                    # wandb.log(
-                    # {f"{prefix}_example_{example_idx + 1}/expected_response": wandb.Html(
-                    #     f"<p>{html.escape(expected_response_text)}</p>")})
+            expected_response_ids = example["input_ids"][is_response]
+            prompt_text = tokenizer.decode(prompt_ids)
+            expected_response_text = tokenizer.decode(expected_response_ids)
 
             # unwrapped = accelerator.unwrap_model(model)
             # outputs = unwrapped.generate(input_ids=prompt_ids.to(model.device)[None, :],
             #                              generation_config=generation_config)
 
             outputs = model.generate(input_ids=prompt_ids.to(model.device)[None, :],
-                                     generation_config=generation_config,
+                                     generation_config=gen_config, tokenizer=tokenizer,
                                      synced_gpus=True)
 
             response_text = tokenizer.decode(outputs[0])
@@ -767,25 +814,31 @@ def main():
             #     {f"{prefix}_example_{example_idx + 1}/response": wandb.Html(f"<p>{html.escape(response_text)}</p>")})
             return ((time.time() - start_time, prompt_text, expected_response_text, response_text),)
 
-
         model.eval()
         sum_time = 0.0
 
         def gather_and_log(prefix, examples):
             nonlocal sum_time
 
-            print(f"Logging examples for {prefix}, pidx={accelerator.process_index}", flush=True)
-            logged = gen_examples(train_examples[accelerator.process_index], accelerator.process_index, prefix)
-            print(f"Logged examples for {prefix} set, pidx={accelerator.process_index}", flush=True)
+            logger.info(f"Logging examples for {prefix}", main_process_only=True)
+            logged_greedy = gen_examples(examples[accelerator.process_index], accelerator.process_index,
+                                         generation_config_greedy)
+            logged_nucleus = gen_examples(examples[accelerator.process_index], accelerator.process_index,
+                                          generation_config_nucleus)
+            logger.info(f"Logged examples for {prefix}", main_process_only=True)
 
-
-            all_logged = gather_object(logged)
-            for i, (tm, prompt, expected, actual) in enumerate(list(all_logged)):
-                sum_time += tm
+            all_logged_greedy = gather_object(logged_greedy)
+            all_logged_nucleus = gather_object(logged_nucleus)
+            for i, (lg, ln) in enumerate(zip(all_logged_greedy, all_logged_nucleus)):
+                tm_g, prompt, expected, actual_g = lg
+                tm_n, _, _, actual_n = ln
+                sum_time += tm_g + tm_n
                 accelerator.log(
                     {f"{prefix}_example_{i + 1}/prompt": wandb.Html(f"<p>{html.escape(prompt)}</p>"),
                      f"{prefix}_example_{i + 1}/expected_response": wandb.Html(f"<p>{html.escape(expected)}</p>"),
-                     f"{prefix}_example_{i + 1}/response": wandb.Html(f"<p>{html.escape(actual)}</p>")})
+                     f"{prefix}_example_{i + 1}/response_greedy": wandb.Html(f"<p>{html.escape(actual_g)}</p>"),
+                     f"{prefix}_example_{i + 1}/response_nucleus": wandb.Html(f"<p>{html.escape(actual_n)}</p>"), }
+                )
 
         gather_and_log("train", train_examples)
         gather_and_log("test", test_examples)
@@ -794,19 +847,45 @@ def main():
         accelerator.wait_for_everyone()
         print(f"Finished evals! pidx={accelerator.process_index}")
 
-        accelerator.log({"log_examples_time": sum_time, "avg_example_time": sum_time / (len(train_examples) + len(test_examples))})
+        accelerator.log(
+            {"log_examples_time": sum_time,
+             "avg_example_time": sum_time / 2 / (len(train_examples) + len(test_examples))})
 
     ######################################## Training Loop ########################################
     print(f"{accelerator.sync_gradients=}", flush=True)
     accelerator.wait_for_everyone()
 
-    # if accelerator.sync_gradients:
-    log_examples_to_wandb(0)
+    def compute_loss(batch, outputs):
+        if args.reduce_loss == 'mean':
+            loss = outputs.loss
+        else:
+            # reduce loss is sum
+            # this ensures that we weight all tokens in the dataset equally,
+            # rather than weighting each overall example equally when
+            # using high amounts of gradient accumulation.
+            # this can result in > 5 point improvements in AlpacaEval
+            # see https://github.com/huggingface/transformers/issues/24725 for
+            # more discussion and details.
+            logits = outputs.logits
+            labels = batch["labels"]
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
+            shift_logits = shift_logits.view(-1, embedding_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+        return loss
+
+    if accelerator.sync_gradients and not args.logging_examples_ignore_first:
+        log_examples_to_wandb(completed_steps)
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_loss = 0
         epoch_data_count = 0  # To keep track of the number of data points in each epoch
-
         if (
                 args.resume_from_checkpoint
                 and epoch == starting_epoch
@@ -826,29 +905,7 @@ def main():
                 # print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
                 outputs = model(**batch, use_cache=False)
                 # print(f"Memory allocated after forward pass: {memory_allocated() / 1e9} GB")
-
-                if args.reduce_loss == 'mean':
-                    loss = outputs.loss
-                else:
-                    # reduce loss is sum
-                    # this ensures that we weight all tokens in the dataset equally,
-                    # rather than weighting each overall example equally when
-                    # using high amounts of gradient accumulation.
-                    # this can result in > 5 point improvements in AlpacaEval
-                    # see https://github.com/huggingface/transformers/issues/24725 for
-                    # more discussion and details.
-                    logits = outputs.logits
-                    labels = batch["labels"]
-                    # Shift so that tokens < n predict n
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
-                    # Flatten the tokens
-                    loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
-                    shift_logits = shift_logits.view(-1, embedding_size)
-                    shift_labels = shift_labels.view(-1)
-                    # Enable model parallelism
-                    shift_labels = shift_labels.to(shift_logits.device)
-                    loss = loss_fct(shift_logits, shift_labels)
+                loss = compute_loss(batch, outputs)
                 # We keep track of the loss at each logged step
                 total_loss += loss.detach().float()
                 accelerator.backward(loss)
@@ -884,41 +941,45 @@ def main():
                 if args.logging_examples_steps and completed_steps % args.logging_examples_steps == 0:
                     log_examples_to_wandb(completed_steps)
 
-                if isinstance(checkpointing_steps, int):
-                    if completed_steps % checkpointing_steps == 0:
-                        output_dir = f"step_{completed_steps}"
-                        if args.output_dir is not None:
-                            output_dir = os.path.join(args.output_dir, output_dir)
-                        save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
+                if isinstance(checkpointing_steps, int) and completed_steps % checkpointing_steps == 0:
+                    output_dir = checkpointing_dir / f"step_{completed_steps}"
+                    save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
 
                 if completed_steps >= args.max_train_steps:
                     break
 
         print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
-        # if args.checkpointing_steps == "epoch":
-        #     output_dir = f"epoch_{epoch}"
-        #     torch.cuda.empty_cache()
-        #     if args.output_dir is not None:
-        #         output_dir = os.path.join(args.output_dir, output_dir)
-        #         tokenizer.save_pretrained(output_dir)
-        #     save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
-        #     accelerator.wait_for_everyone()  # ensure that the files are created
-        #     print(output_dir)
-        #
-        #     print(f"Running evaluation at the end of epoch {epoch + 1}")
-        #     run_evaluation_subprocess(args, output_dir, run_id, tokenizer)
-        #     csv_path = output_dir + "/eval_results/summary.csv"
-        #     print("log eval results to wandb")
-        #     metrics_log = log_eval_results_to_wandb(csv_path, epoch)
-        #     logger.info(f"Epoch {epoch} Evaluation Metrics: {metrics_log}")
-        #     if args.with_tracking:
-        #         # Log evaluation metrics
-        #         accelerator.log(metrics_log)
+
+        model.eval()
+        eval_pbar = tqdm(test_dataloader, desc="Evaluating", disable=not accelerator.is_local_main_process)
+        total_loss = 0.0
+        total_num_labels = 0
+        for step, batch in enumerate(eval_pbar):
+            if args.max_train_steps is not None and step >= args.max_train_steps:
+                break
+            with torch.no_grad():
+                outputs = model(**batch, use_cache=False)
+                num_labels = batch["labels"].ne(-100).sum()
+                loss = compute_loss(batch, outputs)
+            batch_num_labels = accelerator.gather(num_labels.repeat(accelerator.num_processes)).sum().item()
+            batch_loss = accelerator.gather(loss.repeat(accelerator.num_processes)).sum().item()
+            total_loss += batch_loss
+            total_num_labels += batch_num_labels
+            eval_pbar.set_postfix({"loss": total_loss / total_num_labels})
+
+        logs = {"eval_loss": total_loss / total_num_labels, "eval_ppl": math.exp(total_loss / total_num_labels)}
+        if args.with_tracking:
+            accelerator.log(logs)
+        model.train()
+
+        if args.checkpointing_steps == "epoch":
+            output_dir = checkpointing_dir / f"epoch_{epoch}"
+            save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
+            with open(output_dir / "logs.json", "w") as f:
+                json.dump(logs, f)
 
     if args.output_dir is not None:
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
-        save_with_accelerate(accelerator, model, tokenizer, args.output_dir, args)
+        save_with_accelerate(accelerator, model, tokenizer, args)
 
     accelerator.wait_for_everyone()
     if args.with_tracking:

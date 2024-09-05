@@ -155,6 +155,9 @@ def add_common_training_args(parser: argparse.ArgumentParser):
         "--overwrite_cache", action="store_true", help="Overwrite the cached training and evaluation sets"
     )
     parser.add_argument(
+        "--ignore_model_cache", action="store_true", help="Ignore the cached model and load from HF."
+    )
+    parser.add_argument(
         "--checkpointing_steps",
         type=str,
         default=None,
@@ -183,6 +186,17 @@ def add_common_training_args(parser: argparse.ArgumentParser):
         type=int,
         default=0.9,
         help="The top-p value to use for the generated examples.",
+    )
+    parser.add_argument(
+        "--logging_examples_temp",
+        type=float,
+        default=0.8,
+        help="The temperature value to use for the generated examples."
+    )
+    parser.add_argument(
+        "--logging_examples_ignore_first",
+        action="store_true",
+        help="For debugging: do not log sample outputs before the first training step.",
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -259,6 +273,13 @@ def add_common_training_args(parser: argparse.ArgumentParser):
         '--trust_remote_code',
         action='store_true',
         help='Trust remote code when loading pretrained models and tokenizers. Use only when you trust the remote code.',
+    )
+    parser.add_argument(
+        '--method',
+        type=str,
+        default='att',
+        choices=['att', 'dpo', 'orpo'],
+        help='The method to use for preference tuning.',
     )
 
 
