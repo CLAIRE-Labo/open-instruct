@@ -10,6 +10,7 @@ import argparse
 import logging
 import math
 import os
+import subprocess
 import random
 from copy import deepcopy
 import datasets
@@ -43,13 +44,13 @@ from dpo_utils import dpo_loss, concatenated_forward, DataCollatorForSeq2SeqDPO
 from datasets import DatasetDict
 import sys
 import wandb
+import pandas as pd
 import os
 import gc
 from peft import PeftConfig, PeftModel
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:64'
 from pathlib import Path
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
-from finetune_preference import run_evaluation_subprocess, log_eval_results_to_wandb
 
 
 logger = get_logger(__name__)
@@ -77,6 +78,47 @@ def _autoset_attn_implementation_for_olmo(
     return config
 
 OLMoForCausalLM._autoset_attn_implementation = _autoset_attn_implementation_for_olmo
+
+
+def log_eval_results_to_wandb(csv_path, epoch):
+    # Load the summary CSV file
+    try:
+        # Load the summary CSV file
+        results_df = pd.read_csv(csv_path)
+        metrics={}
+        # Assume there's only one row of metrics, typical in a summarised results CSV
+        if not results_df.empty:
+            results_dict = results_df.iloc[0].to_dict()  # Convert the first row to a dictionary
+            metrics={
+                "BLEURT_acc": results_dict.get('BLEURT acc', None),
+                "bleu_acc": results_dict.get('bleu acc', None),
+                "rouge1_acc": results_dict.get('rouge1 acc', None),
+                "rouge2_acc": results_dict.get('rouge2 acc', None),
+                "rougeL_acc": results_dict.get('rougeL acc', None),
+                "eval_step": epoch + 1
+            }
+
+        else:
+            print("No data found in the CSV file.")
+        return metrics
+    except Exception as e:
+        print(f"Failed to read or log evaluation results: {e}")
+
+def run_evaluation_subprocess(args,base_path, run_id, tokenizer):
+    """ Run the evaluation script as a subprocess. """
+    command = [
+        'python', '../open-instruct/open_instruct/eval_script.py',
+        '--base_path', base_path,
+        '--base_model', args.base_model_dir,
+        '--wandb_run_id', run_id,
+    ]
+    if isinstance(tokenizer, (LlamaTokenizer, LlamaTokenizerFast)):
+        # If tokenizer is an instance of LlamaTokenizer or LlamaTokenizerFast, use phi3 chat format
+        chat_format = "eval.templates.create_prompt_with_phi3_chat_format"
+        command.extend(['--chat_formatting_function', chat_format])
+    # Run the command
+    subprocess.run(command, capture_output=True, text=True)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")

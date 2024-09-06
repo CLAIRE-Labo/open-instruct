@@ -56,6 +56,7 @@ sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from utils import add_common_training_args, parse_entry_anthropic_hh, merge_consecutive_messages_and_trim, \
     is_entry_ok_anthropic_hh, pretty_print_chatml
+from att import apply_att_template
 
 from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
 
@@ -131,92 +132,6 @@ def add_att_args(parser: argparse.ArgumentParser):
         action="store_true",
         help="If set, the new token template is used for ATT taning."
     )
-
-
-# OLMo chat template handles the BOS token, so we don'tk need to fiddle with add_bos.
-# See https://huggingface.co/allenai/OLMo-7B-Instruct/commit/f09de2dc46d1e848f19dd7161bd998973e2b1272
-def apply_att_template(example, tokenizer, max_seq_length, debug_print=False):
-    chosen = example['chosen']
-    rejected = example['rejected']
-
-    assert len(chosen) == len(rejected), \
-        f"Chosen and rejected should have the same length, got {len(chosen)} and {len(rejected)}.\n" \
-        f"Chosen:\n{pretty_print_chatml(chosen)}\nRejected:\n{pretty_print_chatml(rejected)}"
-
-    assert len(chosen) > 1, f"Chosen and rejected should have at least 2 messages, got {len(chosen)}"
-    # All messages but the last one should be identical, like in the Anthropic HH data
-    for i, (mc, mr) in enumerate(zip(chosen[:-1], rejected[:-1])):
-        assert mc == mr, f"Chosen and rejected should be identical, got {mc} and {mr}"
-    assert chosen[-1]['role'] == 'assistant' and rejected[-1]['role'] == 'assistant', \
-        f"The last message in both chosen and rejected should be by the assistant, got {chosen[-1]['role']} and {rejected[-1]['role']}"
-
-    messages = chosen[:-2]
-    messages.append({
-        'role': 'user',
-        'content': ATT_TEMPLATE.format(last_user_message=chosen[-2]['content'], rejected=rejected[-1]['content'])
-    })
-
-    for i in range(0, len(messages) - 1):
-        assert messages[i]['role'] != messages[i + 1]['role'], \
-            f"Messages should alternate between user and assistant, got {messages[i]['role']} and {messages[i + 1]['role']}\n" \
-            f"You can use mege_consecutive_messages to achieve that. \n" \
-            f"Messages:\n{pretty_print_chatml(messages)}"
-
-    # The chat template used by Mistral is not convenient because it only adds the system prompt to the last
-    # user message, and only does it if the last message in the conversation is indeed by the user. This would make it
-    # painful to set up the labels for SFT. Hence, we just prepend the system prompt to the first user message instead.
-    if tokenizer.chat_template == BAD_MISTRAL_CHAT_TEMPLATE:
-        messages[0]["content"] = ATT_SYSTEM_PROMPT + '\n\n' + messages[0]["content"]
-    else:
-        system_msg = {'role': 'system', 'content': ATT_SYSTEM_PROMPT}
-        messages = [system_msg] + messages
-
-    try:
-        # TODO Skander check max token length of HH data
-        prompt_text = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True,
-                                                    tokenize=False, max_length=max_seq_length)
-    except Exception as e:
-        logger.error(f"Error in apply_chat_template when generating the prompt: {e}")
-        logger.error("Messages:")
-        logger.error(pretty_print_chatml(messages))
-        raise e
-
-    if debug_print:
-        logger.info("The prompt:\n\"\"\"\n" + prompt_text + "\n\"\"\"")
-    tokens = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True,
-                                           max_length=max_seq_length)
-    end_idx = len(tokens)
-
-    messages.append(chosen[-1])
-
-    try:
-        response_text = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=False,
-                                                      tokenize=False, max_length=max_seq_length)
-    except Exception as e:
-        logger.error(f"Error in apply_chat_template when generating the response message: {e}")
-        logger.error("Messages:")
-        logger.error(pretty_print_chatml(messages))
-        raise e
-
-    assert prompt_text == response_text[:len(prompt_text)], \
-        f"Currently it is assumed that the prompt and response should be the same up to the end of the prompt," \
-        f" got \"{prompt_text}\" and \"{response_text}\""
-    expected_response_text = response_text[len(prompt_text):]
-    if debug_print:
-        logger.info("Target response:\n\"\"\"\n" + expected_response_text + "\n\"\"\"")
-
-    input_ids = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=False,
-                                              max_length=max_seq_length)
-    input_ids = torch.tensor([input_ids], dtype=torch.long)
-    labels = input_ids.clone()
-    labels[:, :end_idx] = -100
-    attention_mask = torch.ones_like(input_ids)
-
-    return {
-        'input_ids': input_ids.flatten(),
-        'labels': labels.flatten(),
-        'attention_mask': attention_mask.flatten(),
-    }
 
 
 def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
@@ -449,7 +364,7 @@ def main():
     for i in range(10):
         logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(dataset_train[i]['chosen'])}\n\n"
                     f"Example {i} rejected:\n{pretty_print_chatml(dataset_train[i]['rejected'])}\n\n")
-        apply_att_template(dataset_test[i], tokenizer, args.max_seq_length, debug_print=True)
+        apply_att_template(dataset_test[i], tokenizer, args.max_seq_length, debug_print=True, logger=logger)
 
     filtered_dataset = DatasetDict({
         'train': dataset_train,
@@ -469,7 +384,8 @@ def main():
     encode_function = partial(
         apply_att_template,
         tokenizer=tokenizer,
-        max_seq_length=args.max_seq_length
+        max_seq_length=args.max_seq_length,
+        logger=logger,
     )
 
     with accelerator.main_process_first():
@@ -542,37 +458,58 @@ def main():
         logger.info("Training new model from scratch")
         model = AutoModelForCausalLM.from_config(config)
 
+    # TODO check that nothing breaks if we don't add special tokens
+    # We only use instruct models, so tokens should already be there
+
     # Add special tokens if they are not already added
     # no default pad token for llama!
     # here we add all special tokens again, because the default ones are not in the special_tokens_map
-    if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
-        num_added_tokens = tokenizer.add_special_tokens({
-            "bos_token": "<s>",
-            "eos_token": "</s>",
-            "unk_token": "<unk>",
-            "pad_token": "<pad>",
-        })
-        # pad token is also equal to eos token in the case of phi3
 
-        if model.__class__.__name__ == "Phi3ForCausalLM":
-            assert num_added_tokens <= 2
-            # Taken from https://github.com/microsoft/Phi-3CookBook/blob/main/code/04.Finetuning/Phi-3-finetune-lora-python.ipynb
-            tokenizer.pad_token = tokenizer.unk_token
-            # The ID of the padding token is set to the ID of the unknown token.
-            tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
-        else:
-            assert num_added_tokens in [0, 1], "LlamaTokenizer should only add one special token - the pad_token," \
-                                               " or no tokens if pad token present."
-        tokenizer.padding_side = 'left'
-    elif isinstance(tokenizer, GPTNeoXTokenizerFast):
-        num_added_tokens = tokenizer.add_special_tokens({
-            "pad_token": "<pad>",
-        })
-        assert num_added_tokens == 1, "GPTNeoXTokenizer should only add one special token - the pad_token."
-    elif isinstance(tokenizer, GPT2Tokenizer) and isinstance(model, OPTForCausalLM):
-        num_added_tokens = tokenizer.add_special_tokens({'unk_token': '<unk>'})
+    new_special_tokens = {
+        "bos_token": "<s>",
+        "eos_token": "</s>",
+        "unk_token": "<unk>",
+    }
+    # for key, value in new_special_tokens.items():
+    #     if key not in tokenizer.special_tokens_map:
+    #         num_added = tokenizer.add_special_tokens({key: value})
+    #         if num_added > 0:
+    #             logger.info(f"Added special tokens to the tokenizer: {key} = {value}")
 
-    # Now OLMo supports chat templates, so we don't need to add bos token
+    # Force rewrite the pad token. Some models set pad_token=eos_token, and then the attention mask is not deduced correctly
+    # We also have to add a new eos token. It appears kv caching in model.generate has a bug when used together with deepspeed.
+    # Outputs past the actual eos_token have to be truncated manually.
+
+    actual_eos_token = tokenizer.eos_token
+    tokenizer.add_special_tokens({'pad_token': '<pad>', 'eos_token': '<my_eos_token>'})
+
+    # if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+    #     num_added_tokens = tokenizer.add_special_tokens({
+    #         "bos_token": "<s>",
+    #         "eos_token": "</s>",
+    #         "unk_token": "<unk>",
+    #         "pad_token": "<pad>",
+    #     })
+    #     # pad token is also equal to eos token in the case of phi3
+    #
+    #     if model.__class__.__name__ == "Phi3ForCausalLM":
+    #         assert num_added_tokens <= 2
+    #         # Taken from https://github.com/microsoft/Phi-3CookBook/blob/main/code/04.Finetuning/Phi-3-finetune-lora-python.ipynb
+    #         tokenizer.pad_token = tokenizer.unk_token
+    #         # The ID of the padding token is set to the ID of the unknown token.
+    #         tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+    #     else:
+    #         assert num_added_tokens in [0, 1], "LlamaTokenizer should only add one special token - the pad_token," \
+    #                                            " or no tokens if pad token present."
+    #     tokenizer.padding_side = 'left'
+    # elif isinstance(tokenizer, GPTNeoXTokenizerFast):
+    #     num_added_tokens = tokenizer.add_special_tokens({
+    #         "pad_token": "<pad>",
+    #     })
+    #     assert num_added_tokens == 1, "GPTNeoXTokenizer should only add one special token - the pad_token."
+    # elif isinstance(tokenizer, GPT2Tokenizer) and isinstance(model, OPTForCausalLM):
+    #     num_added_tokens = tokenizer.add_special_tokens({'unk_token': '<unk>'})
+    # # Now OLMo supports chat templates, so we don't need to add bos token
     # elif isinstance(tokenizer, OLMoTokenizerFast):
     #     # only the eos for olmo, but we use it as bos
     #     tokenizer.bos_token = tokenizer.eos_token
@@ -584,8 +521,18 @@ def main():
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        stop_strings=tokenizer.eos_token,
+        # stop_strings=tokenizer.eos_token,
     )
+    embeddings = model.get_input_embeddings()
+    # padding will enable tensorcores, hopefully will make it faster
+    # https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#requirements-tc
+    with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
+        if len(tokenizer) > embeddings.weight.shape[0]:
+            model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=128)
+        embedding_size = embeddings.weight.shape[0]
+        # padding to multiples creates a few "shadow" tokens that we don't want to be generated
+        generation_config.suppress_tokens = list(range(len(tokenizer), embedding_size))
+
     generation_config_nucleus = deepcopy(generation_config)
     generation_config_nucleus.do_sample = True
     generation_config_nucleus.top_p = args.logging_examples_top_p
@@ -597,16 +544,6 @@ def main():
     # on a small vocab and want a smaller embedding size, remove this test.
     # gather deepspeed to get "real" embedding size
 
-    embeddings = model.get_input_embeddings()
-
-    # padding will enable tensorcores, hopefully will make it faster
-    # https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#requirements-tc
-    with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
-        if len(tokenizer) > embeddings.weight.shape[0]:
-            model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=128)
-        embedding_size = embeddings.weight.shape[0]
-        # padding to multiples creates a few "shadow" tokens that we don't want to be generated
-        generation_config.suppress_tokens = list(range(len(tokenizer), embedding_size))
 
     if args.use_lora:
         if args.use_qlora:
@@ -810,6 +747,10 @@ def main():
             else:
                 response_text = response_text[len(prompt_text):]
 
+            # We updated the eos token to avoid the bugs in model.generate, so we have to truncate the output manually
+            if actual_eos_token is not None and actual_eos_token in response_text:
+                response_text = response_text.split(actual_eos_token)[0] + actual_eos_token
+
             # accelerator.get_tracker("wandb", unwrap=True).log(
             # wandb.log(
             #     {f"{prefix}_example_{example_idx + 1}/response": wandb.Html(f"<p>{html.escape(response_text)}</p>")})
@@ -979,8 +920,8 @@ def main():
             with open(output_dir / "logs.json", "w") as f:
                 json.dump(logs, f)
 
-    if args.output_dir is not None:
-        save_with_accelerate(accelerator, model, tokenizer, args)
+    output_dir = checkpointing_dir / "final"
+    save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
 
     accelerator.wait_for_everyone()
     if args.with_tracking:
