@@ -26,7 +26,6 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed, InitProcessGroupKwargs, gather_object, broadcast_object_list
 import datasets
-from datasets import load_dataset
 from datasets import DatasetDict
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -54,8 +53,7 @@ from transformers import (
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-from utils import add_common_training_args, parse_entry_anthropic_hh, merge_consecutive_messages_and_trim, \
-    is_entry_ok_anthropic_hh, pretty_print_chatml
+from utils import add_common_training_args, pretty_print_chatml, preprocess_hh_common, load_tokenizer_model
 from att import apply_att_template
 
 from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
@@ -86,16 +84,6 @@ if api_key_file:
         raise ValueError(f"An error occurred while reading the WANDB_API_KEY from file: {e}")
 else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
-
-
-def get_hf_token() -> str:
-    if 'HUGGINGFACE_HUB_TOKEN' in os.environ:
-        return os.environ['HUGGINGFACE_HUB_TOKEN']
-    elif 'HUGGINGFACE_HUB_TOKEN_FILE_AT' in os.environ:
-        with open(os.environ['HUGGINGFACE_HUB_TOKEN_FILE_AT'], 'r') as file:
-            return file.read().strip()
-    else:
-        raise ValueError("Please set the HUGGINGFACE_HUB_TOKEN or HUGGINGFACE_HUB_TOKEN_FILE_AT variable.")
 
 
 def get_run_id(args: Namespace) -> str:
@@ -175,17 +163,6 @@ def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
     logger.info(f"Checkpointing done!", main_process_only=True)
 
 
-def target_lora_modules(model) -> List[str]:
-    if model.__class__.__name__ == "Phi3ForCausalLM":
-        return ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
-    elif model.__class__.__name__ == "OLMoForCausalLM":
-        return ["att_proj", "ff_proj", "attn_out", "ff_out"]
-    elif model.__class__.__name__ == "MistralForCausalLM":
-        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    else:
-        raise ValueError(f"Model type {type(model)} not added yet. Model:\n {model}")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Finetune a transformers model using pairwise preference data.")
     add_common_training_args(parser)
@@ -239,6 +216,10 @@ def main():
 
     accelerator.wait_for_everyone()
 
+    # load_tokenizer_model is a function that loads the model and tokenizer
+    model, tokenizer, actual_eos_token, generation_config_nucleus, generation_config_greedy \
+        = load_tokenizer_model(accelerator, args)
+
     run_id = get_run_id(args)
     checkpointing_dir = Path(args.output_dir) / run_id
     # If the output directory already exists, the process was interrupted and restarted by the cluster.
@@ -256,111 +237,15 @@ def main():
     if checkpointing_dir_actually_exists[0]:
         logger.info(f"Output directory {checkpointing_dir} already exists. Resuming training...")
         if args.resume_from_checkpoint is None:
-            ckpt_dirs = [x for x in checkpointing_dir.iterdir() if x.stem.startswith("step_") or x.stem.startswith("epoch_")]
+            ckpt_dirs = [x for x in checkpointing_dir.iterdir() if
+                         x.stem.startswith("step_") or x.stem.startswith("epoch_")]
             if len(ckpt_dirs) > 0:
                 last_checkpoint = max(ckpt_dirs, key=os.path.getctime)
                 args.resume_from_checkpoint = last_checkpoint
     logger.info(f"\n\n\nSaving checkpoints to {checkpointing_dir}\n\n\n")
 
-    ######################################## Config and Tokenizer Loading ########################################
-    def try_load_config() -> PretrainedConfig:
-        # Load pretrained model and tokenizer
-        if args.config_name:
-            return AutoConfig.from_pretrained(
-                args.config_name,
-                trust_remote_code=args.trust_remote_code,
-                revision=args.model_revision,
-                force_download=args.ignore_model_cache,
-            )
-        elif args.model_name_or_path:
-            return AutoConfig.from_pretrained(
-                args.model_name_or_path,
-                trust_remote_code=args.trust_remote_code,
-                revision=args.model_revision,
-                force_download=args.ignore_model_cache,
-            )
-        else:
-            raise ValueError(
-                "You are instantiating a new config instance from scratch. This is not supported by this script."
-            )
-
-    try:
-        config = try_load_config()
-    except OSError as e:
-        print(f"Error loading config: {e}")
-        print("Assuming it was a login issue, logging into Huggingface...")
-
-        huggingface_hub.login(token=get_hf_token())
-        config = try_load_config()
-
-    tokenizer_revision = (
-        args.model_revision
-        if args.tokenizer_revision is None
-        else args.tokenizer_revision
-    )
-
-    if tokenizer_revision != args.model_revision:
-        # Warn user if tokenizer and model use different revisions; this is an unusual
-        # use case.
-        warning = f"""Requested tokenizer revision `{tokenizer_revision}` is different
-                   from the model revision `{args.model_revision}`."""
-        logger.warn(warning)
-
-    if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer_name,
-            trust_remote_code=args.trust_remote_code,
-            use_fast=not args.use_slow_tokenizer,
-            revision=tokenizer_revision,
-            force_download=args.ignore_model_cache,
-        )
-    elif args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.model_name_or_path,
-            padding=True,
-            trust_remote_code=args.trust_remote_code,
-            use_fast=not args.use_slow_tokenizer,
-            revision=tokenizer_revision,
-            force_download=args.ignore_model_cache,
-        )
-    else:
-        raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
-        )
-
     ######################################## Data Preprocessing ########################################
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-        )
-    else:
-        data_files = {}
-        dataset_args = {}
-        if args.train_file is not None:
-            data_files["train"] = args.train_file
-        raw_datasets = load_dataset(
-            "json",
-            data_files=data_files,
-            **dataset_args,
-        )
-
-    dataset_train = raw_datasets['train'].map(parse_entry_anthropic_hh)
-    dataset_test = raw_datasets['test'].map(parse_entry_anthropic_hh)
-
-    dataset_train = dataset_train.filter(is_entry_ok_anthropic_hh)
-    dataset_test = dataset_test.filter(is_entry_ok_anthropic_hh)
-    print(f"After filtering, {len(dataset_train)} training examples and {len(dataset_test)} test examples remain.")
-
-    if args.remove_multiturn_data:
-        dataset_train = dataset_train.filter(lambda x: len(x['rejected']) == 2)
-        dataset_test = dataset_test.filter(lambda x: len(x['rejected']) == 2)
-
-    dataset_train = dataset_train.map(lambda x: {k: merge_consecutive_messages_and_trim(v) for k, v in x.items()})
-    dataset_test = dataset_test.map(lambda x: {k: merge_consecutive_messages_and_trim(v) for k, v in x.items()})
-
+    dataset_train, dataset_test = preprocess_hh_common(args)
     for i in range(10):
         logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(dataset_train[i]['chosen'])}\n\n"
                     f"Example {i} rejected:\n{pretty_print_chatml(dataset_train[i]['rejected'])}\n\n")
@@ -371,16 +256,6 @@ def main():
         'test': dataset_test
     })
 
-    # add info column which will store human, assistant_rejected and assistant_chosen messages
-    # filtered_dataset["train"] = filtered_dataset["train"].map(extract_role_messages)
-    # filtered_dataset["test"] = filtered_dataset["test"].map(extract_role_messages)
-
-    # encode_function = partial(
-    #     encode_with_rejected_chosen,
-    #     tokenizer=tokenizer,
-    #     max_seq_length=args.max_seq_length,
-    #     add_bos=args.add_bos,
-    # )
     encode_function = partial(
         apply_att_template,
         tokenizer=tokenizer,
@@ -411,156 +286,8 @@ def main():
     # train_dataset = train_dataset.select(range(192))
     # test_dataset = test_dataset.select(range(192))
 
-    ######################################## Model Loading ########################################
-    if args.model_name_or_path:
-        def try_load_model() -> AutoModelForCausalLM:
-            if args.use_qlora:
-                bnb_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=torch.bfloat16,
-                )
-                device_index = accelerator.local_process_index
-                device_map = {"": device_index}  # force data-parallel training.
-                return AutoModelForCausalLM.from_pretrained(
-                    args.model_name_or_path,
-                    from_tf=bool(".ckpt" in args.model_name_or_path),
-                    config=config,
-                    load_in_4bit=True,
-                    quantization_config=bnb_config,
-                    device_map=device_map,
-                    trust_remote_code=args.trust_remote_code,
-                    torch_dtype=torch.bfloat16,
-                    use_flash_attention_2=True if args.use_flash_attn else False,
-                    revision=args.model_revision,
-                    force_download=args.ignore_model_cache,
-                )
-            else:
-                return AutoModelForCausalLM.from_pretrained(
-                    args.model_name_or_path,
-                    from_tf=bool(".ckpt" in args.model_name_or_path),
-                    config=config,
-                    trust_remote_code=args.trust_remote_code,
-                    low_cpu_mem_usage=args.low_cpu_mem_usage,  #
-                    torch_dtype=torch.bfloat16,
-                    use_flash_attention_2=True if args.use_flash_attn else False,
-                    revision=args.model_revision,
-                    force_download=args.ignore_model_cache,
-                )
-
-        # Just a hack. Sometimes cache fails, and on the second time the model is loaded properly
-        try:
-            model = try_load_model()
-        except Exception as e:
-            model = try_load_model()
-    else:
-        logger.info("Training new model from scratch")
-        model = AutoModelForCausalLM.from_config(config)
-
     # TODO check that nothing breaks if we don't add special tokens
     # We only use instruct models, so tokens should already be there
-
-    # Add special tokens if they are not already added
-    # no default pad token for llama!
-    # here we add all special tokens again, because the default ones are not in the special_tokens_map
-
-    new_special_tokens = {
-        "bos_token": "<s>",
-        "eos_token": "</s>",
-        "unk_token": "<unk>",
-    }
-    # for key, value in new_special_tokens.items():
-    #     if key not in tokenizer.special_tokens_map:
-    #         num_added = tokenizer.add_special_tokens({key: value})
-    #         if num_added > 0:
-    #             logger.info(f"Added special tokens to the tokenizer: {key} = {value}")
-
-    # Force rewrite the pad token. Some models set pad_token=eos_token, and then the attention mask is not deduced correctly
-    # We also have to add a new eos token. It appears kv caching in model.generate has a bug when used together with deepspeed.
-    # Outputs past the actual eos_token have to be truncated manually.
-
-    actual_eos_token = tokenizer.eos_token
-    tokenizer.add_special_tokens({'pad_token': '<pad>', 'eos_token': '<my_eos_token>'})
-
-    # if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
-    #     num_added_tokens = tokenizer.add_special_tokens({
-    #         "bos_token": "<s>",
-    #         "eos_token": "</s>",
-    #         "unk_token": "<unk>",
-    #         "pad_token": "<pad>",
-    #     })
-    #     # pad token is also equal to eos token in the case of phi3
-    #
-    #     if model.__class__.__name__ == "Phi3ForCausalLM":
-    #         assert num_added_tokens <= 2
-    #         # Taken from https://github.com/microsoft/Phi-3CookBook/blob/main/code/04.Finetuning/Phi-3-finetune-lora-python.ipynb
-    #         tokenizer.pad_token = tokenizer.unk_token
-    #         # The ID of the padding token is set to the ID of the unknown token.
-    #         tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
-    #     else:
-    #         assert num_added_tokens in [0, 1], "LlamaTokenizer should only add one special token - the pad_token," \
-    #                                            " or no tokens if pad token present."
-    #     tokenizer.padding_side = 'left'
-    # elif isinstance(tokenizer, GPTNeoXTokenizerFast):
-    #     num_added_tokens = tokenizer.add_special_tokens({
-    #         "pad_token": "<pad>",
-    #     })
-    #     assert num_added_tokens == 1, "GPTNeoXTokenizer should only add one special token - the pad_token."
-    # elif isinstance(tokenizer, GPT2Tokenizer) and isinstance(model, OPTForCausalLM):
-    #     num_added_tokens = tokenizer.add_special_tokens({'unk_token': '<unk>'})
-    # # Now OLMo supports chat templates, so we don't need to add bos token
-    # elif isinstance(tokenizer, OLMoTokenizerFast):
-    #     # only the eos for olmo, but we use it as bos
-    #     tokenizer.bos_token = tokenizer.eos_token
-    #     assert args.add_bos, "For OLMo, you must add bos token to the beginning of the input sequence."
-
-    generation_config = GenerationConfig(
-        max_new_tokens=args.logging_examples_max_length,
-        renormalize_logits=True,
-        pad_token_id=tokenizer.pad_token_id,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        # stop_strings=tokenizer.eos_token,
-    )
-    embeddings = model.get_input_embeddings()
-    # padding will enable tensorcores, hopefully will make it faster
-    # https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#requirements-tc
-    with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
-        if len(tokenizer) > embeddings.weight.shape[0]:
-            model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=128)
-        embedding_size = embeddings.weight.shape[0]
-        # padding to multiples creates a few "shadow" tokens that we don't want to be generated
-        generation_config.suppress_tokens = list(range(len(tokenizer), embedding_size))
-
-    generation_config_nucleus = deepcopy(generation_config)
-    generation_config_nucleus.do_sample = True
-    generation_config_nucleus.top_p = args.logging_examples_top_p
-
-    generation_config_greedy = deepcopy(generation_config)
-    generation_config_greedy.do_sample = False
-
-    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
-    # on a small vocab and want a smaller embedding size, remove this test.
-    # gather deepspeed to get "real" embedding size
-
-
-    if args.use_lora:
-        if args.use_qlora:
-            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
-        logger.info("Initializing LORA model...")
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            inference_mode=False,
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=target_lora_modules(model)
-        )
-        model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
-    elif args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
 
     # Log a few random samples from the training set
 
@@ -652,6 +379,10 @@ def main():
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+
+    embeddings = model.get_input_embeddings()
+    with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
+        embedding_size = embeddings.weight.shape[0]
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")

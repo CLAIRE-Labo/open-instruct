@@ -1,13 +1,36 @@
+import os
 from typing import List, Dict
 import re
 import argparse
 import logging
 from copy import deepcopy
 
+import torch
+import huggingface_hub
 from transformers import SchedulerType
+from transformers import (
+    AutoConfig,
+    PretrainedConfig,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    GenerationConfig,
+    BitsAndBytesConfig,
+)
+import deepspeed
+from datasets import load_dataset
 
 
 logger = logging.getLogger(__name__)
+
+
+def get_hf_token() -> str:
+    if 'HUGGINGFACE_HUB_TOKEN' in os.environ:
+        return os.environ['HUGGINGFACE_HUB_TOKEN']
+    elif 'HUGGINGFACE_HUB_TOKEN_FILE_AT' in os.environ:
+        with open(os.environ['HUGGINGFACE_HUB_TOKEN_FILE_AT'], 'r') as file:
+            return file.read().strip()
+    else:
+        raise ValueError("Please set the HUGGINGFACE_HUB_TOKEN or HUGGINGFACE_HUB_TOKEN_FILE_AT variable.")
 
 
 def add_common_training_args(parser: argparse.ArgumentParser):
@@ -373,6 +396,201 @@ def pretty_print_chatml(messages: List[Dict[str, str]]):
         else:
             raise ValueError(f"Invalid role: {message['role']}")
     return chatml
+
+
+def preprocess_hh_common(args):
+    if args.dataset_name is not None:
+        # Downloading and loading a dataset from the hub.
+        raw_datasets = load_dataset(
+            args.dataset_name,
+            args.dataset_config_name,
+        )
+    else:
+        data_files = {}
+        dataset_args = {}
+        if args.train_file is not None:
+            data_files["train"] = args.train_file
+        raw_datasets = load_dataset(
+            "json",
+            data_files=data_files,
+            **dataset_args,
+        )
+
+    dataset_train = raw_datasets['train'].map(parse_entry_anthropic_hh)
+    dataset_test = raw_datasets['test'].map(parse_entry_anthropic_hh)
+
+    dataset_train = dataset_train.filter(is_entry_ok_anthropic_hh)
+    dataset_test = dataset_test.filter(is_entry_ok_anthropic_hh)
+    print(f"After filtering, {len(dataset_train)} training examples and {len(dataset_test)} test examples remain.")
+
+    if args.remove_multiturn_data:
+        dataset_train = dataset_train.filter(lambda x: len(x['rejected']) == 2)
+        dataset_test = dataset_test.filter(lambda x: len(x['rejected']) == 2)
+
+    dataset_train = dataset_train.map(lambda x: {k: merge_consecutive_messages_and_trim(v) for k, v in x.items()})
+    dataset_test = dataset_test.map(lambda x: {k: merge_consecutive_messages_and_trim(v) for k, v in x.items()})
+
+    return dataset_train, dataset_test
+
+
+def target_lora_modules(model) -> List[str]:
+    if model.__class__.__name__ == "Phi3ForCausalLM":
+        return ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
+    elif model.__class__.__name__ == "OLMoForCausalLM":
+        return ["att_proj", "ff_proj", "attn_out", "ff_out"]
+    elif model.__class__.__name__ == "MistralForCausalLM":
+        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    else:
+        raise ValueError(f"Model type {type(model)} not added yet. Model:\n {model}")
+
+
+def load_tokenizer_model(accelerator, args):
+    ######################################## Config and Tokenizer Loading ########################################
+    def try_load_config() -> PretrainedConfig:
+        # Load pretrained model and tokenizer
+        if args.config_name:
+            return AutoConfig.from_pretrained(
+                args.config_name,
+                trust_remote_code=args.trust_remote_code,
+                revision=args.model_revision,
+                force_download=args.ignore_model_cache,
+            )
+        elif args.model_name_or_path:
+            return AutoConfig.from_pretrained(
+                args.model_name_or_path,
+                trust_remote_code=args.trust_remote_code,
+                revision=args.model_revision,
+                force_download=args.ignore_model_cache,
+            )
+        else:
+            raise ValueError(
+                "You are instantiating a new config instance from scratch. This is not supported by this script."
+            )
+
+    try:
+        config = try_load_config()
+    except OSError as e:
+        print(f"Error loading config: {e}")
+        print("Assuming it was a login issue, logging into Huggingface...")
+
+        huggingface_hub.login(token=get_hf_token())
+        config = try_load_config()
+
+    tokenizer_revision = (
+        args.model_revision
+        if args.tokenizer_revision is None
+        else args.tokenizer_revision
+    )
+
+    if tokenizer_revision != args.model_revision:
+        # Warn user if tokenizer and model use different revisions; this is an unusual
+        # use case.
+        warning = f"""Requested tokenizer revision `{tokenizer_revision}` is different
+                   from the model revision `{args.model_revision}`."""
+        logger.warn(warning)
+
+    if args.tokenizer_name:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer_name,
+            trust_remote_code=args.trust_remote_code,
+            use_fast=not args.use_slow_tokenizer,
+            revision=tokenizer_revision,
+            force_download=args.ignore_model_cache,
+        )
+    elif args.model_name_or_path:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_name_or_path,
+            padding=True,
+            trust_remote_code=args.trust_remote_code,
+            use_fast=not args.use_slow_tokenizer,
+            revision=tokenizer_revision,
+            force_download=args.ignore_model_cache,
+        )
+    else:
+        raise ValueError(
+            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
+            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+        )
+
+    ######################################## Model Loading ########################################
+    if args.model_name_or_path:
+        def try_load_model() -> AutoModelForCausalLM:
+            if args.use_qlora:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+                device_index = accelerator.local_process_index
+                device_map = {"": device_index}  # force data-parallel training.
+                return AutoModelForCausalLM.from_pretrained(
+                    args.model_name_or_path,
+                    from_tf=bool(".ckpt" in args.model_name_or_path),
+                    config=config,
+                    load_in_4bit=True,
+                    quantization_config=bnb_config,
+                    device_map=device_map,
+                    trust_remote_code=args.trust_remote_code,
+                    torch_dtype=torch.bfloat16,
+                    use_flash_attention_2=True if args.use_flash_attn else False,
+                    revision=args.model_revision,
+                    force_download=args.ignore_model_cache,
+                )
+            else:
+                return AutoModelForCausalLM.from_pretrained(
+                    args.model_name_or_path,
+                    from_tf=bool(".ckpt" in args.model_name_or_path),
+                    config=config,
+                    trust_remote_code=args.trust_remote_code,
+                    low_cpu_mem_usage=args.low_cpu_mem_usage,  #
+                    torch_dtype=torch.bfloat16,
+                    use_flash_attention_2=True if args.use_flash_attn else False,
+                    revision=args.model_revision,
+                    force_download=args.ignore_model_cache,
+                )
+
+        # Just a hack. Sometimes cache fails, and on the second time the model is loaded properly
+        try:
+            model = try_load_model()
+        except Exception as e:
+            model = try_load_model()
+    else:
+        logger.info("Training new model from scratch")
+        model = AutoModelForCausalLM.from_config(config)
+
+    actual_eos_token = tokenizer.eos_token
+    tokenizer.add_special_tokens({'pad_token': '<pad>', 'eos_token': '<my_eos_token>'})
+
+    generation_config = GenerationConfig(
+        max_new_tokens=args.logging_examples_max_length,
+        renormalize_logits=True,
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        # stop_strings=tokenizer.eos_token,
+    )
+    embeddings = model.get_input_embeddings()
+    # padding will enable tensorcores, hopefully will make it faster
+    # https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#requirements-tc
+    with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
+        if len(tokenizer) > embeddings.weight.shape[0]:
+            model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=128)
+        embedding_size = embeddings.weight.shape[0]
+        # padding to multiples creates a few "shadow" tokens that we don't want to be generated
+        generation_config.suppress_tokens = list(range(len(tokenizer), embedding_size))
+
+    generation_config_nucleus = deepcopy(generation_config)
+    generation_config_nucleus.do_sample = True
+    generation_config_nucleus.top_p = args.logging_examples_top_p
+
+    generation_config_greedy = deepcopy(generation_config)
+    generation_config_greedy.do_sample = False
+
+    return model, tokenizer, actual_eos_token, generation_config_nucleus, generation_config_greedy
+
+
+
 
 
 if __name__ == "__main__":
