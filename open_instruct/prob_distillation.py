@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import deepspeed
 import wandb
-from argparse import Namespace
+from transformers import StoppingCriteria
 from datasets import DatasetDict
 import subprocess
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
@@ -36,7 +36,9 @@ from transformers import (
     BitsAndBytesConfig,
 )
 import sys
-import subprocess
+import json
+import time
+
 
 logger = get_logger(__name__)
 import pandas as pd
@@ -57,6 +59,82 @@ if api_key_file:
         raise ValueError(f"An error occurred while reading the WANDB_API_KEY from file: {e}")
 else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
+
+class KeyWordsCriteria(StoppingCriteria):
+    def __init__(self, stop_id_sequences):
+        assert isinstance(stop_id_sequences[0], list), "stop_id_sequences should be a list of list of ids"
+        self.stop_sequences = stop_id_sequences
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        sequences_should_be_stopped = []
+        for i in range(input_ids.shape[0]):
+            sequence_should_be_stopped = False
+            for stop_sequence in self.stop_sequences:
+                if input_ids[i][-len(stop_sequence):].tolist() == stop_sequence:
+                    sequence_should_be_stopped = True
+                    break
+            sequences_should_be_stopped.append(sequence_should_be_stopped)
+        return all(sequences_should_be_stopped)
+
+@torch.no_grad()
+def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequences=None, add_special_tokens=True,
+                         disable_tqdm=False, **generation_kwargs):
+    """this function is taken from eval folder in order to see and track the changes it is copied to here."""
+    generations = []
+
+    num_return_sequences = generation_kwargs.get("num_return_sequences", 1)
+    for i in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[i:i + batch_size]
+        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt",
+                                      add_special_tokens=add_special_tokens)
+        batch_input_ids = tokenized_prompts.input_ids
+        attention_mask = tokenized_prompts.attention_mask
+
+        if model.device.type == "cuda":
+            batch_input_ids = batch_input_ids.cuda()
+            attention_mask = attention_mask.cuda()
+
+        batch_outputs = model.generate(
+            input_ids=batch_input_ids,
+            attention_mask=attention_mask,
+            eos_token_id=tokenizer.eos_token_id,
+            stopping_criteria=[KeyWordsCriteria(stop_id_sequences)] if stop_id_sequences else None,
+            **generation_kwargs
+        )
+
+        # the stopping criteria is applied at batch level, so if other examples are not stopped, the entire batch will continue to generate.
+        # so some outputs still have the stop sequence, which we need to remove.
+        if stop_id_sequences:
+            for output_idx in range(batch_outputs.shape[0]):
+                for token_idx in range(batch_input_ids.shape[1], batch_outputs.shape[1]):
+                    if any(batch_outputs[output_idx,
+                           token_idx: token_idx + len(stop_sequence)].tolist() == stop_sequence for stop_sequence in
+                           stop_id_sequences):
+                        batch_outputs[output_idx, token_idx:] = tokenizer.pad_token_id
+                        break
+
+        # remove the prompt from the output
+        # we need to re-encode the prompt because we need to make sure the special tokens are treated the same way as in the outputs.
+        # we changed our previous way of truncating the output token ids dicrectly because some tokenizer (e.g., llama) won't add space token before the first token.
+        # space is important for some tasks (e.g., code completion).
+        batch_outputs = tokenizer.batch_decode(batch_outputs, skip_special_tokens=True)
+        batch_prompts = tokenizer.batch_decode(batch_input_ids, skip_special_tokens=True)
+        # duplicate the prompts to match the number of return sequences
+        batch_prompts = [prompt for prompt in batch_prompts for _ in range(num_return_sequences)]
+        batch_generations = [
+            output[len(prompt):] for prompt, output in zip(batch_prompts, batch_outputs)
+        ]
+        generations += batch_generations
+
+        # for prompt, generation in zip(batch_prompts, batch_generations):
+        #     print("========")
+        #     print(prompt)
+        #     print("--------")
+        #     print(generation)
+
+    assert len(generations) == len(
+        prompts) * num_return_sequences, "number of generations should be equal to number of prompts * num_return_sequences"
+    return generations
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -308,6 +386,35 @@ def parse_args():
             assert extension in ["json", "jsonl"], "`train_file` should be a json/jsonl file."
     return args
 
+def save_with_accelerate(accelerator, model, output_dir, args):
+    unwrapped_model = accelerator.unwrap_model(model)
+    # When doing multi-gpu training, we need to use accelerator.get_state_dict(model) to get the state_dict.
+    # Otherwise, sometimes the model will be saved with only part of the parameters.
+    # Also, accelerator needs to use the wrapped model to get the state_dict.
+    state_dict = accelerator.get_state_dict(model)
+    if args.use_lora:
+        # When using lora, the unwrapped model is a PeftModel, which doesn't support the is_main_process
+        # and has its own save_pretrained function for only saving lora modules.
+        # We have to manually specify the is_main_process outside the save_pretrained function.
+        if accelerator.is_main_process:
+            unwrapped_model.save_pretrained(output_dir, state_dict=state_dict)
+    else:
+        # don't use safetensors for saving for now
+        unwrapped_model.save_pretrained(
+            output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save,
+            state_dict=state_dict,
+            safe_serialization=False
+        )
+
+    # Save the optimizer and scheduler states
+    if accelerator.is_main_process:
+        accelerator.save_state(output_dir)
+
+    # save training arguments or any other configs as a JSON
+    args_file = os.path.join(output_dir, "training_args.json")
+    with open(args_file, "w") as f:
+        json.dump(vars(args), f)
+
 
 def organize_messages(msgs):
     """Organize messages by splitting and grouping based on roles - Assistant vs Human."""
@@ -443,13 +550,38 @@ def create_input_format(messages, tokenizer, add_bos=False):
     return student_message_text, teacher_message_text
 
 
+def create_input_format_student(messages, tokenizer, add_bos=False):
+    student_message_text=""
+    if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+        for message in messages:
+            if message["role"] == "human":
+                student_message_text += "<|user|>\n " + message[
+                    "content"].strip() +'<|end|>' + "\n"
+
+    else:
+        for message in messages:
+            if message["role"] == "human":
+                student_message_text += "<|user|>\n " + message[
+                    "content"].strip() + "\n"
+    student_message_text += "<|assistant|>\n"
+
+    # Optionally add BOS token at the beginning
+    if add_bos:
+        tokenizer.bos_token= tokenizer.eos_token #just for olmo
+        student_message_text = tokenizer.bos_token + student_message_text
+    return student_message_text
+
+
 def apply_formatting_and_encoding(example, tokenizer, max_seq_length, add_bos=True):
     # First format the text for student and teacher
-    student_text, teacher_text = create_input_format(example['info'], tokenizer, add_bos=add_bos)
+    student_text, teacher_text = create_input_format(example["info"], tokenizer, add_bos=add_bos)
+
     # Now encode these formatted texts
     return encode_for_student_and_teacher(student_text, teacher_text, tokenizer, max_seq_length,
                                           add_bos=add_bos)
 
+
+#TODO: Change rejected with the sft models' responses
 def main():
     args = parse_args()
 
@@ -473,9 +605,20 @@ def main():
         # if you get timeouts (e.g. due to long tokenization) increase this.
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=args.timeout))
 
-    teacher_model_1 = AutoModelForCausalLM.from_pretrained(
+    ################
+    # Model & Tokenizer
+    ################
+
+    teacher_model = AutoModelForCausalLM.from_pretrained(
         args.teacher_model_name_or_path, trust_remote_code=args.trust_remote_code
     )
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.teacher_model_name_or_path, trust_remote_code=args.trust_remote_code
+    )
+    model = AutoModelForCausalLM.from_pretrained(  # to be used as student model
+        args.model_name_or_path, trust_remote_code=args.trust_remote_code
+    )
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         **accelerator_log_kwargs,
@@ -503,24 +646,6 @@ def main():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-    ################
-    # Model & Tokenizer
-    ################
-
-    teacher_model = AutoModelForCausalLM.from_pretrained(
-        args.teacher_model_name_or_path, trust_remote_code=args.trust_remote_code
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.teacher_model_name_or_path, trust_remote_code=args.trust_remote_code
-    )
-    model = AutoModelForCausalLM.from_pretrained(  #to be used as student model
-        args.model_name_or_path, trust_remote_code=args.trust_remote_code
-    )
-
-    print("teacher model wte:",teacher_model.model.transformer.wte)
-    print("teacher_model:", teacher_model.model.transformer.wte.weight.shape)
-    print("teacher model_1 wte:",teacher_model.model.transformer.wte)
-    print("teacher_model_1:",teacher_model_1.model.transformer.wte.weight.shape)
 
     # ds_engine = deepspeed.init_inference(  #to be used as student model
 
@@ -549,7 +674,7 @@ def main():
     #for train
     # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line) -> for now
     updated_dataset_train = raw_datasets['train'].map(add_filtered_msgs)
-    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0)#.select(range(10)) # delete this
+    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0).select(range(1000)) # delete this
 
     #for test
     updated_dataset_test = raw_datasets['test'].map(add_filtered_msgs)
@@ -566,6 +691,24 @@ def main():
     # add info column which will store human, assistant_rejected and assistant_chosen messages
     filtered_dataset["train"] = filtered_dataset["train"].map(extract_role_messages)
     filtered_dataset["test"] = filtered_dataset["test"].map(extract_role_messages)
+
+    # getting the responses from the base model as rejected
+    # Apply the create_input_format_student function to each example in the training set
+    # Directly process each 'info' entry in the dataset and collect the results in a list
+    student_msgs_list = [
+        create_input_format_student(info, tokenizer, add_bos=args.add_bos)
+        for info in filtered_dataset['train']['info']
+    ]
+    generated_responses = generate_completions(
+        model, tokenizer, student_msgs_list, batch_size=1, max_new_tokens=50,
+        stop_id_sequences=None,
+        do_sample=False
+    )
+    # replace the rejected responses of anthropic with base models responses
+    for idx, info in enumerate(filtered_dataset["train"]["info"]):
+        for message in info:
+            if message['role'] == 'assistant_rejected':
+                message['content'] = generated_responses[idx]
 
     # Preprocessing the datasets.
 
@@ -661,7 +804,9 @@ def main():
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
+    print("train dataloader:", len(train_dataloader))
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    print(num_update_steps_per_epoch)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -700,8 +845,11 @@ def main():
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
+    teacher_model_1.to(accelerator.device)
+    total_start_time = time.time()  # Start time for the entire training process
 
     for epoch in range(starting_epoch, args.num_train_epochs):
+
         """
         Algorithm: Generalized Knowledge Distillation (GKD)
         1: Given: Teacher model pT, Student Model pθS, Dataset (X, Y) containing (input, output) pairs
@@ -718,6 +866,9 @@ def main():
         """
         model.train()
         total_loss = 0
+        epoch_data_count = 0  # To keep track of the number of data points in each epoch
+        epoch_start_time = time.time()  # Start time for the current epoch
+
         for step, batch in enumerate(train_dataloader):
             # the main ones belong to the student model
             student_inputs = {
@@ -729,63 +880,111 @@ def main():
                 'attention_mask': batch['teacher_attention_mask']
             }
             u = random.uniform(0, 1)
+            batch_size = len(batch['input_ids'])  # Assuming 'input_ids' is the key for input data
+            epoch_data_count += batch_size
+            # Accumulate gradients over the batch
+            with accelerator.accumulate(model):
+                if u <= args.lambda_value:
+                    student_outputs = model(**student_inputs, use_cache=False)
+                    student_logits = student_outputs.logits
 
-            if u <= args.lambda_value:
-                student_outputs = model(**student_inputs, use_cache=False)
-                student_logits = student_outputs.logits
+                    with torch.no_grad():
+                        # when we use teacher_model_1 it works. But when teacher_model used we cannot find the weights
+                        '''
+                        Traceback (most recent call last):
+                          File "open-instruct/open_instruct/prob_distillation.py", line 728, in main
+                            teacher_outputs = teacher_model(**student_inputs, use_cache=False)
+                          File "/usr/local/lib/python3.8/dist-packages/torch/nn/modules/module.py", line 1501, in _call_impl
+                            return forward_call(*args, **kwargs)
+                          File "/usr/local/lib/python3.8/dist-packages/hf_olmo/modeling_olmo.py", line 70, in forward
+                            outputs = self.model.forward(
+                          File "/usr/local/lib/python3.8/dist-packages/olmo/model.py", line 1220, in forward
+                            x = self.transformer.wte(input_ids) if input_embeddings is None else input_embeddings  # type: ignore
+                          File "/usr/local/lib/python3.8/dist-packages/torch/nn/modules/module.py", line 1501, in _call_impl
+                            return forward_call(*args, **kwargs)
+                          File "/usr/local/lib/python3.8/dist-packages/torch/nn/modules/sparse.py", line 162, in forward
+                            return F.embedding(    ### YOU CAN PUT A DEBUG POINT HERE, self.weight is empty, it was not like that in student model
+                          File "/usr/local/lib/python3.8/dist-packages/torch/nn/functional.py", line 2210, in embedding
+                            return torch.embedding(weight, input, padding_idx, scale_grad_by_freq, sparse)
+                        RuntimeError: 'weight' must be 2-D
+                        '''
 
-                with torch.no_grad():
-                    #when we use teacher_model_1 it works. But when teacher_model used we cannot find the weights
-                    '''
-                    Traceback (most recent call last):
-                      File "open-instruct/open_instruct/prob_distillation.py", line 728, in main
-                        teacher_outputs = teacher_model(**student_inputs, use_cache=False)
-                      File "/usr/local/lib/python3.8/dist-packages/torch/nn/modules/module.py", line 1501, in _call_impl
-                        return forward_call(*args, **kwargs)
-                      File "/usr/local/lib/python3.8/dist-packages/hf_olmo/modeling_olmo.py", line 70, in forward
-                        outputs = self.model.forward(
-                      File "/usr/local/lib/python3.8/dist-packages/olmo/model.py", line 1220, in forward
-                        x = self.transformer.wte(input_ids) if input_embeddings is None else input_embeddings  # type: ignore
-                      File "/usr/local/lib/python3.8/dist-packages/torch/nn/modules/module.py", line 1501, in _call_impl
-                        return forward_call(*args, **kwargs)
-                      File "/usr/local/lib/python3.8/dist-packages/torch/nn/modules/sparse.py", line 162, in forward
-                        return F.embedding(    ### YOU CAN PUT A DEBUG POINT HERE, self.weight is empty, it was not like that in student model
-                      File "/usr/local/lib/python3.8/dist-packages/torch/nn/functional.py", line 2210, in embedding
-                        return torch.embedding(weight, input, padding_idx, scale_grad_by_freq, sparse)
-                    RuntimeError: 'weight' must be 2-D
-                    '''
-                    teacher_outputs = teacher_model(**student_inputs, use_cache=False)
-                    teacher_logits = teacher_outputs.logits
-                teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
+                        # Using teacher_model_1 since teacher_model is causing issues with weights
+                        teacher_outputs = teacher_model_1(**student_inputs, use_cache=False)
+                        teacher_logits = teacher_outputs.logits
+                    teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
 
-                # Compute the softmax of student logits for loss calculation
-                student_probs = torch.nn.functional.softmax(student_logits, dim=-1)
-                loss = torch.nn.functional.kl_div(student_probs.log(), teacher_probs, reduction='batchmean')
-            else:
-                with torch.no_grad():
-                    teacher_outputs = teacher_model(**teacher_inputs, use_cache=False)
-                    teacher_logits = teacher_outputs.logits
-                teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
+                    # Compute the softmax of student logits for loss calculation
+                    student_probs = torch.nn.functional.softmax(student_logits, dim=-1)
+                    loss = torch.nn.functional.kl_div(student_probs.log(), teacher_probs, reduction='batchmean')
 
-                # change it with labels - from the dataset - TODO
-                loss = torch.nn.functional.kl_div(teacher_probs.log(), teacher_probs, reduction='batchmean')
+                else:
+                    with torch.no_grad():
+                        teacher_outputs = teacher_model(**teacher_inputs, use_cache=False)
+                        teacher_logits = teacher_outputs.logits
+                    teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
 
-            total_loss += loss.item()
+                    # Change it with labels - from the dataset - TODO
+                    loss = torch.nn.functional.kl_div(teacher_probs.log(), teacher_probs, reduction='batchmean')
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
+                # We keep track of the loss at each logged step
+                total_loss += loss.detach().float()
+
+                # Backpropagation
+                accelerator.backward(loss)
+
+                # Clip gradient norm if needed
+                if accelerator.sync_gradients and args.clip_grad_norm > 0:
+                    accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+
+                # Optimizer step
+                optimizer.step()
+                optimizer.zero_grad()
+
+                # Scheduler step
+                lr_scheduler.step()
 
             # Update progress bar and completed steps
             progress_bar.update(1)
             completed_steps += 1
+            if args.logging_steps and completed_steps % args.logging_steps == 0:
+                step_duration = time.time() - epoch_start_time  # Time taken to process this batch
+                total_elapsed_time = time.time() - total_start_time  # Total time elapsed since training started
 
-            # Early stopping condition if needed
+                avg_loss = total_loss / args.gradient_accumulation_steps / args.logging_steps
+
+                # print(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
+                # Print number of examples processed so far in this epoch
+                print(
+                    f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}, progress: {100 * completed_steps / args.max_train_steps}")
+                #print(f"step_duration: {step_duration},total_elapsed_time: {total_elapsed_time / 3600}")
+                if args.with_tracking:
+                    wandb.log(
+                        {
+                            "learning_rate": lr_scheduler.get_last_lr()[0],
+                            "train_loss": avg_loss,
+                        },
+                        step=completed_steps,
+                    )
+
+                total_loss = 0
+
             if completed_steps >= args.max_train_steps:
                 break
 
-        print(f"Epoch {epoch}: Total Loss = {total_loss}")
+        print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
+
+        if args.checkpointing_steps == "epoch":
+            output_dir = f"epoch_{epoch}"
+
+            if args.output_dir is not None:
+                output_dir = os.path.join(args.output_dir, output_dir)
+                tokenizer.save_pretrained(output_dir)
+            save_with_accelerate(accelerator, model, output_dir, args)
+
+    if args.output_dir is not None:
+        tokenizer.save_pretrained(args.output_dir)
+        save_with_accelerate(accelerator, model, output_dir, args)
 
 
 if __name__ == "__main__":
