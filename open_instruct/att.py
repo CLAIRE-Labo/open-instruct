@@ -1,5 +1,5 @@
 from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
-from utils import pretty_print_chatml
+from load_utils import pretty_print_chatml
 
 import torch
 

@@ -35,25 +35,16 @@ import huggingface_hub
 
 import transformers
 from transformers import (
-    AutoConfig,
-    PretrainedConfig,
     GenerationConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    LlamaTokenizer,
-    LlamaTokenizerFast,
     DataCollatorForSeq2Seq,
     get_scheduler,
-    GPTNeoXTokenizerFast,
-    GPT2Tokenizer,
-    OPTForCausalLM,
-    BitsAndBytesConfig,
 )
 
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-from utils import add_common_training_args, pretty_print_chatml, preprocess_hh_common, load_tokenizer_model
+from load_utils import add_common_training_args, pretty_print_chatml, preprocess_hh_common, load_tokenizer_model, save_args, \
+    load_args
 from att import apply_att_template
 
 from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
@@ -87,7 +78,7 @@ else:
 
 
 def get_run_id(args: Namespace) -> str:
-    timestamp = time.strftime("%Y%m%d_%H%M%S") if not os.getenv('RUN_TIMESTAMP') else os.getenv('RUN_TIMESTAMP')
+    timestamp = time.strftime("%Y%m%d_%H%M%S_%3N") if not os.getenv('RUN_TIMESTAMP') else os.getenv('RUN_TIMESTAMP')
     # try to get the git commit hash
     # try:
     #     git_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('utf-8').strip()
@@ -229,6 +220,10 @@ def main():
         checkpointing_dir_exists = checkpointing_dir.exists()
         if not checkpointing_dir_exists:
             checkpointing_dir.mkdir(parents=True)
+        args_file = checkpointing_dir / "args.json"
+        if args_file.exists():
+            args_file = checkpointing_dir / f"args_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        save_args(args, args_file)
     else:
         checkpointing_dir_exists = None
 

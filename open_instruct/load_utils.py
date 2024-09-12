@@ -1,6 +1,7 @@
 import os
 from typing import List, Dict
 import re
+import json
 import argparse
 import logging
 from copy import deepcopy
@@ -306,6 +307,17 @@ def add_common_training_args(parser: argparse.ArgumentParser):
     )
 
 
+def save_args(args: argparse.Namespace, filename: str):
+    with open(filename, 'w') as f:
+        json.dump(vars(args), f, indent=4)
+
+
+def load_args(filename: str) -> argparse.Namespace:
+    with open(filename, 'r') as f:
+        args_dict = json.load(f)
+    return argparse.Namespace(**args_dict)
+
+
 def parse_messages_anthropic_hh(messages_raw: str) -> List[Dict[str, str]]:
     roles_mapping = {
         "Human:": "user",
@@ -583,14 +595,12 @@ def load_tokenizer_model(accelerator, args):
     generation_config_nucleus = deepcopy(generation_config)
     generation_config_nucleus.do_sample = True
     generation_config_nucleus.top_p = args.logging_examples_top_p
+    generation_config_nucleus.temperature = args.logging_examples_temp
 
     generation_config_greedy = deepcopy(generation_config)
     generation_config_greedy.do_sample = False
 
     return model, tokenizer, actual_eos_token, generation_config_nucleus, generation_config_greedy
-
-
-
 
 
 if __name__ == "__main__":
