@@ -39,9 +39,9 @@ import sys
 import json
 import time
 
-
 logger = get_logger(__name__)
 import pandas as pd
+
 try:
     from hf_olmo import OLMoTokenizerFast
 except ImportError:
@@ -60,6 +60,7 @@ if api_key_file:
 else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
+
 class KeyWordsCriteria(StoppingCriteria):
     def __init__(self, stop_id_sequences):
         assert isinstance(stop_id_sequences[0], list), "stop_id_sequences should be a list of list of ids"
@@ -76,23 +77,29 @@ class KeyWordsCriteria(StoppingCriteria):
             sequences_should_be_stopped.append(sequence_should_be_stopped)
         return all(sequences_should_be_stopped)
 
+
 @torch.no_grad()
 def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequences=None, add_special_tokens=True,
-                         disable_tqdm=False, **generation_kwargs):
-    """this function is taken from eval folder in order to see and track the changes it is copied to here."""
-    generations = []
+                         disable_tqdm=False, generation_storage=None, **generation_kwargs):
+    """Generate text completions with optimizations for GPU usage and batched JSON writing."""
+    # Ensure the model is on the correct device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    generations = []
     num_return_sequences = generation_kwargs.get("num_return_sequences", 1)
-    for i in range(0, len(prompts), batch_size):
+    all_json_entries = []
+
+    # Using tqdm for progress tracking
+    progress_bar = tqdm(range(0, len(prompts), batch_size), disable=disable_tqdm, desc="Generating batches")
+
+    for i in progress_bar:
         batch_prompts = prompts[i:i + batch_size]
+
+        # Tokenize and move to GPU
         tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt",
                                       add_special_tokens=add_special_tokens)
-        batch_input_ids = tokenized_prompts.input_ids
-        attention_mask = tokenized_prompts.attention_mask
-
-        if model.device.type == "cuda":
-            batch_input_ids = batch_input_ids.cuda()
-            attention_mask = attention_mask.cuda()
+        batch_input_ids = tokenized_prompts.input_ids.to(device)
+        attention_mask = tokenized_prompts.attention_mask.to(device)
 
         batch_outputs = model.generate(
             input_ids=batch_input_ids,
@@ -102,8 +109,6 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
             **generation_kwargs
         )
 
-        # the stopping criteria is applied at batch level, so if other examples are not stopped, the entire batch will continue to generate.
-        # so some outputs still have the stop sequence, which we need to remove.
         if stop_id_sequences:
             for output_idx in range(batch_outputs.shape[0]):
                 for token_idx in range(batch_input_ids.shape[1], batch_outputs.shape[1]):
@@ -113,28 +118,43 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
                         batch_outputs[output_idx, token_idx:] = tokenizer.pad_token_id
                         break
 
-        # remove the prompt from the output
-        # we need to re-encode the prompt because we need to make sure the special tokens are treated the same way as in the outputs.
-        # we changed our previous way of truncating the output token ids dicrectly because some tokenizer (e.g., llama) won't add space token before the first token.
-        # space is important for some tasks (e.g., code completion).
         batch_outputs = tokenizer.batch_decode(batch_outputs, skip_special_tokens=True)
         batch_prompts = tokenizer.batch_decode(batch_input_ids, skip_special_tokens=True)
-        # duplicate the prompts to match the number of return sequences
         batch_prompts = [prompt for prompt in batch_prompts for _ in range(num_return_sequences)]
         batch_generations = [
             output[len(prompt):] for prompt, output in zip(batch_prompts, batch_outputs)
         ]
         generations += batch_generations
 
-        # for prompt, generation in zip(batch_prompts, batch_generations):
-        #     print("========")
-        #     print(prompt)
-        #     print("--------")
-        #     print(generation)
+        # Store results for JSON writing
+        json_entry = {
+            "batch_index": i // batch_size,
+            "batch_prompts": batch_prompts,
+            "batch_generations": batch_generations
+        }
+        all_json_entries.append(json_entry)
+
+        # Write to JSON every 100 batches
+        if len(all_json_entries) >= 100:
+            with open(generation_storage, 'a') as f:
+                for entry in all_json_entries:
+                    f.write(json.dumps(entry) + "\n")
+            all_json_entries.clear()  # Clear the list after writing
+
+        # Log progress to W&B
+        wandb.log({"progress": i + batch_size})
+
+    # Write any remaining entries in all_json_entries to the file
+    if all_json_entries:
+        with open(generation_storage, 'a') as f:
+            for entry in all_json_entries:
+                f.write(json.dumps(entry) + "\n")
 
     assert len(generations) == len(
         prompts) * num_return_sequences, "number of generations should be equal to number of prompts * num_return_sequences"
+
     return generations
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -158,6 +178,10 @@ def parse_args():
     )
     parser.add_argument(
         "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
+    )
+
+    parser.add_argument(
+        "--generation_storage", type=str, default="data_new.json", help="A json file will store the generated data."
     )
     parser.add_argument(
         "--teacher_model_name_or_path",
@@ -375,6 +399,12 @@ def parse_args():
         choices=['mean', 'sum'],
         help='How to reduce loss over tokens. Default is mean, but using sum can improve chat model performance.',
     )
+    parser.add_argument(
+        "--generated_data_path",
+        type=str,
+        help="collected/generated data from the base sft model for its use in teacher model",
+        required=False,
+    )
     args = parser.parse_args()
 
     # Sanity checks
@@ -385,6 +415,7 @@ def parse_args():
             extension = args.train_file.split(".")[-1]
             assert extension in ["json", "jsonl"], "`train_file` should be a json/jsonl file."
     return args
+
 
 def save_with_accelerate(accelerator, model, output_dir, args):
     unwrapped_model = accelerator.unwrap_model(model)
@@ -434,7 +465,6 @@ def organize_messages(msgs):
     return organized_msgs
 
 
-
 def add_filtered_msgs(example):
     """
     Add a filtered version of 'rejected' and 'chosen' messages based on the number of organized messages.
@@ -448,12 +478,12 @@ def add_filtered_msgs(example):
     organized_chosen_msgs = organize_messages(stripped_chosen_msgs)
 
     # Here we check the total number of messages in organized_msgs
-    if len(organized_rejected_msgs) <= 2 and len(organized_chosen_msgs)<=2:
+    if len(organized_rejected_msgs) <= 2 and len(organized_chosen_msgs) <= 2:
         example['rejected_filtered'] = organized_rejected_msgs
         example['chosen_filtered'] = organized_chosen_msgs
     else:
         example['rejected_filtered'] = []
-        example['chosen_filtered']=[]
+        example['chosen_filtered'] = []
 
     return example
 
@@ -469,10 +499,9 @@ def extract_role_messages(example):
     assistant_rejected_msg = next(
         (msg[len("Assistant: "):] for msg in example['rejected_filtered'] if msg.startswith("Assistant: ")), " ")
 
-
     # Extracting the Assistant's chosen answer
     assistant_chosen_msg = next(
-        (msg[len("Assistant: "):] for msg in example['chosen_filtered'] if msg.startswith("Assistant: ")),  " ")
+        (msg[len("Assistant: "):] for msg in example['chosen_filtered'] if msg.startswith("Assistant: ")), " ")
 
     """
     There are some cases like:
@@ -481,7 +510,7 @@ def extract_role_messages(example):
     """
 
     example['info'] = [
-        {"role": "human", "content": human_msg if human_msg else " " },
+        {"role": "human", "content": human_msg if human_msg else " "},
         {"role": "assistant_rejected",
          "content": assistant_rejected_msg if assistant_rejected_msg else " "},
         {"role": "assistant_chosen",
@@ -491,72 +520,122 @@ def extract_role_messages(example):
     return example
 
 
-def encode_for_student_and_teacher(student_text, teacher_text, tokenizer, max_seq_length, add_bos=False):
+def encode_with_rejected_chosen(example, tokenizer, max_seq_length, model_type, add_bos=False):
     '''
-    Tokenizes inputs separately for student and teacher models.
-    - Student model gets only the prompts.
-    - Teacher model gets both prompts and rejected answers.
+    Assume each example has a 'messages' field where each message is a dict with 'role' and 'content'.
+    Concatenate all messages with the roles as delimiters and tokenize them together.
     '''
+    messages = example['info']
+    if len(messages) == 0:
+        raise ValueError('messages field is empty.')
 
-    # Tokenize texts for student and teacher
-    student_encoded = tokenizer(student_text, return_tensors='pt', max_length=max_seq_length, truncation=True, padding="max_length")
-    teacher_encoded = tokenizer(teacher_text, return_tensors='pt', max_length=max_seq_length, truncation=True, padding="max_length")
 
-    # Prepare output dictionary
-    output = {
-        'input_ids': student_encoded.input_ids.flatten(),
-        'teacher_input_ids': teacher_encoded.input_ids.flatten(),
-        'attention_mask': student_encoded.attention_mask.flatten(),
-        'teacher_attention_mask': teacher_encoded.attention_mask.flatten()
+    def _concat_messages(messages, model_type):
+        message_text = ""
+        system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
+        if model_type == "teacher":
+            if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+                message_text += "<|system|>\n" + system_message + '<|end|>' + "\n"
+                for message in messages:
+                    if message["role"] == "human":
+                        message_text += "<|user|>\n Prompt: " + message[
+                            "content"].strip() + '<|end|>' + "\n"  # between prompt and assistant rejected \n\n double space
+                    elif message["role"] == "assistant_rejected":
+                        message_text += "\n Current rejected answer: " + message[
+                            "content"].strip() + "\n Corrected output: \n" + '<|end|>' + "\n"
+                    elif message["role"] == "assistant_chosen":
+                        message_text += "<|assistant|>\n" + message["content"].strip() + "<|end|>" + "\n"
+            else:
+                message_text += "<|system|>\n" + system_message + "\n"
+                for message in messages:
+                    if message["role"] == "human":
+                        message_text += "<|user|>\n Prompt: " + message[
+                            "content"].strip() + "\n"  # between prompt and assistant rejected \n\n double space
+                    elif message["role"] == "assistant_rejected":
+                        message_text += "\n Current rejected answer: " + message[
+                            "content"].strip() + "\n Corrected output: \n"
+                    elif message["role"] == "assistant_chosen":
+                        message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
+        elif model_type == "student":
+            if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+                for message in messages:
+                    if message["role"] == "human":
+                        message_text += "<|user|>\n " + message[
+                            "content"].strip() + '<|end|>' + "\n"
+                    elif message["role"] == "assistant_chosen":
+                        message_text += "<|assistant|>\n" + message["content"].strip() + "<|end|>" + "\n"
+
+            else:
+                for message in messages:
+                    if message["role"] == "human":
+                        message_text += "<|user|>\n " + message[
+                            "content"].strip() + "\n"
+                    elif message["role"] == "assistant_chosen":
+                        message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
+        else:
+            raise ValueError("Invalid model type; must be student or teacher")
+
+        return message_text
+
+
+    example_text = _concat_messages(messages, model_type).strip()
+    if add_bos:
+        example_text = tokenizer.bos_token + example_text
+
+    tokenized_example = tokenizer(example_text, return_tensors='pt', max_length=max_seq_length, truncation=True, padding="max_length")
+    input_ids = tokenized_example.input_ids
+    labels = input_ids.clone()
+
+    # Mask the non-assistant part to avoid calculating loss on it
+    for message_idx, message in enumerate(messages):
+        if message["role"] != "assistant_chosen":
+            if message_idx == 0:
+                message_start_idx = 0
+            else:
+                message_start_idx = tokenizer(
+                    _concat_messages(messages[:message_idx], model_type), return_tensors='pt', max_length=max_seq_length,
+                    truncation=True,
+                    padding="max_length"
+                ).input_ids.shape[1]
+            message_end_idx = tokenizer(
+                _concat_messages(messages[:message_idx + 1], model_type),
+                return_tensors='pt',
+                max_length=max_seq_length,
+                truncation=True,
+                padding="max_length"
+            ).input_ids.shape[1]
+            labels[:, message_start_idx:message_end_idx] = -100
+
+            if message_end_idx >= max_seq_length:
+                break
+
+    attention_mask = torch.ones_like(input_ids)
+    return {
+        'input_ids': input_ids.flatten(),
+        'labels': labels.flatten(),
+        'attention_mask': attention_mask.flatten()
     }
 
-    return output
+def apply_formatting_and_encoding(example, tokenizer, max_seq_length, add_bos=False):
+    teacher_encoded = encode_with_rejected_chosen(example, tokenizer, max_seq_length, "teacher", add_bos)
+    student_encoded = encode_with_rejected_chosen(example, tokenizer, max_seq_length, "student", add_bos)
 
-
-def create_input_format(messages, tokenizer, add_bos=False):
-    teacher_message_text=""
-    student_message_text=""
-    system_message = "For the following prompt and output, your task is to provide an improved response for the given prompt compared to the given rejected answer."
-    if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
-        teacher_message_text += "<|system|>\n" + system_message + '<|end|>' + "\n"
-        for message in messages:
-            if message["role"] == "human":
-                teacher_message_text += "<|user|>\n Prompt: " + message[
-                    "content"].strip() +'<|end|>' + "\n" # between prompt and assistant rejected \n\n double space
-                student_message_text += "<|user|>\n " + message[
-                    "content"].strip() +'<|end|>' + "\n"
-            elif message["role"] == "assistant_rejected":
-                teacher_message_text += "\n Current rejected answer: " + message[
-                    "content"].strip() + "\n Corrected output: \n" + '<|end|>' + "\n"
-
-    else:
-        teacher_message_text += "<|system|>\n" + system_message + "\n"
-        for message in messages:
-            if message["role"] == "human":
-                teacher_message_text += "<|user|>\n Prompt: " + message[
-                    "content"].strip() + "\n" # between prompt and assistant rejected \n\n double space
-                student_message_text += "<|user|>\n " + message[
-                    "content"].strip() + "\n"
-            elif message["role"] == "assistant_rejected":
-                teacher_message_text += "\n Current rejected answer: " + message["content"].strip() + "\n Corrected output: \n"
-    student_message_text += "<|assistant|>\n"
-    teacher_message_text += "<|assistant|>\n"
-
-    # Optionally add BOS token at the beginning
-    if add_bos:
-        tokenizer.bos_token= tokenizer.eos_token #just for olmo
-        student_message_text = tokenizer.bos_token + student_message_text
-        teacher_message_text = tokenizer.bos_token + teacher_message_text
-    return student_message_text, teacher_message_text
+    return {
+        'input_ids': student_encoded['input_ids'],
+        'teacher_input_ids': teacher_encoded['input_ids'],
+        'attention_mask': student_encoded['attention_mask'],
+        'teacher_attention_mask': teacher_encoded['attention_mask'],
+        'labels': teacher_encoded['labels'],
+    }
 
 
 def create_input_format_student(messages, tokenizer, add_bos=False):
-    student_message_text=""
+    student_message_text = ""
     if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
         for message in messages:
             if message["role"] == "human":
                 student_message_text += "<|user|>\n " + message[
-                    "content"].strip() +'<|end|>' + "\n"
+                    "content"].strip() + '<|end|>' + "\n"
 
     else:
         for message in messages:
@@ -567,28 +646,17 @@ def create_input_format_student(messages, tokenizer, add_bos=False):
 
     # Optionally add BOS token at the beginning
     if add_bos:
-        tokenizer.bos_token= tokenizer.eos_token #just for olmo
+        tokenizer.bos_token = tokenizer.eos_token  # just for olmo
         student_message_text = tokenizer.bos_token + student_message_text
     return student_message_text
 
 
-def apply_formatting_and_encoding(example, tokenizer, max_seq_length, add_bos=True):
-    # First format the text for student and teacher
-    student_text, teacher_text = create_input_format(example["info"], tokenizer, add_bos=add_bos)
-
-    # Now encode these formatted texts
-    return encode_for_student_and_teacher(student_text, teacher_text, tokenizer, max_seq_length,
-                                          add_bos=add_bos)
-
-
-#TODO: Change rejected with the sft models' responses
 def main():
     args = parse_args()
 
     accelerator_log_kwargs = {}
-    args.with_tracking=False
-
-    args.lambda_value=1
+    args.with_tracking = True
+    args.lambda_value = 1
 
     if args.with_tracking:
         if "wandb" in args.report_to.split(",") or args.report_to == "all":
@@ -609,15 +677,85 @@ def main():
     # Model & Tokenizer
     ################
 
-    teacher_model = AutoModelForCausalLM.from_pretrained(
-        args.teacher_model_name_or_path, trust_remote_code=args.trust_remote_code
+    # Load pretrained model and tokenizer
+    if args.config_name:
+        config = AutoConfig.from_pretrained(
+            args.config_name,
+            trust_remote_code=args.trust_remote_code,
+            revision=args.model_revision,
+        )
+    elif args.model_name_or_path:
+        config = AutoConfig.from_pretrained(
+            args.model_name_or_path,
+            trust_remote_code=args.trust_remote_code,
+            revision=args.model_revision,
+        )
+    else:
+        raise ValueError(
+            "You are instantiating a new config instance from scratch. This is not supported by this script."
+        )
+
+    tokenizer_revision = (
+        args.model_revision
+        if args.tokenizer_revision is None
+        else args.tokenizer_revision
     )
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.teacher_model_name_or_path, trust_remote_code=args.trust_remote_code
-    )
-    model = AutoModelForCausalLM.from_pretrained(  # to be used as student model
-        args.model_name_or_path, trust_remote_code=args.trust_remote_code
-    )
+
+    if tokenizer_revision != args.model_revision:
+        # Warn user if tokenizer and model use different revisions; this is an unusual
+        # use case.
+        warning = f"""Requested tokenizer revision `{tokenizer_revision}` is different
+                       from the model revision `{args.model_revision}`."""
+        logger.warn(warning)
+
+    if args.tokenizer_name:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer_name,
+            trust_remote_code=args.trust_remote_code,
+            use_fast=not args.use_slow_tokenizer,
+            revision=tokenizer_revision
+        )
+    elif args.model_name_or_path:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_name_or_path,
+            padding=True,
+            trust_remote_code=args.trust_remote_code,
+            use_fast=not args.use_slow_tokenizer,
+            revision=tokenizer_revision
+        )
+    else:
+        raise ValueError(
+            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
+            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+        )
+
+    if args.model_name_or_path:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            trust_remote_code=args.trust_remote_code,
+            low_cpu_mem_usage=args.low_cpu_mem_usage,
+            use_flash_attention_2=True if args.use_flash_attn else False,
+            revision=args.model_revision
+        )
+
+        teacher_model = AutoModelForCausalLM.from_pretrained(
+            args.teacher_model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            trust_remote_code=args.trust_remote_code,
+            low_cpu_mem_usage=args.low_cpu_mem_usage,
+            use_flash_attention_2=True if args.use_flash_attn else False,
+            revision=args.model_revision)
+
+    else:
+        logger.info("Training new model from scratch")
+        model = AutoModelForCausalLM.from_config(config)
+
+    # Print all named modules
+    for name, module in model.named_modules():
+        print(name)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -646,15 +784,9 @@ def main():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-
-    # ds_engine = deepspeed.init_inference(  #to be used as student model
-
-    # teacher_model.eval()
-
-
     ################
     # Dataset & Lora Config
-    ###############e
+    ################
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         raw_datasets = load_dataset(
@@ -671,12 +803,13 @@ def main():
             **dataset_args,
         )
 
-    #for train
+    # for train
     # filter the dataset for it to have only one prompt and answer (not a sequence of prompt-answer in one line) -> for now
     updated_dataset_train = raw_datasets['train'].map(add_filtered_msgs)
-    filtered_train = updated_dataset_train.filter(lambda x: len(x['rejected_filtered']) > 0).select(range(1000)) # delete this
+    filtered_train = updated_dataset_train.filter(
+        lambda x: len(x['rejected_filtered']) > 0)  # .select(range(1000)) # delete this
 
-    #for test
+    # for test
     updated_dataset_test = raw_datasets['test'].map(add_filtered_msgs)
     filtered_test = updated_dataset_test.filter(lambda x: len(x['rejected_filtered']) > 0)
 
@@ -699,12 +832,32 @@ def main():
         create_input_format_student(info, tokenizer, add_bos=args.add_bos)
         for info in filtered_dataset['train']['info']
     ]
-    generated_responses = generate_completions(
-        model, tokenizer, student_msgs_list, batch_size=1, max_new_tokens=50,
-        stop_id_sequences=None,
-        do_sample=False
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model.to(device)
+    if args.generated_data_path:
+        generated_responses = []
+        # Open the JSON file and read each line
+        with open(args.generated_data_path, 'r') as file:
+            for line in file:
+                try:
+                    # Parse the JSON data from the line
+                    data = json.loads(line.strip())
+                    # Extract batch_generations and append to the list
+                    generated_responses.extend(data.get("batch_generations", []))
+                except json.JSONDecodeError as e:
+                    print(f"Skipping invalid line due to JSONDecodeError: {e}")
+        print("already generated responses taken", generated_responses[0])
+    else:
+        generated_responses = generate_completions(
+            model, tokenizer, student_msgs_list, batch_size=1, max_new_tokens=300, disable_tqdm=False,
+            generation_storage=args.generation_storage,
+            stop_id_sequences=None,
+            do_sample=False
+        )
     # replace the rejected responses of anthropic with base models responses
+
+    # Modifying the remaining entries
     for idx, info in enumerate(filtered_dataset["train"]["info"]):
         for message in info:
             if message['role'] == 'assistant_rejected':
@@ -717,7 +870,7 @@ def main():
             apply_formatting_and_encoding,
             tokenizer=tokenizer,
             max_seq_length=args.max_seq_length,
-            add_bos=args.add_bos
+            add_bos= args.add_bos
         )
     else:
         raise ValueError("You need to have either 'rejected'&'chosen' in your column names.")
@@ -728,7 +881,7 @@ def main():
         num_proc=args.preprocessing_num_workers,
         load_from_cache_file=not args.overwrite_cache,
         remove_columns=[name for name in filtered_dataset["train"].column_names if
-                        name not in ["input_ids", "teacher_input_ids", "attention_mask","teacher_attention_mask"]],
+                        name not in ["input_ids", "teacher_input_ids", "attention_mask", "teacher_attention_mask"]],
         desc="Tokenizing and reformatting instruction data",
     )
     lm_datasets.set_format(type="pt")
@@ -841,15 +994,13 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
-    print("teacher_model pre-cooked:", teacher_model.model.transformer.wte.weight.shape)
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
-    teacher_model_1.to(accelerator.device)
+    teacher_model.to(accelerator.device)
     total_start_time = time.time()  # Start time for the entire training process
 
     for epoch in range(starting_epoch, args.num_train_epochs):
-
         """
         Algorithm: Generalized Knowledge Distillation (GKD)
         1: Given: Teacher model pT, Student Model pθS, Dataset (X, Y) containing (input, output) pairs
@@ -889,34 +1040,14 @@ def main():
                     student_logits = student_outputs.logits
 
                     with torch.no_grad():
-                        # when we use teacher_model_1 it works. But when teacher_model used we cannot find the weights
-                        '''
-                        Traceback (most recent call last):
-                          File "open-instruct/open_instruct/prob_distillation.py", line 728, in main
-                            teacher_outputs = teacher_model(**student_inputs, use_cache=False)
-                          File "/usr/local/lib/python3.8/dist-packages/torch/nn/modules/module.py", line 1501, in _call_impl
-                            return forward_call(*args, **kwargs)
-                          File "/usr/local/lib/python3.8/dist-packages/hf_olmo/modeling_olmo.py", line 70, in forward
-                            outputs = self.model.forward(
-                          File "/usr/local/lib/python3.8/dist-packages/olmo/model.py", line 1220, in forward
-                            x = self.transformer.wte(input_ids) if input_embeddings is None else input_embeddings  # type: ignore
-                          File "/usr/local/lib/python3.8/dist-packages/torch/nn/modules/module.py", line 1501, in _call_impl
-                            return forward_call(*args, **kwargs)
-                          File "/usr/local/lib/python3.8/dist-packages/torch/nn/modules/sparse.py", line 162, in forward
-                            return F.embedding(    ### YOU CAN PUT A DEBUG POINT HERE, self.weight is empty, it was not like that in student model
-                          File "/usr/local/lib/python3.8/dist-packages/torch/nn/functional.py", line 2210, in embedding
-                            return torch.embedding(weight, input, padding_idx, scale_grad_by_freq, sparse)
-                        RuntimeError: 'weight' must be 2-D
-                        '''
 
-                        # Using teacher_model_1 since teacher_model is causing issues with weights
-                        teacher_outputs = teacher_model_1(**student_inputs, use_cache=False)
+                        teacher_outputs = teacher_model(**teacher_inputs, use_cache=False)
                         teacher_logits = teacher_outputs.logits
                     teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
 
                     # Compute the softmax of student logits for loss calculation
                     student_probs = torch.nn.functional.softmax(student_logits, dim=-1)
-                    loss = torch.nn.functional.kl_div(student_probs.log(), teacher_probs, reduction='batchmean')
+                    loss = torch.nn.functional.kl_div(torch.nn.functional.log_softmax(student_logits,dim=-1), teacher_probs, reduction='batchmean')
 
                 else:
                     with torch.no_grad():
@@ -955,9 +1086,9 @@ def main():
 
                 # print(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
                 # Print number of examples processed so far in this epoch
-                print(
-                    f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}, progress: {100 * completed_steps / args.max_train_steps}")
-                #print(f"step_duration: {step_duration},total_elapsed_time: {total_elapsed_time / 3600}")
+                # print(
+                #    f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}, progress: {100 * completed_steps / args.max_train_steps}")
+                # print(f"step_duration: {step_duration},total_elapsed_time: {total_elapsed_time / 3600}")
                 if args.with_tracking:
                     wandb.log(
                         {
@@ -984,7 +1115,7 @@ def main():
 
     if args.output_dir is not None:
         tokenizer.save_pretrained(args.output_dir)
-        save_with_accelerate(accelerator, model, output_dir, args)
+        save_with_accelerate(accelerator, model, args.output_dir, args)
 
 
 if __name__ == "__main__":
