@@ -36,12 +36,12 @@ def evaluate(accelerator, args):
     responses_log_path = output_dir / "responses.json"
 
     logger.info("loading data...")
-    alpaca_eval_data = datasets.load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval")["eval"]
+    alpaca_eval_data = datasets.load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval", trust_remote_code=True)["eval"]
     prompts = []
     for example in alpaca_eval_data:
         prompt = example["instruction"]
         prompts.append(prompt)
-    prompts = prompts[:10]
+    # prompts = prompts[:10]
 
     responses_log = []
     if responses_log_path.exists():
@@ -78,6 +78,7 @@ def evaluate(accelerator, args):
             #     seed=239,
             #     disable_sliding_window=True,
             # )
+            mem_util = 0.9 if args.is_lora else 0.4
             base_model = vllm.LLM(model=train_args.model_name_or_path,
                                   revision=train_args.model_revision,
                                   tokenizer=tokenizer_name,
@@ -86,16 +87,18 @@ def evaluate(accelerator, args):
                                   trust_remote_code=True,
                                   enable_lora=args.is_lora,
                                   disable_sliding_window=True,
+                                  gpu_memory_utilization=mem_util,
                                   # model_config=model_config
                                   )
 
             def create_att_model():
-                nonlocal base_model, tokenizer, tokenizer_name, tokenizer_revision, args, train_args
-                destroy_model_parallel()
-                del base_model
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.distributed.destroy_process_group()
+                nonlocal base_model, tokenizer, tokenizer_name, tokenizer_revision, args, train_args, mem_util
+                # Can't destroy vLLM state
+                # destroy_model_parallel()
+                # del base_model
+                # gc.collect()
+                # torch.cuda.empty_cache()
+                # torch.distributed.destroy_process_group()
                 return vllm.LLM(model=args.tuned_checkpoint.absolute().as_posix(),
                                 revision=train_args.model_revision,
                                 tokenizer=tokenizer_name,
@@ -104,6 +107,7 @@ def evaluate(accelerator, args):
                                 trust_remote_code=True,
                                 enable_lora=False,
                                 disable_sliding_window=True,
+                                gpu_memory_utilization=mem_util,
                                 # model_config=model_config
                                 )
 
@@ -196,8 +200,8 @@ def evaluate(accelerator, args):
                 responses_log.append(log_entry)
                 print(f"Prompt: {prompt} \nResponse: {log_entry['output']}")
 
-            with open(responses_log_path, "w") as f:
-                json.dump(responses_log, f)
+        with open(responses_log_path, "w") as f:
+            json.dump(responses_log, f)
 
     prompts = [resp["instruction"] for resp in responses_log]
     alpaca_eval_data = alpaca_eval_data.filter(lambda x: x["instruction"] in prompts)
@@ -213,7 +217,6 @@ def evaluate(accelerator, args):
         precomputed_leaderboard=None,
         is_cache_leaderboard=False,
         metric_kwargs={"save_weights_dir": output_dir / "weights/finetuned"},
-        trust_remote_code=True,
     )
 
     if (not args.not_att) and args.att_evaluate_base:
@@ -235,7 +238,6 @@ def evaluate(accelerator, args):
             precomputed_leaderboard=None,
             is_cache_leaderboard=False,
             metric_kwargs={"save_weights_dir": output_dir / "weights/base"},
-            trust_remote_code=True,
         )
         df_leaderboard = pd.concat([df_leaderboard, base_leaderboard])
 
