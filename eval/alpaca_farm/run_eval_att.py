@@ -112,8 +112,8 @@ def evaluate(accelerator, args):
                                 )
 
             sampling_params = vllm.SamplingParams(
-                top_p=args.top_p,
-                temperature=args.temperature,
+                top_p=1.0 if args.greedy else args.top_p,
+                temperature=0.0 if args.greedy else args.temperature,
                 seed=239,
                 max_tokens=args.max_new_tokens,
             )

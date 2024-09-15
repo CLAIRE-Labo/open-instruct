@@ -193,6 +193,7 @@ def main(args):
         print(f"Interaction {i + 1}")
         chat.append({"role": "user", "content": input("User: ")})
         response = generate_response_att_lora(model, tokenizer, chat, generation_config)[-1]
+        print(f"Assistant: {response}")
         chat.append({"role": "assistant", "content": response})
 
 
