@@ -2,24 +2,18 @@ import sys
 import argparse
 from pathlib import Path
 from copy import deepcopy
-import logging
 
 import torch
 from ply.yacc import token
-from transformers import (
-    AutoConfig,
-    GenerationConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-)
+from transformers import GenerationConfig
 import accelerate
+from accelerate.logging import get_logger
 
-sys.path.append(str(Path(__file__).parents[1] / "open_instruct"))
-print(sys.path)
-from att import apply_att_template
-from load_utils import load_args, load_tokenizer_model
+sys.path.append(Path(__file__).parents[1].absolute().as_posix())
+from open_instruct.att import apply_att_template
+from open_instruct.load_utils import load_args, load_tokenizer_model
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def generate_response(model, tokenizer, chat, generation_config):
@@ -27,7 +21,7 @@ def generate_response(model, tokenizer, chat, generation_config):
     max_prompt_len = generation_config.max_length - generation_config.max_new_tokens
     input_ids = tokenizer.apply_chat_template(chat, add_generation_prompt=True)
     if len(input_ids) > max_prompt_len:
-        logger.warning(f"generate_response: tuncated input of size {len(input_ids)} to {max_prompt_len}")
+        logger.warning(f"generate_response: truncated input of size {len(input_ids)} to {max_prompt_len}")
         input_ids = input_ids[-max_prompt_len:]
     input_text = tokenizer.decode(input_ids)
 
@@ -47,6 +41,60 @@ def generate_response(model, tokenizer, chat, generation_config):
     return input_text, response_text_with_special_tokens, response_text
 
 
+def generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_request=None):
+    prompts = [tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True) for chat in chats]
+
+    responses = model.generate(
+        prompts,
+        sampling_params=sampling_params,
+        lora_request=lora_request,
+    )
+
+    return prompts, [r.outputs[0].text for r in responses]
+
+
+def generate_responses_vllm_att(model, tokenizer, chats, sampling_params, lora_request=None, create_att_model=None):
+    if lora_request is not None:
+        assert create_att_model is None, "If the LoRA request is set, we assume that the ATT model is the LoRA adapter."
+    else:
+        assert create_att_model is not None, "If the LoRA request is not set, we need a separate ATT model."
+
+    prompts_base, responses_base = generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_request=None)
+
+    prompts_att = []
+    for i, (chat, response_base) in enumerate(zip(chats, responses_base)):
+        rejected = deepcopy(chat)
+        rejected.append({"role": "assistant", "content": response_base})
+        chosen = deepcopy(chat)
+        chosen.append({"role": "assistant", "content": ""})
+
+        data = apply_att_template({'chosen': chosen, 'rejected': rejected}, tokenizer=tokenizer, max_seq_length=1024,
+                                  debug_print=False, logger=logger)
+        input_ids = data['input_ids']
+        labels = data['labels']
+        prompt_ids = input_ids[labels == -100]
+        if len(prompt_ids) > 2048:
+            logger.warning(f"generate_responses_vllm_att_lora truncated input of size {len(prompt_ids)} to 2048")
+            prompt_ids = input_ids[-2048:]
+        prompt_text = tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=False)
+        prompts_att.append(prompt_text)
+
+    if lora_request is not None:
+        responses_att = model.generate(
+            prompts_att,
+            sampling_params=sampling_params,
+            lora_request=lora_request,
+        )
+    else:
+        att_model = create_att_model()
+        responses_att = att_model.generate(
+            prompts_att,
+            sampling_params=sampling_params,
+        )
+
+    return prompts_base, responses_base, prompts_att, [r.outputs[0].text for r in responses_att]
+
+
 def generate_response_att_lora(model, tokenizer, chat, generation_config):
     assert generation_config.max_new_tokens is not None
     max_prompt_len = generation_config.max_length - generation_config.max_new_tokens
@@ -55,7 +103,7 @@ def generate_response_att_lora(model, tokenizer, chat, generation_config):
     inputs_base_text, response_base_text_with_special_tokens, response_base_text \
         = generate_response(model, tokenizer, chat, generation_config)
     # print(f"Input to base: \n\n{inputs_base_text}\n\n")
-    print(f"Response from base (w/ sp tokens): \n\n{response_base_text_with_special_tokens}\n\n")
+    # print(f"Response from base (w/ sp tokens): \n\n{response_base_text_with_special_tokens}\n\n")
     model.enable_adapters()
 
     rejected = deepcopy(chat)
@@ -72,7 +120,7 @@ def generate_response_att_lora(model, tokenizer, chat, generation_config):
         logger.warning(f"generate_response_att_lora truncated input of size {len(prompt_ids)} to {max_prompt_len}")
         prompt_ids = input_ids[-max_prompt_len:]
     prompt_text = tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=False)
-    print(f"Prompt: \n\n{prompt_text}\n\n")
+    # print(f"Prompt: \n\n{prompt_text}\n\n")
 
     att_response_ids = model.generate(
         prompt_ids.cuda().unsqueeze(0),
@@ -81,12 +129,14 @@ def generate_response_att_lora(model, tokenizer, chat, generation_config):
     )
 
     att_response_ids = att_response_ids[0].tolist()
-    att_response_text = tokenizer.decode(att_response_ids)
-    assert att_response_text.startswith(prompt_text), f"Response does not start with prompt"
-    att_response_text = att_response_text[len(prompt_text):].strip()
-    print(f"Response from att (w/ sp tokens): \n\n{att_response_text}\n\n")
-    att_response_text = tokenizer.decode(tokenizer.encode(att_response_text), skip_special_tokens=True).strip()
-    return att_response_text
+    att_response_text_with_special_tokens = tokenizer.decode(att_response_ids)
+    assert att_response_text_with_special_tokens.startswith(prompt_text), f"Response does not start with prompt"
+    att_response_text_with_special_tokens = att_response_text_with_special_tokens[len(prompt_text):].strip()
+
+    # print(f"Response from att (w/ sp tokens): \n\n{att_response_text_with_special_tokens}\n\n")
+    att_response_text = tokenizer.decode(tokenizer.encode(att_response_text_with_special_tokens),
+                                         skip_special_tokens=True).strip()
+    return inputs_base_text, response_base_text, prompt_text, att_response_text_with_special_tokens, att_response_text
 
 
 def main(args):
@@ -125,7 +175,7 @@ def main(args):
     for i in range(args.max_interactions):
         print(f"Interaction {i + 1}")
         chat.append({"role": "user", "content": input("User: ")})
-        response = generate_response_att_lora(model, tokenizer, chat, generation_config)
+        response = generate_response_att_lora(model, tokenizer, chat, generation_config)[-1]
         chat.append({"role": "assistant", "content": response})
 
 

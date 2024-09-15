@@ -16,7 +16,7 @@ import math
 import ast
 import os
 import random
-from datetime import timedelta
+from datetime import timedelta, datetime
 import torch
 from functools import partial
 import subprocess
@@ -41,10 +41,9 @@ from transformers import (
 )
 
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
-
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-from load_utils import add_common_training_args, pretty_print_chatml, preprocess_hh_common, load_tokenizer_model, save_args, \
-    load_args
+from load_utils import (add_common_training_args, pretty_print_chatml, preprocess_data_to_chatml, \
+                        load_tokenizer_model, save_args, load_args)
 from att import apply_att_template
 
 from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
@@ -78,7 +77,7 @@ else:
 
 
 def get_run_id(args: Namespace) -> str:
-    timestamp = time.strftime("%Y%m%d_%H%M%S_%3N") if not os.getenv('RUN_TIMESTAMP') else os.getenv('RUN_TIMESTAMP')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f") if not os.getenv('RUN_TIMESTAMP') else os.getenv('RUN_TIMESTAMP')
     # try to get the git commit hash
     # try:
     #     git_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('utf-8').strip()
@@ -240,7 +239,7 @@ def main():
     logger.info(f"\n\n\nSaving checkpoints to {checkpointing_dir}\n\n\n")
 
     ######################################## Data Preprocessing ########################################
-    dataset_train, dataset_test = preprocess_hh_common(args)
+    dataset_train, dataset_test = preprocess_data_to_chatml(args)
     for i in range(10):
         logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(dataset_train[i]['chosen'])}\n\n"
                     f"Example {i} rejected:\n{pretty_print_chatml(dataset_train[i]['rejected'])}\n\n")

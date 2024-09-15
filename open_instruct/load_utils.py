@@ -1,4 +1,6 @@
 import os
+import sys
+from pathlib import Path
 from typing import List, Dict
 import re
 import json
@@ -20,6 +22,8 @@ from transformers import (
 import deepspeed
 from datasets import load_dataset
 
+sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
+from open_instruct.constants import PHI2_CHAT_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -37,16 +41,24 @@ def get_hf_token() -> str:
 def add_common_training_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--dataset_name",
+        nargs="*",
         type=str,
         default=None,
-        help="The name of the dataset to use (via the datasets library).",
+        help="The name of the datasets to use (via the datasets library).",
     )
     parser.add_argument(
-        "--dataset_config_name",
-        type=str,
+        '--dataset_subsample_size',
+        type=int,
         default=None,
-        help="The configuration name of the dataset to use (via the datasets library).",
+        help='Subsample the dataset to this size. Useful for debugging.'
     )
+    # Don't need this for now
+    # parser.add_argument(
+    #     "--dataset_config_name",
+    #     type=str,
+    #     default=None,
+    #     help="The configuration name of the dataset to use (via the datasets library).",
+    # )
     parser.add_argument(
         "--save_tokenizer",
         type=bool,
@@ -370,6 +382,7 @@ def merge_consecutive_messages_and_trim(messages: List[Dict[str, str]]) -> List[
 
     return merged_messages
 
+
 # See eg https://huggingface.co/datasets/Anthropic/hh-rlhf/viewer/default/train?q=facebook+stalk&row=12696
 def is_entry_ok_anthropic_hh(entry: Dict[str, List[Dict[str, str]]]) -> bool:
     if len(entry['chosen']) != len(entry['rejected']):
@@ -410,32 +423,47 @@ def pretty_print_chatml(messages: List[Dict[str, str]]):
     return chatml
 
 
-def preprocess_hh_common(args):
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-        )
-    else:
-        data_files = {}
-        dataset_args = {}
-        if args.train_file is not None:
-            data_files["train"] = args.train_file
-        raw_datasets = load_dataset(
-            "json",
-            data_files=data_files,
-            **dataset_args,
-        )
+def preprocess_data_to_chatml(args):
+    chatml_datasets_train = []
+    chatml_datasets_test = []
+    for dataset_name in args.dataset_name:
+        raw_data = load_dataset(dataset_name)
+        if dataset_name == "Anthropic/hh-rlhf":
+            dataset_train, dataset_test = preprocess_hh_common(raw_data, remove_multiturn_data=True)
+        elif dataset_name == "HuggingFaceH4/ultrafeedback_binarized":
+            dataset_train = raw_data['train_prefs']
+            dataset_test = raw_data['test_prefs']
+        else:
+            raise ValueError(f"Dataset {dataset_name} not supported yet.")
+        chatml_datasets_train.append(dataset_train)
+        chatml_datasets_test.append(dataset_test)
 
-    dataset_train = raw_datasets['train'].map(parse_entry_anthropic_hh)
-    dataset_test = raw_datasets['test'].map(parse_entry_anthropic_hh)
+    # merge training datasets
+    chatml_dataset_train = chatml_datasets_train[0]
+    for dataset in chatml_datasets_train[1:]:
+        chatml_dataset_train = chatml_dataset_train.concatenate(dataset)
+
+    # merge test datasets
+    chatml_dataset_test = chatml_datasets_test[0]
+    for dataset in chatml_datasets_test[1:]:
+        chatml_dataset_test = chatml_dataset_test.concatenate(dataset)
+
+    if args.dataset_subsample_size:
+        chatml_dataset_train = chatml_dataset_train.shuffle(seed=args.seed).select(range(args.dataset_subsample_size))
+        # chatml_dataset_test = chatml_dataset_test.shuffle(seed=args.seed).select(range(args.dataset_subsample_size))
+
+    return chatml_dataset_train, chatml_dataset_test
+
+
+def preprocess_hh_common(raw_dataset, remove_multiturn_data=False):
+    dataset_train = raw_dataset['train'].map(parse_entry_anthropic_hh)
+    dataset_test = raw_dataset['test'].map(parse_entry_anthropic_hh)
 
     dataset_train = dataset_train.filter(is_entry_ok_anthropic_hh)
     dataset_test = dataset_test.filter(is_entry_ok_anthropic_hh)
     print(f"After filtering, {len(dataset_train)} training examples and {len(dataset_test)} test examples remain.")
 
-    if args.remove_multiturn_data:
+    if remove_multiturn_data:
         dataset_train = dataset_train.filter(lambda x: len(x['rejected']) == 2)
         dataset_test = dataset_test.filter(lambda x: len(x['rejected']) == 2)
 
@@ -448,6 +476,8 @@ def preprocess_hh_common(args):
 def target_lora_modules(model) -> List[str]:
     if model.__class__.__name__ == "Phi3ForCausalLM":
         return ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
+    elif model.__class__.__name__ == "PhiForCausalLM":
+        return ["Wqkv", "out_proj", "fc1", "fc2"]
     elif model.__class__.__name__ == "OLMoForCausalLM":
         return ["att_proj", "ff_proj", "attn_out", "ff_out"]
     elif model.__class__.__name__ == "MistralForCausalLM":
@@ -502,6 +532,7 @@ def load_tokenizer_model(accelerator, args):
         logger.warn(warning)
 
     if args.tokenizer_name:
+        tokenizer_name = args.tokenizer_name
         tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer_name,
             trust_remote_code=args.trust_remote_code,
@@ -510,6 +541,7 @@ def load_tokenizer_model(accelerator, args):
             force_download=args.ignore_model_cache,
         )
     elif args.model_name_or_path:
+        tokenizer_name = args.model_name_or_path
         tokenizer = AutoTokenizer.from_pretrained(
             args.model_name_or_path,
             padding=True,
@@ -526,7 +558,7 @@ def load_tokenizer_model(accelerator, args):
 
     ######################################## Model Loading ########################################
     if args.model_name_or_path:
-        def try_load_model() -> AutoModelForCausalLM:
+        def try_load_model():
             if args.use_qlora:
                 bnb_config = BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -573,6 +605,10 @@ def load_tokenizer_model(accelerator, args):
 
     actual_eos_token = tokenizer.eos_token
     tokenizer.add_special_tokens({'pad_token': '<pad>', 'eos_token': '<my_eos_token>'})
+
+    # The SFTd Phi-2 model
+    if tokenizer_name == 'lxuechen/phi-2-sft':
+        tokenizer.chat_template = PHI2_CHAT_TEMPLATE
 
     generation_config = GenerationConfig(
         max_new_tokens=args.logging_examples_max_length,

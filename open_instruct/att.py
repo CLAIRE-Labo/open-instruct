@@ -1,7 +1,12 @@
-from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
-from load_utils import pretty_print_chatml
+import sys
+from pathlib import Path
 
 import torch
+
+sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
+from open_instruct.constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
+from open_instruct.load_utils import pretty_print_chatml
+
 
 
 # OLMo chat template handles the BOS token, so we don't need to fiddle with add_bos.
@@ -78,6 +83,8 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
             logger.error(pretty_print_chatml(messages))
         raise e
 
+    if prompt_text != response_text[:len(prompt_text)]:
+        print(f"Prompt:\n\"\"\"\n{prompt_text}\n\"\"\"")
     assert prompt_text == response_text[:len(prompt_text)], \
         f"Currently it is assumed that the prompt and response should be the same up to the end of the prompt," \
         f" got \"{prompt_text}\" and \"{response_text}\""
