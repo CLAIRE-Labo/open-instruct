@@ -21,6 +21,7 @@ import torch
 from functools import partial
 import subprocess
 
+import numpy as np
 from torch.cuda import memory_allocated
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -270,8 +271,12 @@ def main():
         lm_datasets.set_format(type="pt")
         lm_datasets = lm_datasets.filter(lambda example: (example['labels'] != -100).any())
 
-    print("Size of training set:", len(filtered_dataset['train']))
-    print("Size of test set:", len(filtered_dataset['test']))
+    if accelerator.is_main_process:
+        lens = [x["input_ids"].shape[0] for x in lm_datasets["train"]]
+        len_response = [torch.sum(x["labels"] != -100) for x in lm_datasets["train"]]
+        logger.info(f"Avg length of example: {np.mean(lens):.1f} +/- {np.std(lens):.1f}")
+        logger.info(f"Avg length of response: {np.mean(len_response):.1f} +/- {np.std(len_response):.1f}")
+    accelerator.wait_for_everyone()
 
     train_dataset = lm_datasets["train"]
     test_dataset = lm_datasets["test"]
@@ -292,10 +297,26 @@ def main():
 
     train_examples = [train_dataset[i] for i in indices_train_ex]
     test_examples = [test_dataset[i] for i in indices_test_ex]
-    for index, ex in enumerate(train_examples):
-        logger.info(f"Sample {index} of the training set: {ex}.")
+    # for index, ex in enumerate(train_examples):
+    #     logger.info(f"Sample {index} of the training set: {ex}.")
 
     ######################################## Training Setup ########################################
+    def put_big_to_front(dataset):
+        logger.info("Putting the biggest examples to the front of the dataset to catch OOMs early.")
+        lens = [x["input_ids"].shape[0] for x in dataset]
+        order = list(sorted(range(len(lens)), key=lambda x: lens[x], reverse=True))
+        if len(order) > 128:
+            order = order[:128] + random.sample(order[128:], k=len(order[128:]))
+        dataset = dataset.select(order)
+        return dataset
+
+    train_dataset = put_big_to_front(train_dataset)
+    test_dataset = put_big_to_front(test_dataset)
+
+    if args.dataset_subsample_size is not None:
+        train_dataset = train_dataset.select(range(min(args.dataset_subsample_size, len(train_dataset))))
+        test_dataset = test_dataset.select(range(min(args.dataset_subsample_size, len(test_dataset))))
+
     # DataLoaders creation:
     def get_dataloader(dataset, batch_size):
         return DataLoader(
@@ -304,6 +325,9 @@ def main():
             collate_fn=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest"),
             batch_size=batch_size
         )
+
+    print("Size of training set:", len(train_dataset['train']))
+    print("Size of test set:", len(test_dataset['test']))
 
     train_dataloader = get_dataloader(train_dataset, args.per_device_train_batch_size)
     test_dataloader = get_dataloader(test_dataset, args.per_device_train_batch_size)

@@ -138,7 +138,7 @@ def add_common_training_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=512,
+        default=1024,
         help="The maximum total sequence length (prompt+completion) of each training example.",
     )
     parser.add_argument(
@@ -448,9 +448,10 @@ def preprocess_data_to_chatml(args):
     for dataset in chatml_datasets_test[1:]:
         chatml_dataset_test = chatml_dataset_test.concatenate(dataset)
 
-    if args.dataset_subsample_size:
-        chatml_dataset_train = chatml_dataset_train.shuffle(seed=args.seed).select(range(args.dataset_subsample_size))
-        # chatml_dataset_test = chatml_dataset_test.shuffle(seed=args.seed).select(range(args.dataset_subsample_size))
+    # Subsampling is done later after processing and filtering
+    # if args.dataset_subsample_size:
+    #     chatml_dataset_train = chatml_dataset_train.shuffle(seed=args.seed).select(range(args.dataset_subsample_size))
+    #     chatml_dataset_test = chatml_dataset_test.shuffle(seed=args.seed).select(range(args.dataset_subsample_size))
 
     return chatml_dataset_train, chatml_dataset_test
 

@@ -57,7 +57,7 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
     try:
         # TODO Skander check max token length of HH data
         prompt_text = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True,
-                                                    tokenize=False, max_length=max_seq_length)
+                                                    tokenize=False)
     except Exception as e:
         if logger is not None:
             logger.error(f"Error in apply_chat_template when generating the prompt: {e}")
@@ -67,15 +67,14 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
 
     if debug_print and logger is not None:
         logger.info("The prompt:\n\"\"\"\n" + prompt_text + "\n\"\"\"")
-    tokens = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True,
-                                           max_length=max_seq_length)
+    tokens = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True)
     end_idx = len(tokens)
 
     messages.append(chosen[-1])
 
     try:
         response_text = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=False,
-                                                      tokenize=False, max_length=max_seq_length)
+                                                      tokenize=False)
     except Exception as e:
         if logger is not None:
             logger.error(f"Error in apply_chat_template when generating the response message: {e}")
@@ -92,12 +91,15 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
     if debug_print and logger is not None:
         logger.info("Target response:\n\"\"\"\n" + expected_response_text + "\n\"\"\"")
 
-    input_ids = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=False,
-                                              max_length=max_seq_length)
+    input_ids = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=False)
     input_ids = torch.tensor([input_ids], dtype=torch.long)
     labels = input_ids.clone()
     labels[:, :end_idx] = -100
     attention_mask = torch.ones_like(input_ids)
+
+    input_ids = input_ids[:, :max_seq_length]
+    labels = labels[:, :max_seq_length]
+    attention_mask = attention_mask[:, :max_seq_length]
 
     return {
         'input_ids': input_ids.flatten(),

@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 from copy import deepcopy
 
+from tqdm import trange, tqdm
 import torch
 from ply.yacc import token
 from transformers import GenerationConfig
@@ -41,25 +42,33 @@ def generate_response(model, tokenizer, chat, generation_config):
     return input_text, response_text_with_special_tokens, response_text
 
 
-def generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_request=None):
+# Batching is not supposed to be necessary, vLLM has to figure it out itself. However, I encountered a random bug that was fixed by batching.
+def generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_request=None, batch_size=None):
     prompts = [tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True) for chat in chats]
 
-    responses = model.generate(
-        prompts,
-        sampling_params=sampling_params,
-        lora_request=lora_request,
-    )
+    batches = [prompts[i:i + batch_size] for i in range(0, len(prompts), batch_size)] if batch_size is not None else [
+        prompts]
+    responses = []
+    for batch in tqdm(batches, desc="Generating responses"):
+        responses += model.generate(
+            batch,
+            use_tqdm=batch_size is None,
+            sampling_params=sampling_params,
+            lora_request=lora_request,
+        )
 
     return prompts, [r.outputs[0].text for r in responses]
 
 
-def generate_responses_vllm_att(model, tokenizer, chats, sampling_params, lora_request=None, create_att_model=None):
+def generate_responses_vllm_att(model, tokenizer, chats, sampling_params, lora_request=None, create_att_model=None,
+                                batch_size=None):
     if lora_request is not None:
         assert create_att_model is None, "If the LoRA request is set, we assume that the ATT model is the LoRA adapter."
     else:
         assert create_att_model is not None, "If the LoRA request is not set, we need a separate ATT model."
 
-    prompts_base, responses_base = generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_request=None)
+    prompts_base, responses_base = generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_request=None,
+                                                           batch_size=batch_size)
 
     prompts_att = []
     for i, (chat, response_base) in enumerate(zip(chats, responses_base)):
@@ -79,18 +88,26 @@ def generate_responses_vllm_att(model, tokenizer, chats, sampling_params, lora_r
         prompt_text = tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=False)
         prompts_att.append(prompt_text)
 
+    batches = [prompts_att[i:i + batch_size] for i in
+               range(0, len(prompts_att), batch_size)] if batch_size is not None else [
+        prompts_att]
+    responses_att = []
     if lora_request is not None:
-        responses_att = model.generate(
-            prompts_att,
-            sampling_params=sampling_params,
-            lora_request=lora_request,
-        )
+        for batch in tqdm(batches, desc="Generating responses ATT"):
+            responses_att += model.generate(
+                batch,
+                use_tqdm=batch_size is None,
+                sampling_params=sampling_params,
+                lora_request=lora_request,
+            )
     else:
         att_model = create_att_model()
-        responses_att = att_model.generate(
-            prompts_att,
-            sampling_params=sampling_params,
-        )
+        for batch in tqdm(batches, desc="Generating responses ATT"):
+            responses_att += att_model.generate(
+                batch,
+                sampling_params=sampling_params,
+                use_tqdm=batch_size is None,
+            )
 
     return prompts_base, responses_base, prompts_att, [r.outputs[0].text for r in responses_att]
 

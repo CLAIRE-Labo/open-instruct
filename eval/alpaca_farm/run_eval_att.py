@@ -141,7 +141,7 @@ def evaluate(accelerator, args):
                 else:
                     prompts_base, responses_base, prompts_att, responses = \
                         generate_responses_vllm_att(base_model, tokenizer, chats, sampling_params,
-                                                    create_att_model=create_att_model)
+                                                    create_att_model=create_att_model, batch_size=25)
 
                 responses_log = [
                     {"instruction": prompt,
