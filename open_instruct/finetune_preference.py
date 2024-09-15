@@ -317,6 +317,9 @@ def main():
         train_dataset = train_dataset.select(range(min(args.dataset_subsample_size, len(train_dataset))))
         test_dataset = test_dataset.select(range(min(args.dataset_subsample_size, len(test_dataset))))
 
+    print("Size of training set:", len(train_dataset))
+    print("Size of test set:", len(test_dataset))
+
     # DataLoaders creation:
     def get_dataloader(dataset, batch_size):
         return DataLoader(
@@ -325,9 +328,6 @@ def main():
             collate_fn=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest"),
             batch_size=batch_size
         )
-
-    print("Size of training set:", len(train_dataset['train']))
-    print("Size of test set:", len(test_dataset['test']))
 
     train_dataloader = get_dataloader(train_dataset, args.per_device_train_batch_size)
     test_dataloader = get_dataloader(test_dataset, args.per_device_train_batch_size)
