@@ -18,6 +18,7 @@ from eval.chat import (
     generate_response_att_lora,
     generate_response,
 )
+from open_instruct.load_utils import load_tokenizer
 
 
 class KeyWordsCriteria(StoppingCriteria):
@@ -591,11 +592,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
     )
     hf_revision = train_args.model_revision
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_name_or_path,
-        revision=hf_revision,
-        use_fast=not train_args.use_slow_tokenizer,
-    )
+    tokenizer, _ = load_tokenizer(train_args, False)
 
     if eval_args.use_vllm:
         print("Loading vLLM model...")

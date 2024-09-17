@@ -43,7 +43,7 @@ def evaluate(accelerator, args):
 
     train_args = load_args(args.train_run_args)
 
-    output_dir = args.tuned_checkpoint / "eval" / "toxigen" if args.output_dir is None else args.output_dir
+    output_dir = args.tuned_checkpoint / "eval" / "toxigen_20" if args.output_dir is None else args.output_dir
     if output_dir.exists():
         logger.warning(f"Output directory {output_dir} already exists. Will see if the outputs are cached.")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -82,7 +82,7 @@ def evaluate(accelerator, args):
         ]
         chats.append(messages)
 
-    # chats = chats[:10]  # For testing
+    chats = chats[:10]  # For testing
 
     responses_log = []
     if responses_log_path.exists():

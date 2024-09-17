@@ -494,38 +494,7 @@ def target_lora_modules(model) -> List[str]:
         raise ValueError(f"Model type {type(model)} not added yet. Model:\n {model}")
 
 
-def load_tokenizer_model(accelerator, args):
-    ######################################## Config and Tokenizer Loading ########################################
-    def try_load_config() -> PretrainedConfig:
-        # Load pretrained model and tokenizer
-        if args.config_name:
-            return AutoConfig.from_pretrained(
-                args.config_name,
-                trust_remote_code=args.trust_remote_code,
-                revision=args.model_revision,
-                force_download=args.ignore_model_cache,
-            )
-        elif args.model_name_or_path:
-            return AutoConfig.from_pretrained(
-                args.model_name_or_path,
-                trust_remote_code=args.trust_remote_code,
-                revision=args.model_revision,
-                force_download=args.ignore_model_cache,
-            )
-        else:
-            raise ValueError(
-                "You are instantiating a new config instance from scratch. This is not supported by this script."
-            )
-
-    try:
-        config = try_load_config()
-    except OSError as e:
-        print(f"Error loading config: {e}")
-        print("Assuming it was a login issue, logging into Huggingface...")
-
-        huggingface_hub.login(token=get_hf_token())
-        config = try_load_config()
-
+def load_tokenizer(args, substitute_eos_token=False):
     tokenizer_revision = (
         args.model_revision
         if args.tokenizer_revision is None
@@ -563,6 +532,53 @@ def load_tokenizer_model(accelerator, args):
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+
+    actual_eos_token = tokenizer.eos_token
+    tokenizer.add_special_tokens({'pad_token': '<pad>'})
+    if substitute_eos_token:
+        tokenizer.add_special_tokens({'eos_token': '<my_eos_token>'})
+
+    # The SFTd Phi-2 model
+    if tokenizer_name == 'lxuechen/phi-2-sft':
+        tokenizer.chat_template = PHI2_CHAT_TEMPLATE
+    # this also doesn't provide its own chat template, so we wrote it ourselves
+    elif tokenizer_name == 'allenai/tulu-v1-llama2-7b':
+        tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
+
+    return tokenizer, actual_eos_token
+
+
+def load_tokenizer_model(accelerator, args):
+    ######################################## Config and Tokenizer Loading ########################################
+    def try_load_config() -> PretrainedConfig:
+        # Load pretrained model and tokenizer
+        if args.config_name:
+            return AutoConfig.from_pretrained(
+                args.config_name,
+                trust_remote_code=args.trust_remote_code,
+                revision=args.model_revision,
+                force_download=args.ignore_model_cache,
+            )
+        elif args.model_name_or_path:
+            return AutoConfig.from_pretrained(
+                args.model_name_or_path,
+                trust_remote_code=args.trust_remote_code,
+                revision=args.model_revision,
+                force_download=args.ignore_model_cache,
+            )
+        else:
+            raise ValueError(
+                "You are instantiating a new config instance from scratch. This is not supported by this script."
+            )
+
+    try:
+        config = try_load_config()
+    except OSError as e:
+        print(f"Error loading config: {e}")
+        print("Assuming it was a login issue, logging into Huggingface...")
+
+        huggingface_hub.login(token=get_hf_token())
+        config = try_load_config()
 
     ######################################## Model Loading ########################################
     if args.model_name_or_path:
@@ -611,15 +627,8 @@ def load_tokenizer_model(accelerator, args):
         logger.info("Training new model from scratch")
         model = AutoModelForCausalLM.from_config(config)
 
-    actual_eos_token = tokenizer.eos_token
-    tokenizer.add_special_tokens({'pad_token': '<pad>', 'eos_token': '<my_eos_token>'})
-
-    # The SFTd Phi-2 model
-    if tokenizer_name == 'lxuechen/phi-2-sft':
-        tokenizer.chat_template = PHI2_CHAT_TEMPLATE
-    #
-    elif tokenizer_name == 'allenai/tulu-v1-llama2-7b':
-        tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
+    # Have to use a "fake" eos token that the model never generates as a hack to work around a bug in model.generate
+    tokenizer, actual_eos_token = load_tokenizer(args, substitute_eos_token=True)
 
     generation_config = GenerationConfig(
         max_new_tokens=args.logging_examples_max_length,
