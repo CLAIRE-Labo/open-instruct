@@ -57,23 +57,24 @@ from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
 logger = get_logger(__name__)
 import pandas as pd
 
-try:
-    from hf_olmo import OLMoTokenizerFast
-except ImportError:
-    logger.warning("OLMo not installed. Ignore if using a different model.")
-
-# wandb login stage
-api_key_file = os.getenv('WANDB_API_KEY_FILE_AT')
-
-if api_key_file:
+if __name__ == "__main__":
     try:
-        with open(api_key_file, 'r') as file:
-            wandb_api_key = file.readline().strip()
-            os.environ['WANDB_API_KEY'] = wandb_api_key  # Set the API key in the environment
-    except Exception as e:
-        raise ValueError(f"An error occurred while reading the WANDB_API_KEY from file: {e}")
-else:
-    raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
+        from hf_olmo import OLMoTokenizerFast
+    except ImportError:
+        logger.warning("OLMo not installed. Ignore if using a different model.")
+
+    # wandb login stage
+    api_key_file = os.getenv('WANDB_API_KEY_FILE_AT')
+
+    if api_key_file:
+        try:
+            with open(api_key_file, 'r') as file:
+                wandb_api_key = file.readline().strip()
+                os.environ['WANDB_API_KEY'] = wandb_api_key  # Set the API key in the environment
+        except Exception as e:
+            raise ValueError(f"An error occurred while reading the WANDB_API_KEY from file: {e}")
+    else:
+        raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
 
 def get_run_id(args: Namespace) -> str:
