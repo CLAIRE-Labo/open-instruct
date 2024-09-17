@@ -10,6 +10,7 @@ from copy import deepcopy
 
 import torch
 import huggingface_hub
+from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from transformers import SchedulerType
 from transformers import (
     AutoConfig,
@@ -21,11 +22,12 @@ from transformers import (
 )
 import deepspeed
 from datasets import load_dataset
+from accelerate.logging import get_logger
 
 sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
-from open_instruct.constants import PHI2_CHAT_TEMPLATE
+from open_instruct.constants import PHI2_CHAT_TEMPLATE, LLAMA_TULU_CHAT_TEMPLATE
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def get_hf_token() -> str:
@@ -433,6 +435,9 @@ def preprocess_data_to_chatml(args):
         elif dataset_name == "HuggingFaceH4/ultrafeedback_binarized":
             dataset_train = raw_data['train_prefs']
             dataset_test = raw_data['test_prefs']
+        elif dataset_name == "Magpie-Align/Magpie-Air-DPO-100K-v0.1":
+            dataset_train = raw_data['train']
+            dataset_test = raw_data['test']
         else:
             raise ValueError(f"Dataset {dataset_name} not supported yet.")
         chatml_datasets_train.append(dataset_train)
@@ -482,6 +487,8 @@ def target_lora_modules(model) -> List[str]:
     elif model.__class__.__name__ == "OLMoForCausalLM":
         return ["att_proj", "ff_proj", "attn_out", "ff_out"]
     elif model.__class__.__name__ == "MistralForCausalLM":
+        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    elif model.__class__.__name__ == "LlamaForCausalLM":
         return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     else:
         raise ValueError(f"Model type {type(model)} not added yet. Model:\n {model}")
@@ -610,6 +617,9 @@ def load_tokenizer_model(accelerator, args):
     # The SFTd Phi-2 model
     if tokenizer_name == 'lxuechen/phi-2-sft':
         tokenizer.chat_template = PHI2_CHAT_TEMPLATE
+    #
+    elif tokenizer_name == 'allenai/tulu-v1-llama2-7b':
+        tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
 
     generation_config = GenerationConfig(
         max_new_tokens=args.logging_examples_max_length,
@@ -628,6 +638,23 @@ def load_tokenizer_model(accelerator, args):
         embedding_size = embeddings.weight.shape[0]
         # padding to multiples creates a few "shadow" tokens that we don't want to be generated
         generation_config.suppress_tokens = list(range(len(tokenizer), embedding_size))
+
+    if args.use_lora:
+        logger.info("Initializing LORA model...")
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_lora_modules(model)
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+    elif args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    logger.info(str(model), main_process_only=True)
 
     generation_config_nucleus = deepcopy(generation_config)
     generation_config_nucleus.do_sample = True

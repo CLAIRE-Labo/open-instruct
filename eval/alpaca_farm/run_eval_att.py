@@ -26,6 +26,7 @@ logger = get_logger(__name__)
 
 
 def evaluate(accelerator, args):
+    # TODO in principle there's run_att_model_for_eval now in utils, but refactoring is delayed
     set_seed(239)
 
     train_args = load_args(args.train_run_args)

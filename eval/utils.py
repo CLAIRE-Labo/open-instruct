@@ -1,13 +1,23 @@
+import sys
 import torch
 import tqdm
 import json
 import time
 import asyncio
+from pathlib import Path
 import os
 from importlib import import_module
-from transformers import StoppingCriteria
+from transformers import StoppingCriteria, AutoTokenizer
 from eval.dispatch_openai_requests import dispatch_openai_chat_requesets, dispatch_openai_prompt_requesets
 import warnings
+
+sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
+from eval.chat import (
+    generate_responses_vllm,
+    generate_responses_vllm_att,
+    generate_response_att_lora,
+    generate_response,
+)
 
 
 class KeyWordsCriteria(StoppingCriteria):
@@ -491,3 +501,256 @@ def dynamic_import_function(function_path):
     module = import_module(module_path)
     function = getattr(module, function_name)
     return function
+
+
+def add_eval_args(parser):
+    parser.add_argument(
+        "train_run_args",
+        type=Path,
+        help="Path to the training run saved args.json. Allows us to faithfully load the model, tokenizer, and determine the type of ATT template to use.",
+    )
+    parser.add_argument(
+        "tuned_checkpoint",
+        type=Path,
+        help="LoRA adapter or a full fine-tuned model checkpoint.",
+    )
+
+    parser.add_argument(
+        "--is_lora",
+        action="store_true",
+        help="If set, we assume that the checkpoint is a LoRA adapter rather than a full model.",
+    )
+    parser.add_argument(
+        "--not_att",
+        action="store_true",
+        help="If set, we assume that the fine-tuned model is NOT an ATT model.",
+    )
+    parser.add_argument('--att_evaluate_base', action='store_true',
+                        help='If set, evaluation is also run on the base model. Like this we dont need to run the base eval separately.')
+    parser.add_argument(
+        "--hf_revision",
+        type=str,
+        default=None,
+        help="If specified, we will load the model from a revision of the model in the hub. If not specified, will use model_revision from train_args.",
+    )
+    parser.add_argument(
+        "--tokenizer_name_or_path",
+        type=str,
+        default=None,
+        help="If specified, we will load the tokenizer from here. If not specified, will use tokenizer_name from train_args.",
+    )
+    parser.add_argument(
+        "--use_slow_tokenizer",
+        action="store_true",
+        help="If given, we will use the slow tokenizer.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        default=None,
+        help="If given, we will save the outputs here.",
+    )
+
+    # sampling
+    parser.add_argument(
+        "--use_vllm",
+        action="store_true",
+        help="If given, we will use vLLM to generate the predictions - much faster.",
+    )
+    parser.add_argument(
+        "--greedy",
+        action="store_true",
+        help="If specified, we will use greedy decoding instead of sampling."
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=0.9,
+        help="The nucleus sampling parameter."
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.8,
+        help="The temperature for sampling."
+    )
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=512,
+        help="Maximum number of new tokens to generate."
+    )
+
+
+def run_att_model_for_eval(train_args, eval_args, chats):
+    import vllm
+
+    model_name_or_path = train_args.model_name_or_path
+    tokenizer_name_or_path = (
+        train_args.tokenizer_name if train_args.tokenizer_name else model_name_or_path
+    )
+    hf_revision = train_args.model_revision
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name_or_path,
+        revision=hf_revision,
+        use_fast=not train_args.use_slow_tokenizer,
+    )
+
+    if eval_args.use_vllm:
+        print("Loading vLLM model...")
+        mem_util = 0.9 if eval_args.is_lora else 0.4
+
+        # Load base model using parameters from train_args
+        base_model = vllm.LLM(
+            model=model_name_or_path,
+            revision=hf_revision,
+            tokenizer=tokenizer_name_or_path,
+            tokenizer_revision=hf_revision,
+            tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
+            trust_remote_code=True,
+            enable_lora=eval_args.is_lora,
+            disable_sliding_window=True,
+            gpu_memory_utilization=mem_util,
+        )
+
+        sampling_params = vllm.SamplingParams(
+            top_p=1.0 if eval_args.greedy else eval_args.top_p,
+            temperature=0.0 if eval_args.greedy else eval_args.temperature,
+            seed=239,
+            max_tokens=eval_args.max_new_tokens,
+        )
+
+        # Function to create ATT model if needed
+        def create_att_model():
+            return vllm.LLM(
+                model=eval_args.tuned_checkpoint.absolute().as_posix(),
+                revision=eval_args.hf_revision,
+                tokenizer=tokenizer_name_or_path,
+                tokenizer_revision=eval_args.hf_revision,
+                tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
+                trust_remote_code=True,
+                enable_lora=False,
+                disable_sliding_window=True,
+                gpu_memory_utilization=mem_util,
+            )
+
+        responses_log = []
+        # Generate outputs based on ATT and LoRA settings
+        if eval_args.not_att:
+            if eval_args.is_lora:
+                # Not ATT, using LoRA
+                lora_request = vllm.lora.request.LoRARequest(
+                    "adapter", 1, eval_args.tuned_checkpoint.absolute().as_posix()
+                )
+                # generate_responses_vllm returns formatted prompts and responses
+                formatted_prompts, outputs = generate_responses_vllm(
+                    base_model,
+                    tokenizer,
+                    chats,
+                    sampling_params,
+                    lora_request=lora_request,
+                )
+            else:
+                # Not ATT, not using LoRA
+                formatted_prompts, outputs = generate_responses_vllm(
+                    create_att_model(), tokenizer, chats, sampling_params
+                )
+            # Collect responses
+            for chat, prompt, output in zip(chats, formatted_prompts, outputs):
+                responses_log.append(
+                    {
+                        "instruction": chat[0]["content"],
+                        "generator": model_name_or_path,
+                        "prompt": prompt,
+                        "output": output,
+                    }
+                )
+        else:
+            if eval_args.is_lora:
+                # ATT, using LoRA
+                lora_request = vllm.lora.request.LoRARequest(
+                    "adapter", 1, eval_args.tuned_checkpoint.absolute().as_posix()
+                )
+                (
+                    prompts_base,
+                    responses_base,
+                    prompts_att,
+                    outputs,
+                ) = generate_responses_vllm_att(base_model, tokenizer, chats, sampling_params,
+                                                lora_request=lora_request, batch_size=30)
+            else:
+                # ATT, not using LoRA
+                (
+                    prompts_base,
+                    responses_base,
+                    prompts_att,
+                    outputs,
+                ) = generate_responses_vllm_att(base_model, tokenizer, chats, sampling_params,
+                                                create_att_model=create_att_model, batch_size=30)
+            # Collect responses
+            for chat, prompt_base, response_base, prompt_att, output in zip(
+                    chats, prompts_base, responses_base, prompts_att, outputs
+            ):
+                responses_log.append(
+                    {
+                        "instruction": chat[0]["content"],
+                        "generator": model_name_or_path + "+ATT",
+                        "input_base": prompt_base,
+                        "response_base": response_base,
+                        "att_prompt": prompt_att,
+                        "output": output,
+                    }
+                )
+
+        del base_model  # Free up GPU memory
+    else:
+        assert False, "Currently only supporting vLLM generations."
+        # If we need non-vLLM, need to debug and test this
+
+        assert args.is_lora, f"Full model evaluation is not supported yet."
+
+        base_model, tokenizer, actual_eos_token, _, _ = load_tokenizer_model(accelerator, train_args)
+        actual_eos_token_id = tokenizer.encode(actual_eos_token)[0]
+        base_model.load_adapter(str(args.tuned_checkpoint))
+        base_model = base_model.cuda()
+        base_model.eval()
+
+        print(base_model)
+
+        generation_config = GenerationConfig(
+            max_length=args.max_seq_length,
+            # Note that max_length in the config is overridden by max_new_tokens when model.generate is run. However, we use max_length to crop the prompts if necessary
+            max_new_tokens=args.max_new_tokens,
+            renormalize_logits=True,
+            pad_token_id=tokenizer.pad_token_id,
+            bos_token_id=tokenizer.bos_token_id,
+            eos_token_id=actual_eos_token_id,
+            stop_strings=tokenizer.eos_token,
+            do_sample=not args.greedy,
+            top_p=args.top_p,
+            temperature=args.temperature,
+        )
+        # filter instructions to only include those that are in prompts
+        for prompt in tqdm(prompts, desc="Generating responses"):
+            messages = [{"role": "user", "content": prompt}]
+            log_entry = {"instruction": prompt, "generator": model_name}
+            if not args.not_att:
+                input_base, response_base, att_prompt, att_response_with_special_tokens, att_response \
+                    = generate_response_att_lora(base_model, tokenizer, messages, generation_config)
+                log_entry["input_base"] = input_base
+                log_entry["response_base"] = response_base
+                log_entry["att_prompt"] = att_prompt
+                log_entry["response_with_special_tokens"] = att_response_with_special_tokens
+                log_entry["output"] = att_response
+            else:
+                template_prompt, response_with_special_tokens, response \
+                    = generate_response(base_model, tokenizer, messages, generation_config)
+                log_entry["template_prompt"] = template_prompt
+                log_entry["response_with_special_tokens"] = response_with_special_tokens
+                log_entry["output"] = response
+            responses_log.append(log_entry)
+            print(f"Prompt: {prompt} \nResponse: {log_entry['output']}")
+
+    return responses_log
+

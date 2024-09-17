@@ -42,7 +42,6 @@ from transformers import (
 )
 
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from load_utils import (add_common_training_args, pretty_print_chatml, preprocess_data_to_chatml, \
                         load_tokenizer_model, save_args, load_args)
 from att import apply_att_template
@@ -462,6 +461,7 @@ def main():
     # def get_cur_wandb_step():
     #     return accelerator.get_tracker("wandb").current_step
 
+    # TODO if we end up using phi2, look into the bug in the chat template we have for it
     def log_examples_to_wandb(step: int):
         def gen_examples(example, example_idx: int, gen_config: GenerationConfig) -> Tuple[Tuple[float, str, str, str]]:
             start_time = time.time()
