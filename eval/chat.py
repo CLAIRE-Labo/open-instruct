@@ -56,8 +56,10 @@ def generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_reque
             sampling_params=sampling_params,
             lora_request=lora_request,
         )
-
-    return prompts, [r.outputs[0].text for r in responses]
+    if len(responses[0].outputs) > 1:
+        return prompts, [[output.text for output in response.outputs] for response in responses]
+    else:
+        return prompts, [r.outputs[0].text for r in responses]
 
 
 def generate_responses_vllm_att(model, tokenizer, chats, sampling_params, lora_request=None, create_att_model=None,

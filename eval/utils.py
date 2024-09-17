@@ -596,7 +596,10 @@ def run_att_model_for_eval(train_args, eval_args, chats):
 
     if eval_args.use_vllm:
         print("Loading vLLM model...")
-        mem_util = 0.9 if eval_args.is_lora else 0.4
+        if hasattr(eval_args, "mem_util"):
+            mem_util = eval_args.mem_util
+        else:
+            mem_util = 0.9 if eval_args.is_lora else 0.4
 
         # Load base model using parameters from train_args
         base_model = vllm.LLM(
@@ -607,7 +610,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
             tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
             trust_remote_code=True,
             enable_lora=eval_args.is_lora,
-            disable_sliding_window=True,
+            disable_sliding_window=True if not hasattr(eval_args, "disable_sliding_window") else eval_args.disable_sliding_window,
             gpu_memory_utilization=mem_util,
         )
 
@@ -616,6 +619,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
             temperature=0.0 if eval_args.greedy else eval_args.temperature,
             seed=239,
             max_tokens=eval_args.max_new_tokens,
+            n=1 if not hasattr(eval_args, "n_sample_per_prompt") else eval_args.n_sample_per_prompt,
         )
 
         # Function to create ATT model if needed
@@ -634,7 +638,15 @@ def run_att_model_for_eval(train_args, eval_args, chats):
 
         responses_log = []
         # Generate outputs based on ATT and LoRA settings
-        if eval_args.not_att:
+        if hasattr(eval_args, "is_base_model") and eval_args.is_base_model:
+            formatted_prompts, outputs = generate_responses_vllm(
+                base_model,
+                tokenizer,
+                chats,
+                sampling_params,
+            )
+            return formatted_prompts, outputs
+        elif eval_args.not_att:
             if eval_args.is_lora:
                 # Not ATT, using LoRA
                 lora_request = vllm.lora.request.LoRARequest(
