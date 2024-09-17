@@ -7,9 +7,17 @@ import asyncio
 from pathlib import Path
 import os
 from importlib import import_module
-from transformers import StoppingCriteria, AutoTokenizer
-from eval.dispatch_openai_requests import dispatch_openai_chat_requesets, dispatch_openai_prompt_requesets
+from shutil import copyfile
 import warnings
+
+from transformers import StoppingCriteria, AutoTokenizer
+from safetensors import safe_open
+from safetensors.torch import save_file
+from eval.dispatch_openai_requests import dispatch_openai_chat_requesets, dispatch_openai_prompt_requesets
+from accelerate.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
 from eval.chat import (
@@ -526,8 +534,6 @@ def add_eval_args(parser):
         action="store_true",
         help="If set, we assume that the fine-tuned model is NOT an ATT model.",
     )
-    parser.add_argument('--att_evaluate_base', action='store_true',
-                        help='If set, evaluation is also run on the base model. Like this we dont need to run the base eval separately.')
     parser.add_argument(
         "--hf_revision",
         type=str,
@@ -544,12 +550,6 @@ def add_eval_args(parser):
         "--use_slow_tokenizer",
         action="store_true",
         help="If given, we will use the slow tokenizer.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=Path,
-        default=None,
-        help="If given, we will save the outputs here.",
     )
 
     # sampling
@@ -583,6 +583,45 @@ def add_eval_args(parser):
     )
 
 
+# vLLM unfortunately requires the checkpoints to be in a slightly different format compared to what HF provides.
+def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint):
+    tuned_checkpoint = Path(tuned_checkpoint)
+    reformatted_checkpoint = tuned_checkpoint.parent / f"{tuned_checkpoint.stem}_reformatted"
+    logger.info(f"Reformatted checkpoint path: {reformatted_checkpoint}")
+    if reformatted_checkpoint.exists():
+        logger.info("Reformatted checkpoint already exists. Skipping.")
+        return reformatted_checkpoint
+
+    logger.info("Reformatting checkpoint...")
+    reformatted_checkpoint.mkdir()
+    copyfile(tuned_checkpoint / "adapter_config.json", reformatted_checkpoint / "adapter_config.json")
+
+    all_tensors = {}
+    tensors_to_move = {}
+    tensors_remaining = {}
+
+    # Load the original tensors
+    with safe_open(tuned_checkpoint / "adapter_model.safetensors", framework="pt") as f:
+        for tensor_name in f.keys():
+            tensor = f.get_tensor(tensor_name)
+            all_tensors[tensor_name] = tensor
+
+            # Check if the tensor should be removed
+            if 'lm_head' in tensor_name or 'embed_tokens' in tensor_name:
+                tensors_to_move[tensor_name] = tensor
+            else:
+                tensors_remaining[tensor_name] = tensor
+
+    logger.info(f"Saving the following weights into the embedding file: {list(tensors_to_move.keys())}")
+
+    # Save the tensors without 'lm_head' and 'embeddings'
+    save_file(tensors_remaining, reformatted_checkpoint / "adapter_model.safetensors")
+    # Save the 'lm_head' and 'embeddings' tensors separately
+    save_file(tensors_to_move, reformatted_checkpoint / "new_embeddings.safetensors")
+
+    return reformatted_checkpoint
+
+
 def run_att_model_for_eval(train_args, eval_args, chats):
     import vllm
 
@@ -607,6 +646,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
             tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
             trust_remote_code=True,
             enable_lora=eval_args.is_lora,
+            max_lora_rank=128,
             disable_sliding_window=True,
             gpu_memory_utilization=mem_util,
         )
@@ -637,8 +677,9 @@ def run_att_model_for_eval(train_args, eval_args, chats):
         if eval_args.not_att:
             if eval_args.is_lora:
                 # Not ATT, using LoRA
+                reformatted_checkpoint = maybe_create_reformatted_lora_checkpoint(eval_args.tuned_checkpoint)
                 lora_request = vllm.lora.request.LoRARequest(
-                    "adapter", 1, eval_args.tuned_checkpoint.absolute().as_posix()
+                    "adapter", 1, reformatted_checkpoint.absolute().as_posix()
                 )
                 # generate_responses_vllm returns formatted prompts and responses
                 formatted_prompts, outputs = generate_responses_vllm(
@@ -666,8 +707,9 @@ def run_att_model_for_eval(train_args, eval_args, chats):
         else:
             if eval_args.is_lora:
                 # ATT, using LoRA
+                reformatted_checkpoint = maybe_create_reformatted_lora_checkpoint(eval_args.tuned_checkpoint)
                 lora_request = vllm.lora.request.LoRARequest(
-                    "adapter", 1, eval_args.tuned_checkpoint.absolute().as_posix()
+                    "adapter", 1, reformatted_checkpoint.absolute().as_posix()
                 )
                 (
                     prompts_base,
