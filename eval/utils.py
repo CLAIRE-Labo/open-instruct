@@ -658,20 +658,6 @@ def run_att_model_for_eval(train_args, eval_args, chats):
             max_tokens=eval_args.max_new_tokens,
         )
 
-        # Function to create ATT model if needed
-        def create_att_model():
-            return vllm.LLM(
-                model=eval_args.tuned_checkpoint.absolute().as_posix(),
-                revision=eval_args.hf_revision,
-                tokenizer=tokenizer_name_or_path,
-                tokenizer_revision=eval_args.hf_revision,
-                tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
-                trust_remote_code=True,
-                enable_lora=False,
-                disable_sliding_window=True,
-                gpu_memory_utilization=mem_util,
-            )
-
         responses_log = []
         # Generate outputs based on ATT and LoRA settings
         if eval_args.not_att:
@@ -691,8 +677,19 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                 )
             else:
                 # Not ATT, not using LoRA
+                tuned_model = vllm.LLM(
+                    model=eval_args.tuned_checkpoint.absolute().as_posix(),
+                    revision=eval_args.hf_revision,
+                    tokenizer=tokenizer_name_or_path,
+                    tokenizer_revision=eval_args.hf_revision,
+                    tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
+                    trust_remote_code=True,
+                    enable_lora=False,
+                    disable_sliding_window=True,
+                    gpu_memory_utilization=mem_util,
+                )
                 formatted_prompts, outputs = generate_responses_vllm(
-                    create_att_model(), tokenizer, chats, sampling_params
+                    tuned_model, tokenizer, chats, sampling_params
                 )
             # Collect responses
             for chat, prompt, output in zip(chats, formatted_prompts, outputs):
@@ -717,7 +714,9 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                     prompts_att,
                     outputs,
                 ) = generate_responses_vllm_att(base_model, tokenizer, chats, sampling_params,
-                                                lora_request=lora_request, batch_size=30)
+                                                lora_request=lora_request,
+                                                batch_size=30
+                )
             else:
                 # ATT, not using LoRA
                 (
@@ -726,7 +725,10 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                     prompts_att,
                     outputs,
                 ) = generate_responses_vllm_att(base_model, tokenizer, chats, sampling_params,
-                                                create_att_model=create_att_model, batch_size=30)
+                                                att_model_checkpoint=eval_args.tuned_checkpoint.absolute().as_posix(),
+                                                tokenizer_name=tokenizer_name_or_path,
+                                                batch_size=30
+                )
             # Collect responses
             for chat, prompt_base, response_base, prompt_att, output in zip(
                     chats, prompts_base, responses_base, prompts_att, outputs

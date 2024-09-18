@@ -30,7 +30,7 @@ def evaluate(accelerator, args):
     set_seed(239)
 
     train_args = load_args(args.train_run_args)
-    output_dir = args.tuned_checkpoint / "eval" / "alpaca_farm_80" if args.output_dir is None else args.output_dir
+    output_dir = args.tuned_checkpoint / "eval" / args.output_dir
     if output_dir.exists():
         logger.warning(f"Output directory {output_dir} already exists. Will see if the outputs are cached.")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -110,6 +110,7 @@ if __name__ == '__main__':
     parser.add_argument('--att_evaluate_base', action='store_true',
                         help='If set, evaluation is also run on the base model. Like this we dont need to run the base eval separately.')
     parser.add_argument('--output_dir', type=Path,
+                        default="alpaca_farm",
                         help='Output directory to save results. Default is into {tuned_checkpoint}/eval/alpaca_farm ')
     parser.add_argument(
         "--openai_engine",

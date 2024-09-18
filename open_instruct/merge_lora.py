@@ -1,12 +1,17 @@
+import sys
 import torch
 import argparse
 from peft import PeftConfig, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import bitsandbytes as bnb
 import os
+from pathlib import Path
 import copy
 from bitsandbytes.functional import dequantize_4bit
 from peft.utils import _get_submodules
+
+sys.path.append(Path(__file__).parents[1].absolute().as_posix())
+from open_instruct.load_utils import load_tokenizer_model
 
 
 def dequantize_model(model, dtype=torch.bfloat16, device="cuda"):
@@ -46,6 +51,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--lora_model_name_or_path", type=str, required=True)
     parser.add_argument("--base_model_name_or_path", type=str, required=False)
+    parser.add_argument("--train_args", type=str, required=False,
+                        help="If provided, the tokenizer, model, and lora configuration will be loaded with the same configuration as in training.")
     parser.add_argument("--tokenizer_name_or_path", type=str, required=False)
     parser.add_argument("--output_dir", type=str, required=False)
     parser.add_argument("--qlora", action="store_true")  # qlora requires special treatment.

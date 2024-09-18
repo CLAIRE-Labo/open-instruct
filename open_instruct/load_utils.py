@@ -548,7 +548,8 @@ def load_tokenizer(args, substitute_eos_token=False):
     return tokenizer, actual_eos_token
 
 
-def load_tokenizer_model(accelerator, args):
+# substitute_eos_token default value to not break existing code
+def load_tokenizer_model(accelerator, args, substitute_eos_token=True, load_lora=True):
     ######################################## Config and Tokenizer Loading ########################################
     def try_load_config() -> PretrainedConfig:
         # Load pretrained model and tokenizer
@@ -628,7 +629,7 @@ def load_tokenizer_model(accelerator, args):
         model = AutoModelForCausalLM.from_config(config)
 
     # Have to use a "fake" eos token that the model never generates as a hack to work around a bug in model.generate
-    tokenizer, actual_eos_token = load_tokenizer(args, substitute_eos_token=True)
+    tokenizer, actual_eos_token = load_tokenizer(args, substitute_eos_token=substitute_eos_token)
 
     generation_config = GenerationConfig(
         max_new_tokens=args.logging_examples_max_length,
@@ -648,7 +649,7 @@ def load_tokenizer_model(accelerator, args):
         # padding to multiples creates a few "shadow" tokens that we don't want to be generated
         generation_config.suppress_tokens = list(range(len(tokenizer), embedding_size))
 
-    if args.use_lora:
+    if load_lora and args.use_lora:
         logger.info("Initializing LORA model...")
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,

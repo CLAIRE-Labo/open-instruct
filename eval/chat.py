@@ -2,6 +2,9 @@ import sys
 import argparse
 from pathlib import Path
 from copy import deepcopy
+import subprocess
+from datetime import datetime
+import pickle
 
 from tqdm import trange, tqdm
 import torch
@@ -60,12 +63,13 @@ def generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_reque
     return prompts, [r.outputs[0].text for r in responses]
 
 
-def generate_responses_vllm_att(model, tokenizer, chats, sampling_params, lora_request=None, create_att_model=None,
-                                batch_size=None):
+def generate_responses_vllm_att(model, tokenizer, chats, sampling_params, lora_request=None, att_model_checkpoint=None,
+                                tokenizer_name=None, batch_size=None):
     if lora_request is not None:
-        assert create_att_model is None, "If the LoRA request is set, we assume that the ATT model is the LoRA adapter."
+        assert att_model_checkpoint is None, "If the LoRA request is set, we assume that the ATT model is the LoRA adapter."
     else:
-        assert create_att_model is not None, "If the LoRA request is not set, we need a separate ATT model."
+        assert att_model_checkpoint is not None, "If the LoRA request is not set, we need a separate ATT model."
+        assert tokenizer_name is not None, "If the LoRA request is not set, please provide the tokenizer_name."
 
     prompts_base, responses_base = generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_request=None,
                                                            batch_size=batch_size)
@@ -100,16 +104,40 @@ def generate_responses_vllm_att(model, tokenizer, chats, sampling_params, lora_r
                 sampling_params=sampling_params,
                 lora_request=lora_request,
             )
+        responses_att = [r.outputs[0].text for r in responses_att]
     else:
-        att_model = create_att_model()
-        for batch in tqdm(batches, desc="Generating responses ATT"):
-            responses_att += att_model.generate(
-                batch,
-                sampling_params=sampling_params,
-                use_tqdm=batch_size is None,
-            )
+        # Run the second instance of vLLM as a subprocess. vLLM does not support multiple instances in the same process.
+        vllm_script = (Path(__file__).parents[0] / "run_vllm.py").absolute().as_posix()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pickle_prompts = Path(f"prompts_{timestamp}.pkl").absolute().as_posix()
+        with open(pickle_prompts, "wb") as f:
+            pickle.dump(prompts_att, f)
+        pickle_sampling_params = Path(f"sampling_params_{timestamp}.pkl").absolute().as_posix()
+        with open(pickle_sampling_params, "wb") as f:
+            pickle.dump(sampling_params, f)
+        pickle_output = Path(f"output_{timestamp}.pkl").absolute().as_posix()
+        args = ["python", vllm_script, att_model_checkpoint, "--tokenizer_name", tokenizer_name, "--pickle_prompts",
+                pickle_prompts, "--pickle_sampling_params", pickle_sampling_params, "--pickle_output", pickle_output,
+                "--mem_util", "0.4", "--batch_size", "30"]
+        logger.info(f"Running: {' '.join(args)}")
+        subprocess.run(args, capture_output=True, check=True)
+        with open(pickle_output, "rb") as f:
+            responses_att = pickle.load(f)
 
-    return prompts_base, responses_base, prompts_att, [r.outputs[0].text for r in responses_att]
+        # remove the auxiliary files
+        Path(pickle_prompts).unlink()
+        Path(pickle_sampling_params).unlink()
+        Path(pickle_output).unlink()
+
+        # att_model = create_att_model()
+        # for batch in tqdm(batches, desc="Generating responses ATT"):
+        #     responses_att += att_model.generate(
+        #         batch,
+        #         sampling_params=sampling_params,
+        #         use_tqdm=batch_size is None,
+        #     )
+
+    return prompts_base, responses_base, prompts_att, responses_att
 
 
 def generate_response_att_lora(model, tokenizer, chat, generation_config):
