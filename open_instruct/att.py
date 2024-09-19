@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 
 sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
-from open_instruct.constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
+from open_instruct.constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE, ATT_RESPONSE_PREFIX
 from open_instruct.load_utils import pretty_print_chatml
 
 
@@ -55,32 +55,45 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
         messages = [system_msg] + messages
 
     try:
-        # TODO Skander check max token length of HH data
-        prompt_text = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True,
-                                                    tokenize=False)
+        tokens = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True)
     except Exception as e:
         if logger is not None:
             logger.error(f"Error in apply_chat_template when generating the prompt: {e}")
             logger.error("Messages:")
             logger.error(pretty_print_chatml(messages))
         raise e
+    end_idx = len(tokens)
+
+    prompt_text = tokenizer.decode(tokens, skip_special_tokens=False)
+
+    prompt_text += ATT_RESPONSE_PREFIX
 
     if debug_print and logger is not None:
         logger.info("The prompt:\n\"\"\"\n" + prompt_text + "\n\"\"\"")
-    tokens = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True)
-    end_idx = len(tokens)
 
+    chosen_msg = chosen[-1]
+    chosen_msg['content'] = ATT_RESPONSE_PREFIX + chosen_msg['content']
     messages.append(chosen[-1])
 
     try:
-        response_text = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=False,
-                                                      tokenize=False)
+        input_ids = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=False)
     except Exception as e:
         if logger is not None:
             logger.error(f"Error in apply_chat_template when generating the response message: {e}")
             logger.error("Messages:")
             logger.error(pretty_print_chatml(messages))
         raise e
+
+    assert input_ids[0] == tokenizer.bos_token_id, \
+        f"The first token should be the BOS token, got {tokenizer.decode(input_ids[:10], skip_special_tokens=False)}"
+    assert input_ids[1] != tokenizer.bos_token_id, \
+        f"Got duplicated BOS token: {tokenizer.decode(input_ids[:10], skip_special_tokens=False)}"
+    assert input_ids[-1] == tokenizer.eos_token_id, \
+        f"The last token should be the EOS token, got {tokenizer.decode(input_ids[-10:], skip_special_tokens=False)}"
+    assert input_ids[-2] != tokenizer.eos_token_id, \
+        f"Got duplicated EOS token: {tokenizer.decode(input_ids[-10:], skip_special_tokens=False)}"
+
+    response_text = tokenizer.decode(input_ids, skip_special_tokens=False)
 
     if prompt_text != response_text[:len(prompt_text)]:
         print(f"Prompt:\n\"\"\"\n{prompt_text}\n\"\"\"")
@@ -91,7 +104,6 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
     if debug_print and logger is not None:
         logger.info("Target response:\n\"\"\"\n" + expected_response_text + "\n\"\"\"")
 
-    input_ids = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=False)
     input_ids = torch.tensor([input_ids], dtype=torch.long)
     labels = input_ids.clone()
     labels[:, :end_idx] = -100

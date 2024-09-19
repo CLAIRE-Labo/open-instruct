@@ -534,9 +534,10 @@ def load_tokenizer(args, substitute_eos_token=False):
         )
 
     actual_eos_token = tokenizer.eos_token
-    tokenizer.add_special_tokens({'pad_token': '<pad>'})
-    if substitute_eos_token:
-        tokenizer.add_special_tokens({'eos_token': '<my_eos_token>'})
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '<pad>'})
+    # if substitute_eos_token:
+    #     tokenizer.add_special_tokens({'eos_token': '<my_eos_token>'})
 
     # The SFTd Phi-2 model
     if tokenizer_name == 'lxuechen/phi-2-sft':
@@ -544,6 +545,9 @@ def load_tokenizer(args, substitute_eos_token=False):
     # this also doesn't provide its own chat template, so we wrote it ourselves
     elif tokenizer_name == 'allenai/tulu-v1-llama2-7b':
         tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
+    else:
+        assert hasattr(tokenizer, 'chat_template'), \
+            f"Tokenizer {tokenizer_name} does not have a chat template and we don't provide one."
 
     return tokenizer, actual_eos_token
 

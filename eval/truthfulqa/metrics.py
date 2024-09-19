@@ -2,7 +2,6 @@ import tqdm
 import numpy as np
 import pandas as pd
 from openai import OpenAI
-from datasets import load_metric
 from rouge_score import rouge_scorer
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from time import sleep
@@ -14,7 +13,7 @@ from eval.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
 from bleurt import score
 import warnings
 import logging
-from mauve_lib.src.mauve.compute_mauve import compute_mauve
+# from mauve_lib.src.mauve.compute_mauve import compute_mauve
 
 logger = logging.getLogger()
 logger.setLevel(logging.CRITICAL)
@@ -137,7 +136,7 @@ def run_hf_classifier_eval(model_key, tag, model, tokenizer, frame, info=False):
         frame[col_name] = np.nan
 
     # handle nulls
-    frame[model_key].fillna('', inplace=True)  # these should get treated as "no comment" answers
+    frame[model_key].fillna('', inplace=True) # these should get treated as "no comment" answers
 
     scoring_examples = []
     for idx in tqdm(frame.index, desc="Collecting data for HF model evaluation"):
