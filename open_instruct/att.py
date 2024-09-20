@@ -62,11 +62,12 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
             logger.error("Messages:")
             logger.error(pretty_print_chatml(messages))
         raise e
-    end_idx = len(tokens)
 
     prompt_text = tokenizer.decode(tokens, skip_special_tokens=False)
 
     prompt_text += ATT_RESPONSE_PREFIX
+    prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
+    end_idx = len(prompt_tokens)
 
     if debug_print and logger is not None:
         logger.info("The prompt:\n\"\"\"\n" + prompt_text + "\n\"\"\"")
@@ -100,6 +101,11 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
     assert prompt_text == response_text[:len(prompt_text)], \
         f"Currently it is assumed that the prompt and response should be the same up to the end of the prompt," \
         f" got \"{prompt_text}\" and \"{response_text}\""
+    assert prompt_tokens == input_ids[:end_idx], \
+        f"The prompt tokens should be the same as the first end_idx tokens of the response, " \
+        f"got prompt ids\n{prompt_tokens}\nresponse ids\n{input_ids[:end_idx]}\n" \
+        f" prompt:\n{prompt_text}\"\nresponse\n\"{response_text}\""
+
     expected_response_text = response_text[len(prompt_text):]
     if debug_print and logger is not None:
         logger.info("Target response:\n\"\"\"\n" + expected_response_text + "\n\"\"\"")
