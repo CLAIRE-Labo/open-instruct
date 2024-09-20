@@ -42,7 +42,7 @@ def evaluate(accelerator, args):
     for example in alpaca_eval_data:
         prompt = example["instruction"]
         prompts.append(prompt)
-    prompts = prompts[:80]
+    # prompts = prompts[:80]
 
     chats = [[{"role": "user", "content": prompt}] for prompt in prompts]
 

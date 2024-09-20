@@ -116,7 +116,8 @@ def main(args):
     set_seed(239)
 
     train_args = load_args(args.train_run_args)
-    model_key = train_args.model_name_or_path + "+" + args.name_tag
+    model_key_tuned = train_args.model_name_or_path + "+" + args.name_tag
+    model_keys = [model_key_tuned]
 
     output_dir = args.tuned_checkpoint / "eval" / args.output_dir
     if output_dir.exists():
@@ -135,7 +136,10 @@ def main(args):
     # if args.model_name_or_path:
     #     print("Loading model and tokenizer...")
 
-    chats = [[{"role": "user", "content": q}] for q in questions["Question"]]
+    def prepare_question(prompt):
+        return prompt if args.not_ask_brevity else prompt + " Please answer in one sentence."
+
+    chats = [[{"role": "user", "content": prepare_question(q)}] for q in questions["Question"]]
 
     responses_log = []
     if responses_log_path.exists():
@@ -148,18 +152,23 @@ def main(args):
             json.dump(responses_log, f)
 
     # set the answers to response["output"]
-    questions[model_key] = [response["output"] for response in responses_log]
+    questions[model_key_tuned] = [response["output"] for response in responses_log]
+    if args.att_evaluate_base:
+        assert not args.not_att, "Cannot evaluate base model when not using ATT"
+        model_key_base = train_args.model_name_or_path
+        model_keys.append(model_key_base)
+        questions[model_key_base] = [response["response_base"] for response in responses_log]
 
     # run metrics
     print("Running metrics!")
     print(questions.columns)
-    for metric in args.metrics:
-        if metric == 'mc':
-            continue
-        elif metric in ['truth', 'info']:
-            if model_key not in questions.columns:
-                raise ValueError("Answers missing for {0}!".format(model_key))
-            try:
+    for model_key in model_keys:
+        for metric in args.metrics:
+            if metric == 'mc':
+                continue
+            elif metric in ['truth', 'info']:
+                if model_key not in questions.columns:
+                    raise ValueError("Answers missing for {0}!".format(model_key))
                 if metric == 'truth':
                     print("entered truth")
                     # questions=questions[0:3]
@@ -191,36 +200,34 @@ def main(args):
                         questions = run_hf_classifier_eval(model_key, 'info', info_classifier, info_tokenizer,
                                                            questions, info=True)
                     save_questions(questions, output_dir, "predictions.csv")
-            except Exception as err:
-                print(err)
-        elif metric in ['bleu', 'rouge', 'bleurt', 'mauve']:
-            try:
-                if metric == 'bleu':
-                    print("bleu started")
-                    questions = run_bleu(model_key, questions)
-                elif metric == 'rouge':
-                    print("rouge started")
-                    questions = run_rouge(model_key, questions)
-                elif metric == 'bleurt':
-                    print("bleurt started")
-                    checkpoint = "BLEURT-20"
-                    if bleurt_scorer == None:
-                        bleurt_scorer = score.BleurtScorer(checkpoint)
+            elif metric in ['bleu', 'rouge', 'bleurt', 'mauve']:
+                try:
+                    if metric == 'bleu':
+                        print("bleu started")
+                        questions = run_bleu(model_key, questions)
+                    elif metric == 'rouge':
+                        print("rouge started")
+                        questions = run_rouge(model_key, questions)
+                    elif metric == 'bleurt':
+                        print("bleurt started")
+                        checkpoint = "BLEURT-20"
+                        if bleurt_scorer == None:
+                            bleurt_scorer = score.BleurtScorer(checkpoint)
 
-                    questions = run_BLEURT(model_key, questions, bleurt_scorer)
-                elif metric == 'mauve':
-                    assert False, "Dropped support for now"
-                    print("mauve started")
-                    # questions = run_MAUVE(model_key, questions)
-                save_questions(questions, output_dir, "predictions.csv")
-            except Exception as err:
-                print(f"Error running {metric} metric: {err}")
-        else:
-            warnings.warn("Metric {0} not known, skipping!".format(metric), stacklevel=2)
-    print("columns: ", questions.columns)
-    if "truth" in args.metrics and "info" in args.metrics:
-        questions["{} truth-info acc".format(model_key)] = questions["{} truth acc".format(model_key)] * questions[
-            "{} info acc".format(model_key)]
+                        questions = run_BLEURT(model_key, questions, bleurt_scorer)
+                    elif metric == 'mauve':
+                        assert False, "Dropped support for now"
+                        print("mauve started")
+                        # questions = run_MAUVE(model_key, questions)
+                    save_questions(questions, output_dir, "predictions.csv")
+                except Exception as err:
+                    print(f"Error running {metric} metric: {err}")
+            else:
+                warnings.warn("Metric {0} not known, skipping!".format(metric), stacklevel=2)
+        print("columns: ", questions.columns)
+        if "truth" in args.metrics and "info" in args.metrics:
+            questions["{} truth-info acc".format(model_key)] = questions["{} truth acc".format(model_key)] * questions[
+                "{} info acc".format(model_key)]
 
     # save all
     save_questions(questions, output_dir, "predictions.csv")
@@ -283,6 +290,8 @@ def parse_args():
         type=int,
         help="The number of instances to subsample from the data."
     )
+    parser.add_argument('--not_ask_brevity', action='store_true',
+                        help='If set, we will not ask the model to reply in one sentence in the evaluation. This makes the results more "canonical", but ruins the ability of the judge to know whether the answer is correct, since the judge was fine-tuned on one-sentence responses.')
     parser.add_argument(
         '--metrics',
         nargs='+',

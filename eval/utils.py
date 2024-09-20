@@ -7,7 +7,7 @@ import asyncio
 from pathlib import Path
 import os
 from importlib import import_module
-from shutil import copyfile
+import shutil
 import warnings
 
 from transformers import StoppingCriteria, AutoTokenizer
@@ -583,6 +583,16 @@ def add_eval_args(parser):
     )
 
 
+def copy_all_files(src_dir, dest_dir):
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    src_dir = Path(src_dir)
+    for file_path in src_dir.iterdir():
+        if file_path.is_file():
+            shutil.copy(file_path, dest_dir / file_path.name)
+
+
 # vLLM unfortunately requires the checkpoints to be in a slightly different format compared to what HF provides.
 def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint):
     tuned_checkpoint = Path(tuned_checkpoint)
@@ -594,7 +604,7 @@ def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint):
 
     logger.info("Reformatting checkpoint...")
     reformatted_checkpoint.mkdir()
-    copyfile(tuned_checkpoint / "adapter_config.json", reformatted_checkpoint / "adapter_config.json")
+    shutil.copyfile(tuned_checkpoint / "adapter_config.json", reformatted_checkpoint / "adapter_config.json")
 
     all_tensors = {}
     tensors_to_move = {}
@@ -618,6 +628,11 @@ def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint):
     save_file(tensors_remaining, reformatted_checkpoint / "adapter_model.safetensors")
     # Save the 'lm_head' and 'embeddings' tensors separately
     save_file(tensors_to_move, reformatted_checkpoint / "new_embeddings.safetensors")
+
+    # Copy tokenizer if it exists
+    tokenizer_path = tuned_checkpoint.parent / "tokenizer"
+    if tokenizer_path.exists():
+        shutil.copytree(tokenizer_path, reformatted_checkpoint, dirs_exist_ok=True)
 
     return reformatted_checkpoint
 
