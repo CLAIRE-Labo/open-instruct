@@ -153,6 +153,83 @@ def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
 
     logger.info(f"Checkpointing done!", main_process_only=True)
 
+def setup_checkpointing(accelerator, args):
+    """accelerator can be a PartialState() object."""
+    run_id = get_run_id(args)
+    checkpointing_dir = Path(args.output_dir) / run_id
+    # If the output directory already exists, the process was interrupted and restarted by the cluster.
+    # We should resume from the last checkpoint.
+    if accelerator.is_main_process:
+        checkpointing_dir_exists = checkpointing_dir.exists()
+        if not checkpointing_dir_exists:
+            checkpointing_dir.mkdir(parents=True)
+        args_file = checkpointing_dir / "args.json"
+        if args_file.exists():
+            args_file = checkpointing_dir / f"args_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        save_args(args, args_file)
+    else:
+        checkpointing_dir_exists = None
+    # Letting other processes know what the main process found. We don't want to create the directory multiple times.
+    checkpointing_dir_actually_exists = broadcast_object_list([checkpointing_dir_exists], 0)
+    if checkpointing_dir_actually_exists[0]:
+        logger.info(f"Output directory {checkpointing_dir} already exists. Resuming training...")
+        if args.resume_from_checkpoint is None:
+            ckpt_dirs = [x for x in checkpointing_dir.iterdir() if
+                         x.stem.startswith("step_") or x.stem.startswith("epoch_")]
+            if len(ckpt_dirs) > 0:
+                last_checkpoint = max(ckpt_dirs, key=os.path.getctime)
+                args.resume_from_checkpoint = last_checkpoint
+    logger.info(f"\n\n\nSaving checkpoints to {checkpointing_dir}\n\n\n")
+    return checkpointing_dir
+
+def build_lr_scheduler(accelerator, args, optimizer, train_dataloader):
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
+    # Create the learning rate scheduler.
+    # Note: the current accelerator.step() calls the .step() of the real scheduler for the `num_processes` times. This is because they assume
+    # the user initialize the scheduler with the entire training set. In the case of data parallel training, each process only
+    # sees a subset (1/num_processes) of the training set. So each time the process needs to update the lr multiple times so that the total
+    # number of updates in the end matches the num_training_steps here.
+    # Here we need to set the num_training_steps to either using the entire training set (when epochs is specified) or we need to multiply the
+    # num_training_steps by num_processes so that the total number of updates matches the num_training_steps.
+    num_training_steps_for_scheduler = args.max_train_steps if overrode_max_train_steps else args.max_train_steps * accelerator.num_processes
+    lr_scheduler = get_scheduler(
+        name=args.lr_scheduler_type,
+        optimizer=optimizer,
+        num_training_steps=num_training_steps_for_scheduler,
+        num_warmup_steps=int(num_training_steps_for_scheduler * args.warmup_ratio),
+    )
+    return lr_scheduler, overrode_max_train_steps
+
+
+def build_optimizer(args, model):
+    # Split weights in two groups, one with weight decay and the other not.
+    no_decay = ["bias", "layer_norm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    if args.use_qlora:
+        from bitsandbytes.optim import AdamW
+        optimizer = AdamW(
+            optimizer_grouped_parameters,
+            lr=args.learning_rate,
+            optim_bits=8 if args.use_8bit_optimizer else 32,
+            is_paged=True
+        )
+    else:
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    return optimizer
+
 
 def main():
     parser = argparse.ArgumentParser(description="Finetune a transformers model using pairwise preference data.")
@@ -212,33 +289,7 @@ def main():
         = load_tokenizer_model(accelerator, args)
     tokenizer.eos_token = actual_eos_token
 
-    run_id = get_run_id(args)
-    checkpointing_dir = Path(args.output_dir) / run_id
-    # If the output directory already exists, the process was interrupted and restarted by the cluster.
-    # We should resume from the last checkpoint.
-
-    if accelerator.is_main_process:
-        checkpointing_dir_exists = checkpointing_dir.exists()
-        if not checkpointing_dir_exists:
-            checkpointing_dir.mkdir(parents=True)
-        args_file = checkpointing_dir / "args.json"
-        if args_file.exists():
-            args_file = checkpointing_dir / f"args_{time.strftime('%Y%m%d_%H%M%S')}.json"
-        save_args(args, args_file)
-    else:
-        checkpointing_dir_exists = None
-
-    # Letting other processes know what the main process found. We don't want to create the directory multiple times.
-    checkpointing_dir_actually_exists = broadcast_object_list([checkpointing_dir_exists], 0)
-    if checkpointing_dir_actually_exists[0]:
-        logger.info(f"Output directory {checkpointing_dir} already exists. Resuming training...")
-        if args.resume_from_checkpoint is None:
-            ckpt_dirs = [x for x in checkpointing_dir.iterdir() if
-                         x.stem.startswith("step_") or x.stem.startswith("epoch_")]
-            if len(ckpt_dirs) > 0:
-                last_checkpoint = max(ckpt_dirs, key=os.path.getctime)
-                args.resume_from_checkpoint = last_checkpoint
-    logger.info(f"\n\n\nSaving checkpoints to {checkpointing_dir}\n\n\n")
+    checkpointing_dir = setup_checkpointing(accelerator, args)
 
     ######################################## Data Preprocessing ########################################
     dataset_train, dataset_test = preprocess_data_to_chatml(args)
@@ -334,50 +385,10 @@ def main():
     test_dataloader = get_dataloader(test_dataset, args.per_device_train_batch_size)
 
     # Optimizer
-    # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "layer_norm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    if args.use_qlora:
-        from bitsandbytes.optim import AdamW
-        optimizer = AdamW(
-            optimizer_grouped_parameters,
-            lr=args.learning_rate,
-            optim_bits=8 if args.use_8bit_optimizer else 32,
-            is_paged=True
-        )
-    else:
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = build_optimizer(args, model)
 
     # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
-
-    # Create the learning rate scheduler.
-    # Note: the current accelerator.step() calls the .step() of the real scheduler for the `num_processes` times. This is because they assume
-    # the user initialize the scheduler with the entire training set. In the case of data parallel training, each process only
-    # sees a subset (1/num_processes) of the training set. So each time the process needs to update the lr multiple times so that the total
-    # number of updates in the end matches the num_training_steps here.
-    # Here we need to set the num_training_steps to either using the entire training set (when epochs is specified) or we need to multiply the
-    # num_training_steps by num_processes so that the total number of updates matches the num_training_steps.
-    num_training_steps_for_scheduler = args.max_train_steps if overrode_max_train_steps else args.max_train_steps * accelerator.num_processes
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_training_steps=num_training_steps_for_scheduler,
-        num_warmup_steps=int(num_training_steps_for_scheduler * args.warmup_ratio),
-    )
+    lr_scheduler, overrode_max_train_steps = build_lr_scheduler(accelerator, args, optimizer, train_dataloader)
 
     # Figure out how many steps we should save the Accelerator states
     checkpointing_steps = args.checkpointing_steps

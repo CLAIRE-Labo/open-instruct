@@ -428,6 +428,8 @@ def pretty_print_chatml(messages: List[Dict[str, str]]):
 def preprocess_data_to_chatml(args):
     chatml_datasets_train = []
     chatml_datasets_test = []
+    # TODO minor: shouldn't this be prepended with with accelerator.main_process_first():
+    # https://huggingface.co/docs/accelerate/v1.0.0rc1/en/concept_guides/deferring_execution#downloading-a-dataset
     for dataset_name in args.dataset_name:
         raw_data = load_dataset(dataset_name)
         if dataset_name == "Anthropic/hh-rlhf":
