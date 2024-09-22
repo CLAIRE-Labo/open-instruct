@@ -284,7 +284,6 @@ def main():
 
     accelerator.wait_for_everyone()
 
-    # load_tokenizer_model is a function that loads the model and tokenizer
     model, tokenizer, actual_eos_token, generation_config_nucleus, generation_config_greedy \
         = load_tokenizer_model(accelerator, args)
     tokenizer.eos_token = actual_eos_token
