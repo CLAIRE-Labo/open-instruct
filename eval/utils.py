@@ -522,6 +522,7 @@ def add_eval_args(parser):
         type=Path,
         help="LoRA adapter or a full fine-tuned model checkpoint.",
     )
+    parser.add_argument("--evaluated_name", required=True, type=str, help="The name of the model that will be saved.")
 
     parser.add_argument(
         '--cache_dir',
@@ -747,7 +748,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                 responses_log.append(
                     {
                         "instruction": chat[0]["content"],
-                        "generator": model_name_or_path,
+                        "generator": eval_args.evaluated_name,
                         "prompt": prompt,
                         "output": output,
                     }
@@ -788,7 +789,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                 responses_log.append(
                     {
                         "instruction": chat[0]["content"],
-                        "generator": model_name_or_path + "+ATT",
+                        "generator": eval_args.evaluated_name,
                         "input_base": prompt_base,
                         "response_base": response_base,
                         "att_prompt": prompt_att,

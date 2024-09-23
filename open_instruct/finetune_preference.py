@@ -44,7 +44,8 @@ from transformers import (
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 from load_utils import (add_common_training_args, pretty_print_chatml, preprocess_data_to_chatml, \
                         load_tokenizer_model, save_args, load_args)
-from att import apply_att_template
+from att import apply_att_template, add_att_args, neg_crossentropy, DataCollatorForATT, preprocess_for_symmetric_att, \
+    has_responses, compute_loss_att
 
 from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
 
@@ -78,7 +79,8 @@ if __name__ == "__main__":
 
 
 def get_run_id(args: Namespace) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f") if not os.getenv('RUN_TIMESTAMP') else os.getenv('RUN_TIMESTAMP')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f") if not os.getenv('RUN_TIMESTAMP') else os.getenv(
+        'RUN_TIMESTAMP')
     # try to get the git commit hash
     # try:
     #     git_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('utf-8').strip()
@@ -92,25 +94,6 @@ def get_run_id(args: Namespace) -> str:
     return f"{timestamp}"
     # return f"{timestamp}_{args_hash}"
     # return f"{timestamp}_{git_commit}_{args_hash}"
-
-
-def add_att_args(parser: argparse.ArgumentParser):
-    parser.add_argument(
-        '--reduce_loss',
-        default='mean',
-        choices=['mean', 'sum'],
-        help='How to reduce loss over tokens. Default is mean, but using sum can improve chat model performance.',
-    )
-    parser.add_argument(
-        "--remove_multiturn_data",
-        action="store_true",
-        help="If set, only \"prompt-response\" data is used and multi-turn dialogue data is filtered out.",
-    )
-    parser.add_argument(
-        "--use_new_token_template",
-        action="store_true",
-        help="If set, the new token template is used for ATT taning."
-    )
 
 
 def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
@@ -153,6 +136,7 @@ def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
 
     logger.info(f"Checkpointing done!", main_process_only=True)
 
+
 def setup_checkpointing(accelerator, args):
     """accelerator can be a PartialState() object."""
     run_id = get_run_id(args)
@@ -181,6 +165,7 @@ def setup_checkpointing(accelerator, args):
                 args.resume_from_checkpoint = last_checkpoint
     logger.info(f"\n\n\nSaving checkpoints to {checkpointing_dir}\n\n\n")
     return checkpointing_dir
+
 
 def build_lr_scheduler(accelerator, args, optimizer, train_dataloader):
     overrode_max_train_steps = False
@@ -292,6 +277,11 @@ def main():
 
     ######################################## Data Preprocessing ########################################
     dataset_train, dataset_test = preprocess_data_to_chatml(args)
+
+    # COMMENT OUT! This is for debugging
+    dataset_train = dataset_train.select(range(512))
+    dataset_test = dataset_test.select(range(512))
+
     for i in range(10):
         logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(dataset_train[i]['chosen'])}\n\n"
                     f"Example {i} rejected:\n{pretty_print_chatml(dataset_train[i]['rejected'])}\n\n")
@@ -303,7 +293,8 @@ def main():
     })
 
     encode_function = partial(
-        apply_att_template,
+        # apply_att_template,
+        preprocess_for_symmetric_att,
         tokenizer=tokenizer,
         max_seq_length=args.max_seq_length,
         logger=logger,
@@ -320,21 +311,21 @@ def main():
             desc="Tokenizing and reformatting instruction data",
         )
         lm_datasets.set_format(type="pt")
-        lm_datasets = lm_datasets.filter(lambda example: (example['labels'] != -100).any())
+        lm_datasets = lm_datasets.filter(has_responses)
 
     if accelerator.is_main_process:
-        lens = [x["input_ids"].shape[0] for x in lm_datasets["train"]]
-        len_response = [torch.sum(x["labels"] != -100) for x in lm_datasets["train"]]
-        logger.info(f"Avg length of example: {np.mean(lens):.1f} +/- {np.std(lens):.1f}")
-        logger.info(f"Avg length of response: {np.mean(len_response):.1f} +/- {np.std(len_response):.1f}")
+        lens_att = [x["yplus_att"]["input_ids"].shape[0] for x in lm_datasets["train"]]
+        len_response_att = [torch.sum(x["yplus_att"]["labels"] != -100) for x in lm_datasets["train"]]
+        lens_ref = [x["yplus_ref"]["input_ids"].shape[0] for x in lm_datasets["train"]]
+        len_response_ref = [torch.sum(x["yplus_ref"]["labels"] != -100) for x in lm_datasets["train"]]
+        logger.info(f"Avg length of example ATT: {np.mean(lens_att):.1f} +/- {np.std(lens_att):.1f}")
+        logger.info(f"Avg length of response ATT: {np.mean(len_response_att):.1f} +/- {np.std(len_response_att):.1f}")
+        logger.info(f"Avg length of example ref: {np.mean(lens_ref):.1f} +/- {np.std(lens_ref):.1f}")
+        logger.info(f"Avg length of response ref: {np.mean(len_response_ref):.1f} +/- {np.std(len_response_ref):.1f}")
     accelerator.wait_for_everyone()
 
     train_dataset = lm_datasets["train"]
     test_dataset = lm_datasets["test"]
-
-    # COMMENT OUT! This is for debugging epoch checkpointing
-    # train_dataset = train_dataset.select(range(192))
-    # test_dataset = test_dataset.select(range(192))
 
     # TODO check that nothing breaks if we don't add special tokens
     # We only use instruct models, so tokens should already be there
@@ -348,13 +339,14 @@ def main():
 
     train_examples = [train_dataset[i] for i in indices_train_ex]
     test_examples = [test_dataset[i] for i in indices_test_ex]
+
     # for index, ex in enumerate(train_examples):
     #     logger.info(f"Sample {index} of the training set: {ex}.")
 
     ######################################## Training Setup ########################################
     def put_big_to_front(dataset):
         logger.info("Putting the biggest examples to the front of the dataset to catch OOMs early.")
-        lens = [x["input_ids"].shape[0] for x in dataset]
+        lens = [x["yplus_att"]["input_ids"].shape[0] for x in dataset]
         order = list(sorted(range(len(lens)), key=lambda x: lens[x], reverse=True))
         if len(order) > 128:
             order = order[:128] + random.sample(order[128:], k=len(order[128:]))
@@ -376,7 +368,7 @@ def main():
         return DataLoader(
             dataset,
             shuffle=True,
-            collate_fn=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest"),
+            collate_fn=DataCollatorForATT(tokenizer=tokenizer, model=model, padding="longest"),
             batch_size=batch_size
         )
 
@@ -475,8 +467,9 @@ def main():
 
     # TODO if we end up using phi2, look into the bug in the chat template we have for it
     def log_examples_to_wandb(step: int):
-        def gen_examples(example, example_idx: int, gen_config: GenerationConfig) -> Tuple[Tuple[float, str, str, str]]:
+        def gen_examples(example_full, example_idx: int, gen_config: GenerationConfig) -> Tuple[Tuple[float, str, str, str]]:
             start_time = time.time()
+            example = example_full["yplus_att"]
             is_prompt = example["labels"] == -100
             is_response = ~is_prompt
             prompt_ids = example["input_ids"][is_prompt]
@@ -558,31 +551,6 @@ def main():
     print(f"{accelerator.sync_gradients=}", flush=True)
     accelerator.wait_for_everyone()
 
-    def compute_loss(batch, outputs):
-        if args.reduce_loss == 'mean':
-            loss = outputs.loss
-        else:
-            # reduce loss is sum
-            # this ensures that we weight all tokens in the dataset equally,
-            # rather than weighting each overall example equally when
-            # using high amounts of gradient accumulation.
-            # this can result in > 5 point improvements in AlpacaEval
-            # see https://github.com/huggingface/transformers/issues/24725 for
-            # more discussion and details.
-            logits = outputs.logits
-            labels = batch["labels"]
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
-            shift_logits = shift_logits.view(-1, embedding_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
-        return loss
-
     if accelerator.sync_gradients and not args.logging_examples_ignore_first:
         log_examples_to_wandb(completed_steps)
     for epoch in range(starting_epoch, args.num_train_epochs):
@@ -602,14 +570,15 @@ def main():
             active_dataloader = train_dataloader
         for step, batch in enumerate(active_dataloader):
             # Print the size of each component in the batch
-            batch_size = len(batch['input_ids'])  # Assuming 'input_ids' is the key for input data
+            batch_size = len(batch['yplus_att']['input_ids'])  # Assuming 'input_ids' is the key for input data
             epoch_data_count += batch_size
             with accelerator.accumulate(model):
-                # print(f"Memory allocated before forward pass: {memory_allocated() / 1e9} GB")
-                outputs = model(**batch, use_cache=False)
-                # print(f"Memory allocated after forward pass: {memory_allocated() / 1e9} GB")
-                loss = compute_loss(batch, outputs)
-                # We keep track of the loss at each logged step
+                loss, logs = compute_loss_att(accelerator, model, batch, args)
+                # loss = neg_crossentropy(outputs, batch['labels'], reduce_loss=args.reduce_loss)
+
+                # For adam this doesn't matter, but to sleep better we still do it
+                loss /= batch_size
+
                 total_loss += loss.detach().float()
                 accelerator.backward(loss)
                 # clip gradient norm. don't do this with deepspeed
@@ -627,7 +596,10 @@ def main():
                 completed_steps += 1
                 if args.logging_steps and completed_steps % args.logging_steps == 0:
                     avg_loss = accelerator.gather(
-                        total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_steps
+                        total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_step
+
+                    all_logs = accelerator.gather(logs)
+                    avg_logs = {"train/" + k: sum(log[k] for log in all_logs) / len(all_logs) for k in all_logs[0]}
                     # logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
                     # Print number of examples processed so far in this epoch
                     # print(f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
@@ -636,6 +608,7 @@ def main():
                             {
                                 "learning_rate": lr_scheduler.get_last_lr()[0],
                                 "train_loss": avg_loss,
+                                **avg_logs,
                             },
                         )
 
@@ -656,21 +629,21 @@ def main():
         model.eval()
         eval_pbar = tqdm(test_dataloader, desc="Evaluating", disable=not accelerator.is_local_main_process)
         total_loss = 0.0
+        total_yplus_ce = 0.0
         total_num_labels = 0
         for step, batch in enumerate(eval_pbar):
             if args.max_train_steps is not None and step >= args.max_train_steps:
                 break
             with torch.no_grad():
-                outputs = model(**batch, use_cache=False)
                 num_labels = batch["labels"].ne(-100).sum()
-                loss = compute_loss(batch, outputs)
+                loss, logs = compute_loss_att(accelerator, model, batch, args)
             batch_num_labels = accelerator.gather(num_labels.repeat(accelerator.num_processes)).sum().item()
             batch_loss = accelerator.gather(loss.repeat(accelerator.num_processes)).sum().item()
-            total_loss += batch_loss
+            total_loss += batch_losst
             total_num_labels += batch_num_labels
             eval_pbar.set_postfix({"loss": total_loss / total_num_labels})
 
-        logs = {"eval_loss": total_loss / total_num_labels, "eval_ppl": math.exp(total_loss / total_num_labels)}
+        logs = {"eval/loss": total_loss / total_num_labels, "eval_ppl": math.exp(total_loss / total_num_labels)}
         if args.with_tracking:
             accelerator.log(logs)
         model.train()

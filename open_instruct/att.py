@@ -1,17 +1,58 @@
 import sys
 from pathlib import Path
+import argparse
+from copy import deepcopy
 
 import torch
+from transformers import DataCollatorForSeq2Seq
 
 sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
 from open_instruct.constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE, ATT_RESPONSE_PREFIX
 from open_instruct.load_utils import pretty_print_chatml
 
 
+def add_att_args(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        '--reduce_loss',
+        default='mean',
+        choices=['mean', 'sum'],
+        help='How to reduce loss over tokens. Default is mean, but using sum can improve chat model performance.',
+    )
+    parser.add_argument(
+        "--remove_multiturn_data",
+        action="store_true",
+        help="If set, only \"prompt-response\" data is used and multi-turn dialogue data is filtered out.",
+    )
+    parser.add_argument(
+        "--use_new_token_template",
+        action="store_true",
+        help="If set, the new token template is used for ATT training."
+    )
+    parser.add_argument(
+        "--loss",
+        default="ce",
+        choices=["ce", "symmetric", "symmetric_dpo", "symmetric_hinge"],
+    )
 
-# OLMo chat template handles the BOS token, so we don't need to fiddle with add_bos.
-# See https://huggingface.co/allenai/OLMo-7B-Instruct/commit/f09de2dc46d1e848f19dd7161bd998973e2b1272
-def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, logger=None):
+    parser.add_argument(
+        '--neg_example_strength', type=float, default=1.0,
+        help='The strength of the negative examples when using variants of the symmetric loss.'
+    )
+    parser.add_argument(
+        '--hinge_delta', type=float, default=0.0,
+        help='Delta used in the symmetric_hinge loss.'
+    )
+
+
+# Parses nested dicts. Each inner dict will become an input to a model.
+class DataCollatorForATT(DataCollatorForSeq2Seq):
+    def __call__(self, features, return_tensors=None):
+        keys = features[0].keys()
+        return {k: super(DataCollatorForATT, self).__call__([f[k] for f in features], return_tensors=return_tensors)
+                for k in keys}
+
+
+def check_and_preprocess_chosen_rejected(example):
     chosen = example['chosen']
     rejected = example['rejected']
 
@@ -27,11 +68,38 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
         f"The last message in both chosen and rejected should be by the assistant, got {chosen[-1]['role']} and {rejected[-1]['role']}"
 
     if chosen[0]['role'] == 'system':
-        existing_system_prompt = "\n\n" + chosen[0]['content']
+        existing_system_prompt = chosen[0]['content']
         chosen = chosen[1:]
         rejected = rejected[1:]
     else:
         existing_system_prompt = ""
+
+    return chosen, rejected, existing_system_prompt
+
+
+def postprocess_input_ids(input_ids, end_idx, max_seq_length):
+    input_ids = torch.tensor([input_ids], dtype=torch.long)
+    labels = input_ids.clone()
+    labels[:, :end_idx] = -100
+    attention_mask = torch.ones_like(input_ids)
+
+    # We do this at a later stage
+    # input_ids = input_ids[:, :max_seq_length]
+    # labels = labels[:, :max_seq_length]
+    # attention_mask = attention_mask[:, :max_seq_length]
+
+    return {
+        'input_ids': input_ids.flatten(),
+        'labels': labels.flatten(),
+        'attention_mask': attention_mask.flatten(),
+    }
+
+
+# OLMo chat template handles the BOS token, so we don't need to fiddle with add_bos.
+# See https://huggingface.co/allenai/OLMo-7B-Instruct/commit/f09de2dc46d1e848f19dd7161bd998973e2b1272
+def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, logger=None):
+    example = deepcopy(example)
+    chosen, rejected, existing_system_prompt = check_and_preprocess_chosen_rejected(example)
 
     messages = chosen[:-2]
     messages.append({
@@ -51,7 +119,8 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
     if tokenizer.chat_template == BAD_MISTRAL_CHAT_TEMPLATE:
         messages[0]["content"] = ATT_SYSTEM_PROMPT + '\n\n' + messages[0]["content"]
     else:
-        system_msg = {'role': 'system', 'content': ATT_SYSTEM_PROMPT + existing_system_prompt}
+        system_prompt = ATT_SYSTEM_PROMPT + "\n\n" + existing_system_prompt if existing_system_prompt else ATT_SYSTEM_PROMPT
+        system_msg = {'role': 'system', 'content': system_prompt}
         messages = [system_msg] + messages
 
     try:
@@ -110,19 +179,179 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
     if debug_print and logger is not None:
         logger.info("Target response:\n\"\"\"\n" + expected_response_text + "\n\"\"\"")
 
-    input_ids = torch.tensor([input_ids], dtype=torch.long)
-    labels = input_ids.clone()
-    labels[:, :end_idx] = -100
-    attention_mask = torch.ones_like(input_ids)
+    return postprocess_input_ids(input_ids, end_idx, max_seq_length)
 
-    input_ids = input_ids[:, :max_seq_length]
-    labels = labels[:, :max_seq_length]
-    attention_mask = attention_mask[:, :max_seq_length]
+
+def encode_with_chat_template(chat, tokenizer, max_seq_length, debug_print=False, logger=None):
+    chat = deepcopy(chat)
+    try:
+        prompt_tokens = tokenizer.apply_chat_template(conversation=chat[:-1], add_generation_prompt=True)
+    except Exception as e:
+        if logger is not None:
+            logger.error(f"Error in apply_chat_template when generating the prompt: {e}")
+            logger.error("Messages:")
+            logger.error(pretty_print_chatml(chat[:-1]))
+        raise e
+
+    prompt_text = tokenizer.decode(prompt_tokens, skip_special_tokens=False)
+
+    input_ids = tokenizer.apply_chat_template(conversation=chat, add_generation_prompt=False)
+    response_text = tokenizer.decode(input_ids, skip_special_tokens=False)
+    assert prompt_text == response_text[:len(prompt_text)], \
+        f"Currently it is assumed that the prompt and response should be the same up to the end of the prompt," \
+        f" got \n\"\"\"\n{prompt_text}\n\"\"\"\nand\n\"\"\"\n{response_text}\n\"\"\"\n"
+
+    assert prompt_tokens == input_ids[:len(prompt_tokens)], \
+        f"The prompt tokens should be the same as the first end_idx tokens of the response, " \
+        f"got prompt ids\n{prompt_tokens}\nresponse ids\n{input_ids[:len(prompt_tokens)]}\n" \
+        f" prompt:\n\"\"\"\n{prompt_text}\n\"\"\"\nresponse\n\"\"\"\n{response_text}\n\"\"\"\n"
+
+    if debug_print and logger is not None:
+        expected_response_text = response_text[len(prompt_text):]
+        logger.info("The prompt (ref model):\n\"\"\"\n" + prompt_text + "\n\"\"\"")
+        logger.info("The response (ref model):\n\"\"\"\n" + expected_response_text + "\n\"\"\"")
+
+    return postprocess_input_ids(input_ids, len(prompt_tokens), max_seq_length)
+
+
+def crop(inputs, max_len):
+    inputs['input_ids'] = inputs['input_ids'][:max_len]
+    inputs['labels'] = inputs['labels'][:max_len]
+    inputs['attention_mask'] = inputs['attention_mask'][:max_len]
+    return inputs
+
+
+# We want to preserve the response length in yplus for the ATT model and for the reference model.
+# This function computes the response length (number of predicted tokens) after cropping
+def cropped_resp_len(labels, max_len):
+    len_prompt = (labels == -100).sum().item()
+    len_resp = (labels != -100).sum().item()
+    len_resp_cropped = max(0, min(len_resp, max_len - len_prompt))
+    return len_prompt, len_resp_cropped
+
+
+def crop_to_min(inputs1, inputs2, max_len):
+    len_prompt1, len_resp1 = cropped_resp_len(inputs1['labels'], max_len)
+    len_prompt2, len_resp2 = cropped_resp_len(inputs2['labels'], max_len)
+    min_len = min(len_resp1, len_resp2)
+    inputs1 = crop(inputs1, min(len_prompt1 + min_len, max_len))
+    inputs2 = crop(inputs2, min(len_prompt2 + min_len, max_len))
+    return inputs1, inputs2
+
+
+def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, debug_print=False, logger=None):
+    yplus_att = apply_att_template(example, tokenizer, max_seq_length, debug_print, logger)
+
+    backward_example = {
+        'chosen': example['rejected'],
+        'rejected': example['chosen'],
+    }
+    yminus_att = apply_att_template(backward_example, tokenizer, max_seq_length, debug_print, logger)
+
+    yplus_ref = encode_with_chat_template(example['chosen'], tokenizer, max_seq_length, debug_print, logger)
+    yminus_ref = encode_with_chat_template(example['rejected'], tokenizer, max_seq_length, debug_print, logger)
+
+    # This makes sure that the following conditions are met:
+    # 1. Total length of the prompt + response is <= max_seq_length for all four inputs
+    # 2. The response length is the same for the ATT and reference models on yplus (yplus_att and yplus_ref)
+    # 3. The response length is the same for the ATT and reference models on yminus (yminus_att and yminus_ref)
+    yplus_att, yplus_ref = crop_to_min(yplus_att, yplus_ref, max_seq_length)
+    yminus_att, yminus_ref = crop_to_min(yminus_att, yminus_ref, max_seq_length)
 
     return {
-        'input_ids': input_ids.flatten(),
-        'labels': labels.flatten(),
-        'attention_mask': attention_mask.flatten(),
+        "yplus_att": yplus_att,
+        "yminus_att": yminus_att,
+        "yplus_ref": yplus_ref,
+        "yminus_ref": yminus_ref,
     }
 
 
+def has_responses(processed_example):
+    return all([(e["labels"] != -100).any() for e in processed_example.values()])
+
+
+def neg_crossentropy(outputs, labels, reduce_loss='sum'):
+    if reduce_loss == 'mean':
+        loss = outputs.loss
+    elif reduce_loss == 'sum':
+        # reduce loss is sum
+        # this ensures that we weight all tokens in the dataset equally,
+        # rather than weighting each overall example equally when
+        # using high amounts of gradient accumulation.
+        # this can result in > 5 point improvements in AlpacaEval
+        # see https://github.com/huggingface/transformers/issues/24725 for
+        # more discussion and details.
+        logits = outputs.logits
+        # Shift so that tokens < n predict n
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
+        shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+        shift_labels = shift_labels.view(-1)
+        # Enable model parallelism
+        shift_labels = shift_labels.to(shift_logits.device)
+        loss = loss_fct(shift_logits, shift_labels)
+    else:
+        raise ValueError(f"Unknown reduce_loss value: {reduce_loss}")
+    return loss
+
+
+def compute_loss_att(accelerator, model, batch, args):
+    def log_neg_ce(value, labels, name):
+        num_predicted = (labels != -100).sum().item()
+        if args.reduce_loss == 'mean':
+            return {name + "_avg": value.item(), name + "_sum": value.item() * num_predicted}
+        elif args.reduce_loss == 'sum':
+            return {name + "_sum": value.item(), name + "_avg": value.item() / num_predicted}
+
+    logs = {}
+    yplus_outputs = model(**batch["yplus_att"])
+    yplus_neg_ce = neg_crossentropy(yplus_outputs, batch["yplus_att"]["labels"], args.reduce_loss)
+    logs = {**logs, **log_neg_ce(yplus_neg_ce, batch["yplus_att"]["labels"], "mlog_pi_t_yplus")}
+
+    if args.loss == "ce":
+        return yplus_neg_ce, logs
+
+    yminus_outputs = model(**batch["yminus_att"])
+    yminus_neg_ce = neg_crossentropy(yminus_outputs, batch["yminus_att"]["labels"], args.reduce_loss)
+    logs = {**logs, **log_neg_ce(yminus_neg_ce, batch["yminus_att"]["labels"], "mlog_pi_t_yminus")}
+
+    if args.loss == "symmetric":
+        # Loss1
+        diff = yplus_neg_ce - args.neg_example_strength * yminus_neg_ce
+        logs["log_pi_t_diff"] = diff.item()
+        return torch.softplus(-diff), logs
+    elif args.loss == "symmetric_hinge":
+        # Loss2
+        diff = yplus_neg_ce.detach() - yminus_neg_ce
+        logs["log_pi_t_diff"] = diff.item()
+        return yplus_neg_ce + args.neg_example_strength * torch.relu(args.hinge_delta - diff), logs
+    elif args.loss == "symmetric_dpo":
+        # assert isinstance(model, )
+        yplus_ref_outputs = None
+        yminus_ref_outputs = None
+        with torch.no_grad():
+            if args.use_lora:
+                with accelerator.unwrap_model(model).disable_adapter():
+                    yplus_ref_outputs = model(**batch["yplus_ref"])
+                    yminus_ref_outputs = model(**batch["yminus_ref"])
+            else:
+                assert False, "Not implemented"
+                # reference_chosen_logps, reference_rejected_logps = concatenated_forward(reference_model, batch)
+
+            yplus_ref_ce = neg_crossentropy(yplus_ref_outputs, batch["yplus_ref"]["labels"], args.reduce_loss)
+            logs = {**logs, **log_neg_ce(yplus_ref_ce, batch["yplus_ref"]["labels"], "mlog_pi_ref_yplus")}
+            yminus_ref_ce = neg_crossentropy(yminus_ref_outputs, batch["yminus_ref"]["labels"], args.reduce_loss)
+            logs = {**logs, **log_neg_ce(yminus_ref_ce, batch["yminus_ref"]["labels"], "mlog_pi_ref_yminus")}
+
+        diff = yplus_neg_ce - yplus_ref_ce \
+               - args.neg_example_strength * (yminus_neg_ce - yminus_ref_ce)
+        logs["log_pi_t_diff_dpo"] = diff.item()
+
+        return torch.softplus(-diff), logs
+    else:
+        raise ValueError(f"Unknown loss type: {args.loss}")
+
+# pos_inputs = {
+# outputs_pos =
