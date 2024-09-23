@@ -26,11 +26,14 @@ logger = get_logger(__name__)
 
 
 def evaluate(accelerator, args):
-    # TODO in principle there's run_att_model_for_eval now in utils, but refactoring is delayed
     set_seed(239)
 
     train_args = load_args(args.train_run_args)
-    output_dir = args.tuned_checkpoint / "eval" / args.output_dir
+    if args.cache_dir is not None:
+        rel_path = Path(*args.tuned_checkpoint.absolute().parts[1:])
+        output_dir = args.cache_dir / rel_path / "eval" / args.output_dir
+    else:
+        output_dir = args.tuned_checkpoint / "eval" / args.output_dir
     if output_dir.exists():
         logger.warning(f"Output directory {output_dir} already exists. Will see if the outputs are cached.")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -42,7 +45,9 @@ def evaluate(accelerator, args):
     for example in alpaca_eval_data:
         prompt = example["instruction"]
         prompts.append(prompt)
-    # prompts = prompts[:80]
+
+    if args.num_instances is not None:
+        prompts = prompts[:args.num_instances]
 
     chats = [[{"role": "user", "content": prompt}] for prompt in prompts]
 
@@ -107,6 +112,11 @@ if __name__ == '__main__':
 
     add_eval_args(parser)
 
+    parser.add_argument(
+        "--num_instances",
+        type=int,
+        help="The number of instances to subsample from the data."
+    )
     parser.add_argument('--att_evaluate_base', action='store_true',
                         help='If set, evaluation is also run on the base model. Like this we dont need to run the base eval separately.')
     parser.add_argument('--output_dir', type=Path,

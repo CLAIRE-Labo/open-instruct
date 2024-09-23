@@ -18,7 +18,6 @@ from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
 
-
 sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
 from eval.chat import (
     generate_responses_vllm,
@@ -525,6 +524,12 @@ def add_eval_args(parser):
     )
 
     parser.add_argument(
+        '--cache_dir',
+        type=Path,
+        help="Directory to cache eval results and reformatted checkpoints.",
+    )
+
+    parser.add_argument(
         "--is_lora",
         action="store_true",
         help="If set, we assume that the checkpoint is a LoRA adapter rather than a full model.",
@@ -557,6 +562,12 @@ def add_eval_args(parser):
         "--use_vllm",
         action="store_true",
         help="If given, we will use vLLM to generate the predictions - much faster.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Batch size for generating predictions with vLLM (working around a bug in vLLM, setting smaller batch size can help). If not set, the entire dataset will be processed in one batch,  will be done by vLLM."
     )
     parser.add_argument(
         "--greedy",
@@ -594,16 +605,20 @@ def copy_all_files(src_dir, dest_dir):
 
 
 # vLLM unfortunately requires the checkpoints to be in a slightly different format compared to what HF provides.
-def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint):
+def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint, cache_dir=None):
     tuned_checkpoint = Path(tuned_checkpoint)
-    reformatted_checkpoint = tuned_checkpoint.parent / f"{tuned_checkpoint.stem}_reformatted"
+    if cache_dir is None:
+        reformatted_checkpoint = tuned_checkpoint.parent / f"{tuned_checkpoint.stem}_reformatted"
+    else:
+        rel_path = Path(*tuned_checkpoint.parent.absolute().parts[1:])
+        reformatted_checkpoint = Path(cache_dir) / rel_path / f"{tuned_checkpoint.stem}_reformatted"
     logger.info(f"Reformatted checkpoint path: {reformatted_checkpoint}")
     if reformatted_checkpoint.exists():
         logger.info("Reformatted checkpoint already exists. Skipping.")
         return reformatted_checkpoint
 
     logger.info("Reformatting checkpoint...")
-    reformatted_checkpoint.mkdir()
+    reformatted_checkpoint.mkdir(parents=True)
     shutil.copyfile(tuned_checkpoint / "adapter_config.json", reformatted_checkpoint / "adapter_config.json")
 
     all_tensors = {}
@@ -633,6 +648,13 @@ def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint):
     tokenizer_path = tuned_checkpoint.parent / "tokenizer"
     if tokenizer_path.exists():
         shutil.copytree(tokenizer_path, reformatted_checkpoint, dirs_exist_ok=True)
+    else:
+        # Alternative layout of tokenizer files
+        tokenizer_files = ["tokenizer.model", "tokenizer.json", "tokenizer_config.json", "added_tokens.json",
+                           "special_tokens_map.json"]
+        if all([(tuned_checkpoint.parent / file).exists() for file in tokenizer_files]):
+            for file in tokenizer_files:
+                shutil.copy(tuned_checkpoint.parent / file, reformatted_checkpoint)
 
     return reformatted_checkpoint
 
@@ -655,7 +677,6 @@ def run_att_model_for_eval(train_args, eval_args, chats):
         else:
             mem_util = 0.9 if eval_args.is_lora else 0.4
 
-        # Load base model using parameters from train_args
         base_model = vllm.LLM(
             model=model_name_or_path,
             revision=hf_revision,
@@ -665,7 +686,8 @@ def run_att_model_for_eval(train_args, eval_args, chats):
             trust_remote_code=True,
             enable_lora=eval_args.is_lora,
             max_lora_rank=128,
-            disable_sliding_window=True if not hasattr(eval_args, "disable_sliding_window") else eval_args.disable_sliding_window,
+            disable_sliding_window=True if not hasattr(eval_args,
+                                                       "disable_sliding_window") else eval_args.disable_sliding_window,
             gpu_memory_utilization=mem_util,
         )
 
@@ -690,7 +712,8 @@ def run_att_model_for_eval(train_args, eval_args, chats):
         elif eval_args.not_att:
             if eval_args.is_lora:
                 # Not ATT, using LoRA
-                reformatted_checkpoint = maybe_create_reformatted_lora_checkpoint(eval_args.tuned_checkpoint)
+                reformatted_checkpoint = maybe_create_reformatted_lora_checkpoint(eval_args.tuned_checkpoint,
+                                                                                  cache_dir=eval_args.cache_dir)
                 lora_request = vllm.lora.request.LoRARequest(
                     "adapter", 1, reformatted_checkpoint.absolute().as_posix()
                 )
@@ -701,6 +724,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                     chats,
                     sampling_params,
                     lora_request=lora_request,
+                    batch_size=eval_args.batch_size
                 )
             else:
                 # Not ATT, not using LoRA
@@ -731,7 +755,8 @@ def run_att_model_for_eval(train_args, eval_args, chats):
         else:
             if eval_args.is_lora:
                 # ATT, using LoRA
-                reformatted_checkpoint = maybe_create_reformatted_lora_checkpoint(eval_args.tuned_checkpoint)
+                reformatted_checkpoint = maybe_create_reformatted_lora_checkpoint(eval_args.tuned_checkpoint,
+                                                                                  cache_dir=eval_args.cache_dir)
                 lora_request = vllm.lora.request.LoRARequest(
                     "adapter", 1, reformatted_checkpoint.absolute().as_posix()
                 )
@@ -742,8 +767,8 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                     outputs,
                 ) = generate_responses_vllm_att(base_model, tokenizer, chats, sampling_params,
                                                 lora_request=lora_request,
-                                                batch_size=30
-                )
+                                                batch_size=eval_args.batch_size
+                                                )
             else:
                 # ATT, not using LoRA
                 (
@@ -755,7 +780,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                                                 att_model_checkpoint=eval_args.tuned_checkpoint.absolute().as_posix(),
                                                 tokenizer_name=tokenizer_name_or_path,
                                                 batch_size=30
-                )
+                                                )
             # Collect responses
             for chat, prompt_base, response_base, prompt_att, output in zip(
                     chats, prompts_base, responses_base, prompts_att, outputs
@@ -821,4 +846,3 @@ def run_att_model_for_eval(train_args, eval_args, chats):
             print(f"Prompt: {prompt} \nResponse: {log_entry['output']}")
 
     return responses_log
-
