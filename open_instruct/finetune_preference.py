@@ -279,8 +279,8 @@ def main():
     dataset_train, dataset_test = preprocess_data_to_chatml(args)
 
     # COMMENT OUT! This is for debugging
-    dataset_train = dataset_train.select(range(512))
-    dataset_test = dataset_test.select(range(512))
+    # dataset_train = dataset_train.select(range(512))
+    # dataset_test = dataset_test.select(range(512))
 
     for i in range(10):
         logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(dataset_train[i]['chosen'])}\n\n"
@@ -595,10 +595,10 @@ def main():
                 progress_bar.update(1)
                 completed_steps += 1
                 if args.logging_steps and completed_steps % args.logging_steps == 0:
-                    avg_loss = accelerator.gather(
-                        total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_step
+                    gathered_loss = accelerator.gather(total_loss)
+                    avg_loss = gathered_loss.mean().item() / args.gradient_accumulation_steps / args.logging_steps
 
-                    all_logs = accelerator.gather(logs)
+                    all_logs = gather_object((logs,))
                     avg_logs = {"train/" + k: sum(log[k] for log in all_logs) / len(all_logs) for k in all_logs[0]}
                     # logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
                     # Print number of examples processed so far in this epoch
@@ -639,7 +639,7 @@ def main():
                 loss, logs = compute_loss_att(accelerator, model, batch, args)
             batch_num_labels = accelerator.gather(num_labels.repeat(accelerator.num_processes)).sum().item()
             batch_loss = accelerator.gather(loss.repeat(accelerator.num_processes)).sum().item()
-            total_loss += batch_losst
+            total_loss += batch_loss
             total_num_labels += batch_num_labels
             eval_pbar.set_postfix({"loss": total_loss / total_num_labels})
 

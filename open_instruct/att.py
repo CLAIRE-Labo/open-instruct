@@ -4,6 +4,7 @@ import argparse
 from copy import deepcopy
 
 import torch
+import torch.nn.functional as F
 from transformers import DataCollatorForSeq2Seq
 
 sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
@@ -321,7 +322,7 @@ def compute_loss_att(accelerator, model, batch, args):
         # Loss1
         diff = yplus_neg_ce - args.neg_example_strength * yminus_neg_ce
         logs["log_pi_t_diff"] = diff.item()
-        return torch.softplus(-diff), logs
+        return F.softplus(-diff), logs
     elif args.loss == "symmetric_hinge":
         # Loss2
         diff = yplus_neg_ce.detach() - yminus_neg_ce
@@ -349,7 +350,7 @@ def compute_loss_att(accelerator, model, batch, args):
                - args.neg_example_strength * (yminus_neg_ce - yminus_ref_ce)
         logs["log_pi_t_diff_dpo"] = diff.item()
 
-        return torch.softplus(-diff), logs
+        return F.softplus(-diff), logs
     else:
         raise ValueError(f"Unknown loss type: {args.loss}")
 
