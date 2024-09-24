@@ -492,6 +492,10 @@ def target_lora_modules(model) -> List[str]:
         return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     elif model.__class__.__name__ == "LlamaForCausalLM":
         return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    elif model.__class__.__name__ == "OPTForCausalLM":
+        return ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
+    elif model.__class__.__name__ == "GPTNeoXForCausalLM":
+        return ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
     else:
         raise ValueError(f"Model type {type(model)} not added yet. Model:\n {model}")
 
@@ -545,7 +549,7 @@ def load_tokenizer(args, substitute_eos_token=False):
     if tokenizer_name == 'lxuechen/phi-2-sft':
         tokenizer.chat_template = PHI2_CHAT_TEMPLATE
     # this also doesn't provide its own chat template, so we wrote it ourselves
-    elif tokenizer_name == 'allenai/tulu-v1-llama2-7b':
+    elif tokenizer_name in ['allenai/tulu-v1-llama2-7b', "allenai/open-instruct-opt-6.7b-tulu", "allenai/open-instruct-pythia-6.9b-tulu" ]:
         tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
     else:
         assert hasattr(tokenizer, 'chat_template'), \
