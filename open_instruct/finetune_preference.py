@@ -573,7 +573,7 @@ def main():
             batch_size = len(batch['yplus_att']['input_ids'])  # Assuming 'input_ids' is the key for input data
             epoch_data_count += batch_size
             with accelerator.accumulate(model):
-                loss, logs = compute_loss_att(accelerator, model, batch, args)
+                loss, logs = compute_loss_att(accelerator, model, batch, args, debug=False)
                 # loss = neg_crossentropy(outputs, batch['labels'], reduce_loss=args.reduce_loss)
 
                 # For adam this doesn't matter, but to sleep better we still do it
@@ -636,7 +636,8 @@ def main():
                 break
             with torch.no_grad():
                 num_labels = batch["labels"].ne(-100).sum()
-                loss, logs = compute_loss_att(accelerator, model, batch, args)
+                loss, logs = compute_loss_att(accelerator, model, batch, args, debug=False)
+                loss /= accelerator.num_processes
             batch_num_labels = accelerator.gather(num_labels.repeat(accelerator.num_processes)).sum().item()
             batch_loss = accelerator.gather(loss.repeat(accelerator.num_processes)).sum().item()
             total_loss += batch_loss

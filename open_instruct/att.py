@@ -35,6 +35,7 @@ def add_att_args(parser: argparse.ArgumentParser):
         choices=["ce", "symmetric", "symmetric_dpo", "symmetric_hinge"],
     )
 
+    parser.add_argument('--dpo_beta', type=float, default=0.1, help='Beta in the DPO loss.')
     parser.add_argument(
         '--neg_example_strength', type=float, default=1.0,
         help='The strength of the negative examples when using variants of the symmetric loss.'
@@ -53,7 +54,7 @@ class DataCollatorForATT(DataCollatorForSeq2Seq):
                 for k in keys}
 
 
-def check_and_preprocess_chosen_rejected(example):
+def _check_and_preprocess_chosen_rejected(example):
     chosen = example['chosen']
     rejected = example['rejected']
 
@@ -78,7 +79,7 @@ def check_and_preprocess_chosen_rejected(example):
     return chosen, rejected, existing_system_prompt
 
 
-def postprocess_input_ids(input_ids, end_idx, max_seq_length):
+def _postprocess_input_ids(input_ids, end_idx, max_seq_length):
     input_ids = torch.tensor([input_ids], dtype=torch.long)
     labels = input_ids.clone()
     labels[:, :end_idx] = -100
@@ -100,7 +101,7 @@ def postprocess_input_ids(input_ids, end_idx, max_seq_length):
 # See https://huggingface.co/allenai/OLMo-7B-Instruct/commit/f09de2dc46d1e848f19dd7161bd998973e2b1272
 def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, logger=None):
     example = deepcopy(example)
-    chosen, rejected, existing_system_prompt = check_and_preprocess_chosen_rejected(example)
+    chosen, rejected, existing_system_prompt = _check_and_preprocess_chosen_rejected(example)
 
     messages = chosen[:-2]
     messages.append({
@@ -180,7 +181,7 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
     if debug_print and logger is not None:
         logger.info("Target response:\n\"\"\"\n" + expected_response_text + "\n\"\"\"")
 
-    return postprocess_input_ids(input_ids, end_idx, max_seq_length)
+    return _postprocess_input_ids(input_ids, end_idx, max_seq_length)
 
 
 def encode_with_chat_template(chat, tokenizer, max_seq_length, debug_print=False, logger=None):
@@ -212,52 +213,59 @@ def encode_with_chat_template(chat, tokenizer, max_seq_length, debug_print=False
         logger.info("The prompt (ref model):\n\"\"\"\n" + prompt_text + "\n\"\"\"")
         logger.info("The response (ref model):\n\"\"\"\n" + expected_response_text + "\n\"\"\"")
 
-    return postprocess_input_ids(input_ids, len(prompt_tokens), max_seq_length)
+    return _postprocess_input_ids(input_ids, len(prompt_tokens), max_seq_length)
 
 
-def crop(inputs, max_len):
-    inputs['input_ids'] = inputs['input_ids'][:max_len]
-    inputs['labels'] = inputs['labels'][:max_len]
-    inputs['attention_mask'] = inputs['attention_mask'][:max_len]
-    return inputs
+# Cropping strategy for symmetric ATT:
+# 1. Do not crop the prompt. If it is too long, discard the example.
+# 2. The remaining context budget is max_seq_length - prompt_len - slack_len (slack_len is for the template tokens)
+# 2. If the examples don't fit, first try cropping yminus to 1/3 of the remaining budget.
+# 3. If the examples still don't fit, crop yplus until they do.
+def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, slack_len=70, debug_print=False,
+                                 logger=None):
+    example = deepcopy(example)
+    yplus_ref_orig = encode_with_chat_template(example['chosen'], tokenizer, max_seq_length, debug_print, logger)
+    yminus_ref_orig = encode_with_chat_template(example['rejected'], tokenizer, max_seq_length, debug_print, logger)
 
+    yplus_tokens = tokenizer.encode(example['chosen'][-1]['content'], add_special_tokens=False)
+    yminus_tokens = tokenizer.encode(example['rejected'][-1]['content'], add_special_tokens=False)
 
-# We want to preserve the response length in yplus for the ATT model and for the reference model.
-# This function computes the response length (number of predicted tokens) after cropping
-def cropped_resp_len(labels, max_len):
-    len_prompt = (labels == -100).sum().item()
-    len_resp = (labels != -100).sum().item()
-    len_resp_cropped = max(0, min(len_resp, max_len - len_prompt))
-    return len_prompt, len_resp_cropped
+    prompt_len = (yplus_ref_orig['labels'] == -100).sum().item()
+    yplus_len = len(yplus_tokens)
+    yminus_len = len(yminus_tokens)
 
+    if prompt_len >= max_seq_length:
+        return None
 
-def crop_to_min(inputs1, inputs2, max_len):
-    len_prompt1, len_resp1 = cropped_resp_len(inputs1['labels'], max_len)
-    len_prompt2, len_resp2 = cropped_resp_len(inputs2['labels'], max_len)
-    min_len = min(len_resp1, len_resp2)
-    inputs1 = crop(inputs1, min(len_prompt1 + min_len, max_len))
-    inputs2 = crop(inputs2, min(len_prompt2 + min_len, max_len))
-    return inputs1, inputs2
-
-
-def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, debug_print=False, logger=None):
-    yplus_att = apply_att_template(example, tokenizer, max_seq_length, debug_print, logger)
-
-    backward_example = {
-        'chosen': example['rejected'],
-        'rejected': example['chosen'],
-    }
-    yminus_att = apply_att_template(backward_example, tokenizer, max_seq_length, debug_print, logger)
+    remaining_budget = max_seq_length - prompt_len - slack_len
+    yminus_len_cropped = min(yminus_len, remaining_budget // 3)
+    if prompt_len + yminus_len + yplus_len + slack_len <= max_seq_length:
+        # No cropping needed
+        pass
+    elif prompt_len + yminus_len_cropped + yplus_len + slack_len <= max_seq_length:
+        # Only need to crop yminus
+        yminus_len_necessary = max_seq_length - prompt_len - yplus_len - slack_len
+        yminus_cropped_tok = yminus_tokens[:yminus_len_necessary]
+        example['rejected'][-1]['content'] = tokenizer.decode(yminus_cropped_tok, skip_special_tokens=False)
+    else:
+        # Crop both yminus and yplus
+        yminus_cropped_tok = yminus_tokens[:yminus_len_cropped]
+        example['rejected'][-1]['content'] = tokenizer.decode(yminus_cropped_tok, skip_special_tokens=False)
+        yplus_len_necessary = max_seq_length - prompt_len - yminus_len_cropped - slack_len
+        yplus_cropped_tok = yplus_tokens[:yplus_len_necessary]
+        example['chosen'][-1]['content'] = tokenizer.decode(yplus_cropped_tok, skip_special_tokens=False)
 
     yplus_ref = encode_with_chat_template(example['chosen'], tokenizer, max_seq_length, debug_print, logger)
     yminus_ref = encode_with_chat_template(example['rejected'], tokenizer, max_seq_length, debug_print, logger)
 
-    # This makes sure that the following conditions are met:
-    # 1. Total length of the prompt + response is <= max_seq_length for all four inputs
-    # 2. The response length is the same for the ATT and reference models on yplus (yplus_att and yplus_ref)
-    # 3. The response length is the same for the ATT and reference models on yminus (yminus_att and yminus_ref)
-    yplus_att, yplus_ref = crop_to_min(yplus_att, yplus_ref, max_seq_length)
-    yminus_att, yminus_ref = crop_to_min(yminus_att, yminus_ref, max_seq_length)
+    yplus_att = apply_att_template(example, tokenizer, max_seq_length, debug_print, logger)
+    yminus_att = apply_att_template({'chosen': example['rejected'], 'rejected': example['chosen']}, tokenizer,
+                                    max_seq_length, debug_print, logger)
+
+    assert yplus_att['input_ids'].shape[0] <= max_seq_length, f"yplus_att is too long: {yplus_att['input_ids'].shape[0]}"
+    assert yminus_att['input_ids'].shape[0] <= max_seq_length, f"yminus_att is too long: {yminus_att['input_ids'].shape[0]}"
+    assert yplus_ref['input_ids'].shape[0] <= max_seq_length, f"yplus_ref is too long: {yplus_ref['input_ids'].shape[0]}"
+    assert yminus_ref['input_ids'].shape[0] <= max_seq_length, f"yminus_ref is too long: {yminus_ref['input_ids'].shape[0]}"
 
     return {
         "yplus_att": yplus_att,
@@ -267,8 +275,60 @@ def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, debug_print
     }
 
 
+# Old cropping strategy for symmetric ATT
+# def _crop(inputs, max_len):
+#     inputs['input_ids'] = inputs['input_ids'][:max_len]
+#     inputs['labels'] = inputs['labels'][:max_len]
+#     inputs['attention_mask'] = inputs['attention_mask'][:max_len]
+#     return inputs
+#
+#
+# # We want to preserve the response length in yplus for the ATT model and for the reference model.
+# # This function computes the response length (number of predicted tokens) after cropping
+# def _cropped_resp_len(labels, max_len):
+#     len_prompt = (labels == -100).sum().item()
+#     len_resp = (labels != -100).sum().item()
+#     len_resp_cropped = max(0, min(len_resp, max_len - len_prompt))
+#     return len_prompt, len_resp_cropped
+#
+#
+# def _crop_to_min(inputs1, inputs2, max_len):
+#     len_prompt1, len_resp1 = _cropped_resp_len(inputs1['labels'], max_len)
+#     len_prompt2, len_resp2 = _cropped_resp_len(inputs2['labels'], max_len)
+#     min_len = min(len_resp1, len_resp2)
+#     inputs1 = _crop(inputs1, min(len_prompt1 + min_len, max_len))
+#     inputs2 = _crop(inputs2, min(len_prompt2 + min_len, max_len))
+#     return inputs1, inputs2
+
+# def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, debug_print=False, logger=None):
+#     yplus_att = apply_att_template(example, tokenizer, max_seq_length, debug_print, logger)
+#
+#     backward_example = {
+#         'chosen': example['rejected'],
+#         'rejected': example['chosen'],
+#     }
+#     yminus_att = apply_att_template(backward_example, tokenizer, max_seq_length, debug_print, logger)
+#
+#     yplus_ref = encode_with_chat_template(example['chosen'], tokenizer, max_seq_length, debug_print, logger)
+#     yminus_ref = encode_with_chat_template(example['rejected'], tokenizer, max_seq_length, debug_print, logger)
+#
+#     # This makes sure that the following conditions are met:
+#     # 1. Total length of the prompt + response is <= max_seq_length for all four inputs
+#     # 2. The response length is the same for the ATT and reference models on yplus (yplus_att and yplus_ref)
+#     # 3. The response length is the same for the ATT and reference models on yminus (yminus_att and yminus_ref)
+#     yplus_att, yplus_ref = _crop_to_min(yplus_att, yplus_ref, max_seq_length)
+#     yminus_att, yminus_ref = _crop_to_min(yminus_att, yminus_ref, max_seq_length)
+#
+#     return {
+#         "yplus_att": yplus_att,
+#         "yminus_att": yminus_att,
+#         "yplus_ref": yplus_ref,
+#         "yminus_ref": yminus_ref,
+#     }
+
+
 def has_responses(processed_example):
-    return all([(e["labels"] != -100).any() for e in processed_example.values()])
+    return processed_example is not None and all([(e["labels"] != -100).any() for e in processed_example.values()])
 
 
 def neg_crossentropy(outputs, labels, reduce_loss='sum'):
@@ -282,23 +342,28 @@ def neg_crossentropy(outputs, labels, reduce_loss='sum'):
         # this can result in > 5 point improvements in AlpacaEval
         # see https://github.com/huggingface/transformers/issues/24725 for
         # more discussion and details.
-        logits = outputs.logits
-        # Shift so that tokens < n predict n
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        # Flatten the tokens
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
-        shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-        shift_labels = shift_labels.view(-1)
-        # Enable model parallelism
-        shift_labels = shift_labels.to(shift_logits.device)
-        loss = loss_fct(shift_logits, shift_labels)
+        num_labels = (labels != -100).sum()
+        loss = outputs.loss * num_labels
+
+        # logits = outputs.logits
+        # # Shift so that tokens < n predict n
+        # shift_logits = logits[..., :-1, :].contiguous()
+        # shift_labels = labels[..., 1:].contiguous()
+        # # Flatten the tokens
+        # loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
+        # shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+        # shift_labels = shift_labels.view(-1)
+        # # Enable model parallelism
+        # shift_labels = shift_labels.to(shift_logits.device)
+        # loss = loss_fct(shift_logits, shift_labels)
+        # print(f"loss: {loss}, alt_loss: {alt_loss} rel_err = {(loss - alt_loss) / alt_loss}")
+
     else:
         raise ValueError(f"Unknown reduce_loss value: {reduce_loss}")
     return loss
 
 
-def compute_loss_att(accelerator, model, batch, args):
+def compute_loss_att(accelerator, model, batch, args, debug=False):
     def log_neg_ce(value, labels, name):
         num_predicted = (labels != -100).sum().item()
         if args.reduce_loss == 'mean':
@@ -334,6 +399,17 @@ def compute_loss_att(accelerator, model, batch, args):
         yminus_ref_outputs = None
         with torch.no_grad():
             if args.use_lora:
+                if debug:
+                    yplus_nodisable_outputs = model(**batch["yplus_ref"])
+                    yminus_nodisable_outputs = model(**batch["yminus_ref"])
+                    yplus_nodisable_ce = neg_crossentropy(yplus_nodisable_outputs, batch["yplus_ref"]["labels"],
+                                                          args.reduce_loss)
+                    yminus_nodisable_ce = neg_crossentropy(yminus_nodisable_outputs, batch["yminus_ref"]["labels"],
+                                                           args.reduce_loss)
+                    logs = {**logs,
+                            **log_neg_ce(yplus_nodisable_ce, batch["yplus_ref"]["labels"], "mlog_pi_yplus_nodisable")}
+                    logs = {**logs, **log_neg_ce(yminus_nodisable_ce, batch["yminus_ref"]["labels"],
+                                                 "mlog_pi_yminus_nodisable")}
                 with accelerator.unwrap_model(model).disable_adapter():
                     yplus_ref_outputs = model(**batch["yplus_ref"])
                     yminus_ref_outputs = model(**batch["yminus_ref"])
@@ -350,7 +426,7 @@ def compute_loss_att(accelerator, model, batch, args):
                - args.neg_example_strength * (yminus_neg_ce - yminus_ref_ce)
         logs["log_pi_t_diff_dpo"] = diff.item()
 
-        return F.softplus(-diff), logs
+        return F.softplus(-args.dpo_beta * diff), logs
     else:
         raise ValueError(f"Unknown loss type: {args.loss}")
 
