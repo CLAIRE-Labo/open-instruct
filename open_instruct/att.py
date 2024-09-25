@@ -2,10 +2,13 @@ import sys
 from pathlib import Path
 import argparse
 from copy import deepcopy
+import json
 
+from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from transformers import DataCollatorForSeq2Seq
+from datasets import Dataset
 
 sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
 from open_instruct.constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE, ATT_RESPONSE_PREFIX
@@ -25,6 +28,12 @@ def add_att_args(parser: argparse.ArgumentParser):
         help="If set, only \"prompt-response\" data is used and multi-turn dialogue data is filtered out.",
     )
     parser.add_argument(
+        "--base_generations_dir",
+        type=Path,
+        default=None,
+        help="If provided, these generations (produced by generate_vllm.py from the ATT repo) are used as y_ref. We extend the dataset, which originally contains triplets (x, y+, y-) to include also (x, y+, y_ref)."
+    )
+    parser.add_argument(
         "--use_new_token_template",
         action="store_true",
         help="If set, the new token template is used for ATT training."
@@ -36,6 +45,7 @@ def add_att_args(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument('--dpo_beta', type=float, default=0.1, help='Beta in the DPO loss.')
+    parser.add_argument('--loss_lambda', type=float, default=1.0, help='Lambda in the symmetric and hinge losses.')
     parser.add_argument(
         '--neg_example_strength', type=float, default=1.0,
         help='The strength of the negative examples when using variants of the symmetric loss.'
@@ -44,6 +54,28 @@ def add_att_args(parser: argparse.ArgumentParser):
         '--hinge_delta', type=float, default=0.0,
         help='Delta used in the symmetric_hinge loss.'
     )
+
+
+def load_base_generations(base_generations_dir: Path, existing_dataset: Dataset) -> Dataset:
+    with open(base_generations_dir / "prompts.json") as f:
+        prompts = json.load(f)
+    with open(base_generations_dir / "generations.json") as f:
+        responses = json.load(f)
+
+    assert len(prompts) == len(responses), f"Prompt length mismatch: {len(prompts)} vs {len(responses)}"
+    assert len(prompts) == len(existing_dataset), f"Dataset length mismatch: {len(prompts)} vs {len(existing_dataset)}"
+
+    new_dataset = []
+    for i, (prompt, response, example) in tqdm(enumerate(zip(prompts, responses, existing_dataset)),
+                                               desc="Generating self-improvement data", total=len(prompts)):
+        assert prompt == example['chosen'][:-1], f"Prompt mismatch at {i}" \
+                                                 f"\"\"\"\n{pretty_print_chatml(prompt)}\n\"\"\"\nvs\n\"\"\"\n{pretty_print_chatml(example['chosen'][:-1])}\n\"\"\""
+        new_example = deepcopy(example)
+        new_example['rejected'][-1]['content'] = response
+        new_dataset.append(new_example)
+
+    # convert to huggingface dataset format
+    return Dataset.from_list(new_dataset)
 
 
 # Parses nested dicts. Each inner dict will become an input to a model.
@@ -235,7 +267,19 @@ def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, slack_len=7
     yminus_len = len(yminus_tokens)
 
     if prompt_len >= max_seq_length:
-        return None
+        logger.warning(f"Prompt is too long: {prompt_len}")
+        dummy_input = {
+            'input_ids': torch.tensor([tokenizer.bos_token_id], dtype=torch.long),
+            'labels': torch.tensor([-100], dtype=torch.long),
+            'attention_mask': torch.tensor([1], dtype=torch.long),
+        }
+
+        return {
+            "yplus_att": dummy_input,
+            "yminus_att": dummy_input,
+            "yplus_ref": dummy_input,
+            "yminus_ref": dummy_input,
+        }
 
     remaining_budget = max_seq_length - prompt_len - slack_len
     yminus_len_cropped = min(yminus_len, remaining_budget // 3)
@@ -262,10 +306,14 @@ def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, slack_len=7
     yminus_att = apply_att_template({'chosen': example['rejected'], 'rejected': example['chosen']}, tokenizer,
                                     max_seq_length, debug_print, logger)
 
-    assert yplus_att['input_ids'].shape[0] <= max_seq_length, f"yplus_att is too long: {yplus_att['input_ids'].shape[0]}"
-    assert yminus_att['input_ids'].shape[0] <= max_seq_length, f"yminus_att is too long: {yminus_att['input_ids'].shape[0]}"
-    assert yplus_ref['input_ids'].shape[0] <= max_seq_length, f"yplus_ref is too long: {yplus_ref['input_ids'].shape[0]}"
-    assert yminus_ref['input_ids'].shape[0] <= max_seq_length, f"yminus_ref is too long: {yminus_ref['input_ids'].shape[0]}"
+    assert yplus_att['input_ids'].shape[
+               0] <= max_seq_length, f"yplus_att is too long: {yplus_att['input_ids'].shape[0]}"
+    assert yminus_att['input_ids'].shape[
+               0] <= max_seq_length, f"yminus_att is too long: {yminus_att['input_ids'].shape[0]}"
+    assert yplus_ref['input_ids'].shape[
+               0] <= max_seq_length, f"yplus_ref is too long: {yplus_ref['input_ids'].shape[0]}"
+    assert yminus_ref['input_ids'].shape[
+               0] <= max_seq_length, f"yminus_ref is too long: {yminus_ref['input_ids'].shape[0]}"
 
     return {
         "yplus_att": yplus_att,
@@ -387,14 +435,14 @@ def compute_loss_att(accelerator, model, batch, args, eval=False, debug=False):
 
     if args.loss == "symmetric":
         # Loss1
-        diff = yplus_neg_ce - args.neg_example_strength * yminus_neg_ce
+        diff = yplus_neg_ce.detach() - args.neg_example_strength * yminus_neg_ce
         logs["log_pi_t_diff"] = diff.item()
-        return F.softplus(-diff), logs
+        return yplus_neg_ce + args.loss_lambda * F.softplus(-diff), logs
     elif args.loss == "symmetric_hinge":
         # Loss2
-        diff = yplus_neg_ce.detach() - yminus_neg_ce
+        diff = yplus_neg_ce.detach() - args.neg_example_strength * yminus_neg_ce
         logs["log_pi_t_diff"] = diff.item()
-        return yplus_neg_ce + args.neg_example_strength * torch.relu(args.hinge_delta - diff), logs
+        return yplus_neg_ce + args.loss_lamba * torch.relu(args.hinge_delta - diff), logs
     elif args.loss == "symmetric_dpo":
         # assert isinstance(model, )
         yplus_ref_outputs = None
