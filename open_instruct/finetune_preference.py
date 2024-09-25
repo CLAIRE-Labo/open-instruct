@@ -279,8 +279,8 @@ def main():
     dataset_train, dataset_test = preprocess_data_to_chatml(args)
 
     # COMMENT OUT! This is for debugging
-    # dataset_train = dataset_train.select(range(512))
-    # dataset_test = dataset_test.select(range(512))
+    # dataset_train = dataset_train.select(range(24))
+    # dataset_test = dataset_test.select(range(24))
 
     for i in range(10):
         logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(dataset_train[i]['chosen'])}\n\n"
@@ -467,7 +467,8 @@ def main():
 
     # TODO if we end up using phi2, look into the bug in the chat template we have for it
     def log_examples_to_wandb(step: int):
-        def gen_examples(example_full, example_idx: int, gen_config: GenerationConfig) -> Tuple[Tuple[float, str, str, str]]:
+        def gen_examples(example_full, example_idx: int, gen_config: GenerationConfig) -> Tuple[
+            Tuple[float, str, str, str]]:
             start_time = time.time()
             example = example_full["yplus_att"]
             is_prompt = example["labels"] == -100
@@ -484,13 +485,14 @@ def main():
             prompt_text = tokenizer.decode(prompt_ids)
             expected_response_text = tokenizer.decode(expected_response_ids)
 
-            # unwrapped = accelerator.unwrap_model(model)
-            # outputs = unwrapped.generate(input_ids=prompt_ids.to(model.device)[None, :],
-            #                              generation_config=generation_config)
-
-            outputs = model.generate(input_ids=prompt_ids.to(model.device)[None, :],
-                                     generation_config=gen_config, tokenizer=tokenizer,
-                                     synced_gpus=True)
+            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                unwrapped = accelerator.unwrap_model(model)
+                outputs = unwrapped.generate(input_ids=prompt_ids.to(model.device)[None, :],
+                                             generation_config=gen_config, tokenizer=tokenizer)
+            elif isinstance(model, deepspeed.DeepSpeedEngine):
+                outputs = model.generate(input_ids=prompt_ids.to(model.device)[None, :],
+                                         generation_config=gen_config, tokenizer=tokenizer,
+                                         synced_gpus=True)
 
             response_text = tokenizer.decode(outputs[0])
             if response_text[:len(prompt_text)] != prompt_text:
@@ -573,7 +575,7 @@ def main():
             batch_size = len(batch['yplus_att']['input_ids'])  # Assuming 'input_ids' is the key for input data
             epoch_data_count += batch_size
             with accelerator.accumulate(model):
-                loss, logs = compute_loss_att(accelerator, model, batch, args, debug=False)
+                loss, logs = compute_loss_att(accelerator, model, batch, args, eval=False, debug=False)
                 # loss = neg_crossentropy(outputs, batch['labels'], reduce_loss=args.reduce_loss)
 
                 # For adam this doesn't matter, but to sleep better we still do it
@@ -626,25 +628,49 @@ def main():
 
         print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
 
+        accelerator.wait_for_everyone()
+        torch.cuda.empty_cache()
         model.eval()
         eval_pbar = tqdm(test_dataloader, desc="Evaluating", disable=not accelerator.is_local_main_process)
-        total_loss = 0.0
+        total_loss = torch.zeros((), device=accelerator.device, dtype=torch.bfloat16)
         total_yplus_ce = 0.0
-        total_num_labels = 0
+        num_labels_per_proc = torch.zeros((), device=accelerator.device, dtype=int)
+        total_sum_logs = None
+        step = 0
         for step, batch in enumerate(eval_pbar):
             if args.max_train_steps is not None and step >= args.max_train_steps:
                 break
-            with torch.no_grad():
-                num_labels = batch["labels"].ne(-100).sum()
-                loss, logs = compute_loss_att(accelerator, model, batch, args, debug=False)
-                loss /= accelerator.num_processes
-            batch_num_labels = accelerator.gather(num_labels.repeat(accelerator.num_processes)).sum().item()
-            batch_loss = accelerator.gather(loss.repeat(accelerator.num_processes)).sum().item()
-            total_loss += batch_loss
-            total_num_labels += batch_num_labels
-            eval_pbar.set_postfix({"loss": total_loss / total_num_labels})
 
-        logs = {"eval/loss": total_loss / total_num_labels, "eval_ppl": math.exp(total_loss / total_num_labels)}
+            # Encountered a random deepspeed bug, goes away if I don't add no_grad
+            # with (torch.no_grad()):
+            num_labels = batch["yplus_att"]["labels"].ne(-100).sum()
+            loss, logs = compute_loss_att(accelerator, model, batch, args, eval=True, debug=False)
+            loss /= accelerator.num_processes
+            all_logs = gather_object((logs,))
+            sum_logs = {k: sum(log[k] for log in all_logs) for k in all_logs[0]}
+            total_sum_logs = sum_logs if total_sum_logs is None \
+                else {k: (total_sum_logs[k] + sum_logs[k]) for k in sum_logs}
+            for proc_log in all_logs:
+                accelerator.log(proc_log)
+
+            batch_loss = accelerator.gather(loss).sum().item()
+            total_loss += batch_loss
+            num_labels_per_proc += num_labels
+            eval_pbar.set_postfix({"avg_loss": (total_loss / (step + 1)).item()})
+        # logs = {"eval/avg_loss": (total_loss / (step + 1)).item()}
+        logs = {}
+        all_num_labels = accelerator.gather(num_labels_per_proc)
+        total_num_labels = all_num_labels.sum().item()
+
+        logs["eval/avg_loss_per_label"] = (total_loss / total_num_labels).item()
+        logs["eval/avg_loss_per_entry"] = (total_loss / len(test_dataset)).item()
+        logs["eval/ppl"] = np.exp(total_sum_logs["mlog_pi_t_yplus_sum"] / total_num_labels)
+        logs["eval/total_num_labels"] = total_num_labels
+        logs["eval/total_num_entries"] = len(test_dataset)
+
+        logs = {**logs, **{f"eval/per_entry_{k}": total_sum_logs[k] / len(test_dataset) for k in total_sum_logs}}
+        logs = {**logs, **{f"eval/per_label_{k}": total_sum_logs[k] / total_num_labels for k in total_sum_logs}}
+
         if args.with_tracking:
             accelerator.log(logs)
         model.train()
@@ -652,8 +678,10 @@ def main():
         if args.checkpointing_steps == "epoch":
             output_dir = checkpointing_dir / f"epoch_{epoch}"
             save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
-            with open(output_dir / "logs.json", "w") as f:
-                json.dump(logs, f)
+            if accelerator.is_main_process:
+                print(logs)
+                with open(output_dir / "logs.json", "w") as f:
+                    json.dump(logs, f)
 
     output_dir = checkpointing_dir / "final"
     save_with_accelerate(accelerator, model, tokenizer, output_dir, args)

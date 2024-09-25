@@ -363,7 +363,7 @@ def neg_crossentropy(outputs, labels, reduce_loss='sum'):
     return loss
 
 
-def compute_loss_att(accelerator, model, batch, args, debug=False):
+def compute_loss_att(accelerator, model, batch, args, eval=False, debug=False):
     def log_neg_ce(value, labels, name):
         num_predicted = (labels != -100).sum().item()
         if args.reduce_loss == 'mean':
@@ -372,15 +372,17 @@ def compute_loss_att(accelerator, model, batch, args, debug=False):
             return {name + "_sum": value.item(), name + "_avg": value.item() / num_predicted}
 
     logs = {}
-    yplus_outputs = model(**batch["yplus_att"])
-    yplus_neg_ce = neg_crossentropy(yplus_outputs, batch["yplus_att"]["labels"], args.reduce_loss)
+    with torch.set_grad_enabled(not eval):
+        yplus_outputs = model(**batch["yplus_att"])
+        yplus_neg_ce = neg_crossentropy(yplus_outputs, batch["yplus_att"]["labels"], args.reduce_loss)
     logs = {**logs, **log_neg_ce(yplus_neg_ce, batch["yplus_att"]["labels"], "mlog_pi_t_yplus")}
 
     if args.loss == "ce":
         return yplus_neg_ce, logs
 
-    yminus_outputs = model(**batch["yminus_att"])
-    yminus_neg_ce = neg_crossentropy(yminus_outputs, batch["yminus_att"]["labels"], args.reduce_loss)
+    with torch.set_grad_enabled(not eval):
+        yminus_outputs = model(**batch["yminus_att"])
+        yminus_neg_ce = neg_crossentropy(yminus_outputs, batch["yminus_att"]["labels"], args.reduce_loss)
     logs = {**logs, **log_neg_ce(yminus_neg_ce, batch["yminus_att"]["labels"], "mlog_pi_t_yminus")}
 
     if args.loss == "symmetric":
