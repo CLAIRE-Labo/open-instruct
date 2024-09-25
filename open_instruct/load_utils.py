@@ -551,8 +551,12 @@ def load_tokenizer(args, substitute_eos_token=False):
     # this also doesn't provide its own chat template, so we wrote it ourselves
     elif tokenizer_name in ['allenai/tulu-v1-llama2-7b', "allenai/open-instruct-opt-6.7b-tulu", "allenai/open-instruct-pythia-6.9b-tulu" ]:
         tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
+    if "facebook/opt" in tokenizer_name:
+        tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
+    if "EleutherAI/pythia-410m" in tokenizer_name:
+        tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
     else:
-        assert hasattr(tokenizer, 'chat_template'), \
+        assert hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None, \
             f"Tokenizer {tokenizer_name} does not have a chat template and we don't provide one."
 
     return tokenizer, actual_eos_token
