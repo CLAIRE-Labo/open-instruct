@@ -442,7 +442,7 @@ def compute_loss_att(accelerator, model, batch, args, eval=False, debug=False):
         # Loss2
         diff = yplus_neg_ce.detach() - args.neg_example_strength * yminus_neg_ce
         logs["log_pi_t_diff"] = diff.item()
-        return yplus_neg_ce + args.loss_lamba * torch.relu(args.hinge_delta - diff), logs
+        return yplus_neg_ce + args.loss_lambda * torch.relu(args.hinge_delta - diff), logs
     elif args.loss == "symmetric_dpo":
         # assert isinstance(model, )
         yplus_ref_outputs = None
