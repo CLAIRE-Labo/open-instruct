@@ -647,7 +647,7 @@ def main():
         log_examples_to_wandb(completed_steps)"""
 
     torch.cuda.empty_cache()
-    checkpoint_path = ""
+    checkpoint_path = ""  #will be filled with the future checkpoints
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_loss = 0
@@ -724,7 +724,7 @@ def main():
                 pickle_prompts_path = Path(f"pickles/prompts_{timestamp}_gpu{gpu_id}.pkl").absolute().as_posix()
                 pickle_output_path = Path(f"pickles/output_{timestamp}_gpu{gpu_id}.pkl").absolute().as_posix()
                 pickle_sampling_params_path = Path(f"pickles/sampling_params_{timestamp}_gpu{gpu_id}.pkl").absolute().as_posix()
-
+                vllm_script = (Path(__file__).parents[0] / "run_vllm_student.py").absolute().as_posix()
                 # Serialize the prompts and sampling parameters into pickle files
                 with open(pickle_prompts_path, "wb") as f:
                     pickle.dump(gpu_sentences_matrix[gpu_id], f)
@@ -736,16 +736,16 @@ def main():
                 #todo get the results from subprocess - encode them and get the y+
                 #todo crop if needed cases
                 #calculate the losses
-                """  
+
                 p = subprocess.Popen(
-                    ["python", "run_vllm_student.py", "--model_name_or_path", args.model_name_or_path,
+                    ["python", vllm_script, "--model_name_or_path", args.model_name_or_path,
                      "--lora_model_name_or_path", checkpoint_path,
                      "--tokenizer_name", args.tokenizer_name,
                      "--pickle_prompts", pickle_prompts_path,
                      "--pickle_sampling_params", pickle_sampling_params_path,
-                     "--pickle_outputs",pickle_output_path,
+                     "--pickle_output",pickle_output_path,
                      #"--mem_util", str(getattr(sampling_params, "mem_util", 0.4)),
-                     "--batch_size", batch_size_per_gpu],
+                     "--batch_size", str(batch_size_per_gpu), "--trust_remote_code"],
                     env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)},
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE
@@ -755,20 +755,27 @@ def main():
 
                 # Wait for all processes to complete and gather their results
                 for p, gpu_id in processes:
-                    p.wait()  # Wait for the process to finish
+                    stdout, stderr=p.communicate()
+                    if p.returncode !=0:
+                        print(f"Subprocess for GPU {gpu_id} failed with return code {p.returncode}")
+                        print(f"error: {stderr.decode('utf-8')}")
+                        raise RuntimeError("subprocess failed")
+                    if stdout:
+                        print(f"subprocess for gpu {gpu_id} output:\n {stdout.decode('utf-8')}")
+                    #p.wait()  # Wait for the process to finish
 
-                    # Read the responses from the output pickle file
-                    with open(pickle_output_path, "rb") as f:
-                        responses[gpu_id] = pickle.load(f)
+                # Read the responses from the output pickle file
+                with open(pickle_output_path, "rb") as f:
+                    responses[gpu_id] = pickle.load(f)
 
-                    # Optionally, clean up the pickle files after processing
-                    Path(pickle_prompts_path).unlink()
-                    Path(pickle_sampling_params_path).unlink()
-                    Path(pickle_output_path).unlink()
+                Path(pickle_prompts_path).unlink()
+                Path(pickle_sampling_params_path).unlink()
+                Path(pickle_output_path).unlink()
 
                 # Store the responses
                 all_responses.extend(responses)
-
+                responses_log=None
+                #TODO - change the remaining
                 generated_tokens = responses_log["input_ids"][:, original_input_length:]
                 new_attention_mask = responses_log["attention_mask"][:, original_input_length:]
 
@@ -783,7 +790,7 @@ def main():
                     'input_ids': torch.cat([batch['teacher_input_ids'], generated_tokens], dim=1),
                     'attention_mask': torch.cat([batch['teacher_attention_mask'], new_attention_mask], dim=1)
                 }
-                """
+
             else:
                 original_input_length = batch["attention_mask"].sum(dim=1)
                 # Use original batch data for both student and teacher
