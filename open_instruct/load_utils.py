@@ -430,13 +430,14 @@ def pretty_print_chatml(messages: List[Dict[str, str]]):
     return chatml
 
 
-def preprocess_data_to_chatml(args):
+def preprocess_data_to_chatml(accelerator, args):
     chatml_datasets_train = []
     chatml_datasets_test = []
     # TODO minor: shouldn't this be prepended with with accelerator.main_process_first():
     # https://huggingface.co/docs/accelerate/v1.0.0rc1/en/concept_guides/deferring_execution#downloading-a-dataset
     for dataset_name in args.dataset_name:
-        raw_data = load_dataset(dataset_name)
+        with accelerator.main_process_first():
+            raw_data = load_dataset(dataset_name)
         if dataset_name == "Anthropic/hh-rlhf":
             dataset_train, dataset_test = preprocess_hh_common(raw_data, remove_multiturn_data=True)
         elif dataset_name == "HuggingFaceH4/ultrafeedback_binarized":
@@ -497,6 +498,10 @@ def target_lora_modules(model) -> List[str]:
         return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     elif model.__class__.__name__ == "LlamaForCausalLM":
         return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    elif model.__class__.__name__ == "OPTForCausalLM":
+        return ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
+    elif model.__class__.__name__ == "GPTNeoXForCausalLM":
+        return ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
     else:
         raise ValueError(f"Model type {type(model)} not added yet. Model:\n {model}")
 
@@ -550,10 +555,14 @@ def load_tokenizer(args, substitute_eos_token=False):
     if tokenizer_name == 'lxuechen/phi-2-sft':
         tokenizer.chat_template = PHI2_CHAT_TEMPLATE
     # this also doesn't provide its own chat template, so we wrote it ourselves
-    elif tokenizer_name == 'allenai/tulu-v1-llama2-7b':
+    elif tokenizer_name in ['allenai/tulu-v1-llama2-7b', "allenai/open-instruct-opt-6.7b-tulu", "allenai/open-instruct-pythia-6.9b-tulu" ]:
+        tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
+    if "facebook/opt" in tokenizer_name:
+        tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
+    if "EleutherAI/pythia-410m" in tokenizer_name:
         tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
     else:
-        assert hasattr(tokenizer, 'chat_template'), \
+        assert hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None, \
             f"Tokenizer {tokenizer_name} does not have a chat template and we don't provide one."
 
     return tokenizer, actual_eos_token
