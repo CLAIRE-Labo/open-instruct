@@ -433,8 +433,6 @@ def pretty_print_chatml(messages: List[Dict[str, str]]):
 def preprocess_data_to_chatml(accelerator, args):
     chatml_datasets_train = []
     chatml_datasets_test = []
-    # TODO minor: shouldn't this be prepended with with accelerator.main_process_first():
-    # https://huggingface.co/docs/accelerate/v1.0.0rc1/en/concept_guides/deferring_execution#downloading-a-dataset
     for dataset_name in args.dataset_name:
         with accelerator.main_process_first():
             raw_data = load_dataset(dataset_name)
@@ -592,107 +590,110 @@ def load_tokenizer_model(accelerator, args, substitute_eos_token=True, load_lora
                 "You are instantiating a new config instance from scratch. This is not supported by this script."
             )
 
-    try:
-        config = try_load_config()
-    except OSError as e:
-        print(f"Error loading config: {e}")
-        print("Assuming it was a login issue, logging into Huggingface...")
-
-        huggingface_hub.login(token=get_hf_token())
-        config = try_load_config()
-
-    ######################################## Model Loading ########################################
-    if args.model_name_or_path:
-        def try_load_model():
-            if args.use_qlora:
-                bnb_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=torch.bfloat16,
-                )
-                device_index = accelerator.local_process_index
-                device_map = {"": device_index}  # force data-parallel training.
-                return AutoModelForCausalLM.from_pretrained(
-                    args.model_name_or_path,
-                    from_tf=bool(".ckpt" in args.model_name_or_path),
-                    config=config,
-                    load_in_4bit=True,
-                    quantization_config=bnb_config,
-                    device_map=device_map,
-                    trust_remote_code=args.trust_remote_code,
-                    torch_dtype=torch.bfloat16,
-                    use_flash_attention_2=True if args.use_flash_attn else False,
-                    revision=args.model_revision,
-                    force_download=args.ignore_model_cache,
-                )
-            else:
-                return AutoModelForCausalLM.from_pretrained(
-                    args.model_name_or_path,
-                    from_tf=bool(".ckpt" in args.model_name_or_path),
-                    config=config,
-                    trust_remote_code=args.trust_remote_code,
-                    low_cpu_mem_usage=args.low_cpu_mem_usage,  #
-                    torch_dtype=torch.bfloat16,
-                    use_flash_attention_2=True if args.use_flash_attn else False,
-                    revision=args.model_revision,
-                    force_download=args.ignore_model_cache,
-                )
-
-        # Just a hack. Sometimes cache fails, and on the second time the model is loaded properly
+    with accelerator.main_process_first():
         try:
-            model = try_load_model()
-        except Exception as e:
-            model = try_load_model()
-    else:
-        logger.info("Training new model from scratch")
-        model = AutoModelForCausalLM.from_config(config)
+            config = try_load_config()
+        except OSError as e:
+            print(f"Error loading config: {e}")
+            print("Assuming it was a login issue, logging into Huggingface...")
 
-    # Have to use a "fake" eos token that the model never generates as a hack to work around a bug in model.generate
-    tokenizer, actual_eos_token = load_tokenizer(args, substitute_eos_token=substitute_eos_token)
+            huggingface_hub.login(token=get_hf_token())
+            config = try_load_config()
 
-    generation_config = GenerationConfig(
-        max_new_tokens=args.logging_examples_max_length,
-        renormalize_logits=True,
-        pad_token_id=tokenizer.pad_token_id,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        # stop_strings=tokenizer.eos_token,
-    )
-    embeddings = model.get_input_embeddings()
-    # padding will enable tensorcores, hopefully will make it faster
-    # https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#requirements-tc
-    with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
-        if len(tokenizer) > embeddings.weight.shape[0]:
-            model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=128)
-        embedding_size = embeddings.weight.shape[0]
-        # padding to multiples creates a few "shadow" tokens that we don't want to be generated
-        generation_config.suppress_tokens = list(range(len(tokenizer), embedding_size))
+        ######################################## Model Loading ########################################
+        if args.model_name_or_path:
+            def try_load_model():
+                if args.use_qlora:
+                    bnb_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=torch.bfloat16,
+                    )
+                    device_index = accelerator.local_process_index
+                    device_map = {"": device_index}  # force data-parallel training.
+                    return AutoModelForCausalLM.from_pretrained(
+                        args.model_name_or_path,
+                        from_tf=bool(".ckpt" in args.model_name_or_path),
+                        config=config,
+                        load_in_4bit=True,
+                        quantization_config=bnb_config,
+                        device_map=device_map,
+                        trust_remote_code=args.trust_remote_code,
+                        torch_dtype=torch.bfloat16,
+                        use_flash_attention_2=True if args.use_flash_attn else False,
+                        revision=args.model_revision,
+                        force_download=args.ignore_model_cache,
+                    )
+                else:
+                    return AutoModelForCausalLM.from_pretrained(
+                        args.model_name_or_path,
+                        from_tf=bool(".ckpt" in args.model_name_or_path),
+                        config=config,
+                        trust_remote_code=args.trust_remote_code,
+                        low_cpu_mem_usage=args.low_cpu_mem_usage,  #
+                        torch_dtype=torch.bfloat16,
+                        use_flash_attention_2=True if args.use_flash_attn else False,
+                        revision=args.model_revision,
+                        force_download=args.ignore_model_cache,
+                    )
 
-    if load_lora and args.use_lora:
-        logger.info("Initializing LORA model...")
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            inference_mode=False,
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=target_lora_modules(model)
+            # Just a hack. Sometimes cache fails, and on the second time the model is loaded properly
+            try:
+                model = try_load_model()
+            except Exception as e:
+                model = try_load_model()
+        else:
+            logger.info("Training new model from scratch")
+            model = AutoModelForCausalLM.from_config(config)
+
+        # Have to use a "fake" eos token that the model never generates as a hack to work around a bug in model.generate
+        tokenizer, actual_eos_token = load_tokenizer(args, substitute_eos_token=substitute_eos_token)
+
+        generation_config = GenerationConfig(
+            max_new_tokens=args.logging_examples_max_length,
+            renormalize_logits=True,
+            pad_token_id=tokenizer.pad_token_id,
+            bos_token_id=tokenizer.bos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            # stop_strings=tokenizer.eos_token,
         )
-        model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
-    elif args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        embeddings = model.get_input_embeddings()
+        # padding will enable tensorcores, hopefully will make it faster
+        # https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#requirements-tc
+        with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
+            if len(tokenizer) > embeddings.weight.shape[0]:
+                model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=128)
+            embedding_size = embeddings.weight.shape[0]
+            # padding to multiples creates a few "shadow" tokens that we don't want to be generated
+            generation_config.suppress_tokens = list(range(len(tokenizer), embedding_size))
 
-    logger.info(str(model), main_process_only=True)
+        if load_lora and args.use_lora:
+            logger.info("Initializing LORA model...")
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                inference_mode=False,
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=target_lora_modules(model)
+            )
+            model = get_peft_model(model, peft_config)
+            model.print_trainable_parameters()
+        elif args.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
 
-    generation_config_nucleus = deepcopy(generation_config)
-    generation_config_nucleus.do_sample = True
-    generation_config_nucleus.top_p = args.logging_examples_top_p
-    generation_config_nucleus.temperature = args.logging_examples_temp
+        logger.info(str(model), main_process_only=True)
 
-    generation_config_greedy = deepcopy(generation_config)
-    generation_config_greedy.do_sample = False
+        generation_config_nucleus = deepcopy(generation_config)
+        generation_config_nucleus.do_sample = True
+        generation_config_nucleus.top_p = args.logging_examples_top_p
+        generation_config_nucleus.temperature = args.logging_examples_temp
+
+        generation_config_greedy = deepcopy(generation_config)
+        generation_config_greedy.do_sample = False
+
+    accelerator.wait_for_everyone()
 
     return model, tokenizer, actual_eos_token, generation_config_nucleus, generation_config_greedy
 
