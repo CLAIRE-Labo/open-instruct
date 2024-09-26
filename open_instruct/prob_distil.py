@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # coding=utf-8
 import copy
 import os
@@ -21,7 +20,8 @@ from datetime import timedelta
 import torch
 from functools import partial
 import subprocess
-
+import numpy as np
+from dill.pointers import parents
 from torch.cuda import memory_allocated
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -33,6 +33,7 @@ from tqdm.auto import tqdm
 import deepspeed
 import wandb
 import huggingface_hub
+from accelerate.utils import DeepSpeedPlugin
 
 import transformers
 from transformers import (
@@ -50,17 +51,19 @@ from transformers import (
     OPTForCausalLM,
     BitsAndBytesConfig,
 )
-
+import torch.nn.functional as F
+import torch.multiprocessing as mp
+import pickle
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-from utils import add_common_training_args, pretty_print_chatml, preprocess_hh_common, load_tokenizer_model
-from att import apply_att_template
+from peft import PeftConfig, PeftModel, LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from att import apply_att_template, encode_with_chat_template, DataCollatorForATT, has_responses
 
+from eval.utils import maybe_create_reformatted_lora_checkpoint
 from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
-from eval.utils import KeyWordsCriteria
-
-
+from load_utils import (add_common_training_args, pretty_print_chatml, preprocess_data_to_chatml, \
+                        load_tokenizer_model, save_args, load_args, preprocess_hh_common, target_lora_modules)
+from datetime import datetime
 # from eval.truthfulqa.run_eval import main as run_eval
 # from eval.truthfulqa.run_eval import parse_args as parse_args_eval
 
@@ -89,79 +92,60 @@ if api_key_file:
 else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
-@torch.no_grad()
-def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequences=None, add_special_tokens=True,
-                         disable_tqdm=False, generation_storage=None, **generation_kwargs):
-    """Generate text completions with optimizations for GPU usage and batched JSON writing."""
-    # Ensure the model is on the correct device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def convert_batches_to_sentences(tokenizer, small_batches):
+    all_sentences = []
+    all_input_ids_length = []  
 
-    generations = []
-    num_return_sequences = generation_kwargs.get("num_return_sequences", 1)
-    all_json_entries = []
+    for batch in small_batches:
+        input_ids_batch = batch["input_ids"]
+        attention_mask_batch = batch["attention_mask"]
 
-    # Using tqdm for progress tracking
-    progress_bar = tqdm(range(0, len(prompts), batch_size), disable=disable_tqdm, desc="Generating batches")
+        # Loop through each example in the batch
+        for input_ids in input_ids_batch:
+            # Decode the input_ids to a sentence (skip special tokens like padding)
+            sentence = tokenizer.decode(input_ids, skip_special_tokens=True)
+            all_sentences.append(sentence)
+            all_input_ids_length.append(len(input_ids))  # Append the length of the input_ids
+    
+    return all_sentences, all_input_ids_length   
 
-    for i in progress_bar:
-        batch_prompts = prompts[i:i + batch_size]
+def generalized_jsd_loss(
+        student_logits, teacher_logits, labels=None, beta=0.5, temperature=1.0, reduction="batchmean"
+):
+    # Apply temperature scaling
+    student_logits = student_logits / temperature
+    teacher_logits = teacher_logits / temperature
 
-        # Tokenize and move to GPU
-        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt",
-                                      add_special_tokens=add_special_tokens)
-        batch_input_ids = tokenized_prompts.input_ids.to(device)
-        attention_mask = tokenized_prompts.attention_mask.to(device)
+    # Log probabilities
+    student_log_probs = F.log_softmax(student_logits, dim=-1)
+    teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
 
-        batch_outputs = model.generate(
-            input_ids=batch_input_ids,
-            attention_mask=attention_mask,
-            eos_token_id=tokenizer.eos_token_id,
-            stopping_criteria=[KeyWordsCriteria(stop_id_sequences)] if stop_id_sequences else None,
-            **generation_kwargs
-        )
+    # Interpolated log probabilities
+    interpolated_log_probs = beta * student_log_probs + (1 - beta) * teacher_log_probs
 
-        if stop_id_sequences:
-            for output_idx in range(batch_outputs.shape[0]):
-                for token_idx in range(batch_input_ids.shape[1], batch_outputs.shape[1]):
-                    if any(batch_outputs[output_idx,
-                           token_idx: token_idx + len(stop_sequence)].tolist() == stop_sequence for stop_sequence in
-                           stop_id_sequences):
-                        batch_outputs[output_idx, token_idx:] = tokenizer.pad_token_id
-                        break
+    # KL divergence
+    kl_teacher = F.kl_div(interpolated_log_probs, teacher_log_probs, reduction="none", log_target=True)
+    kl_student = F.kl_div(interpolated_log_probs, student_log_probs, reduction="none", log_target=True)
 
-        batch_outputs = tokenizer.batch_decode(batch_outputs, skip_special_tokens=True)
-        batch_prompts = tokenizer.batch_decode(batch_input_ids, skip_special_tokens=True)
-        batch_prompts = [prompt for prompt in batch_prompts for _ in range(num_return_sequences)]
-        batch_generations = [
-            output[len(prompt):] for prompt, output in zip(batch_prompts, batch_outputs)
-        ]
-        generations += batch_generations
+    # Generalized JSD
+    jsd = beta * kl_teacher + (1 - beta) * kl_student
 
-        # Store results for JSON writing
-        json_entry = {
-            "batch_index": i // batch_size,
-            "batch_prompts": batch_prompts,
-            "batch_generations": batch_generations
-        }
-        all_json_entries.append(json_entry)
+    # Mask out padding tokens
+    if labels is not None:
+        mask = labels != -100
+        jsd = jsd[mask]
 
-        # Write to JSON every 100 batches
-        if len(all_json_entries) >= 100:
-            with open(generation_storage, 'a') as f:
-                for entry in all_json_entries:
-                    f.write(json.dumps(entry) + "\n")
-            all_json_entries.clear()  # Clear the list after writing
+    # Apply reduction
+    if reduction == "batchmean":
+        return jsd.sum() / mask.sum() if labels is not None else jsd.sum() / (jsd.size(0) * jsd.size(1))
+    elif reduction == "sum":
+        return jsd.sum()
+    elif reduction == "mean":
+        return jsd.mean()
+    else:
+        return jsd
 
-    # Write any remaining entries in all_json_entries to the file
-    if all_json_entries:
-        with open(generation_storage, 'a') as f:
-            for entry in all_json_entries:
-                f.write(json.dumps(entry) + "\n")
 
-    assert len(generations) == len(
-        prompts) * num_return_sequences, "number of generations should be equal to number of prompts * num_return_sequences"
-
-    return generations
 
 def get_run_id(args: Namespace) -> str:
     timestamp = time.strftime("%Y%m%d_%H%M%S") if not os.getenv('RUN_TIMESTAMP') else os.getenv('RUN_TIMESTAMP')
@@ -195,31 +179,30 @@ def add_distill_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--use_new_token_template",
         action="store_true",
-        help="If set, the new token template is used for ATT taning."
+        help="If set, the new token template is used for ATT traning."
+    )
+    parser.add_argument("--teacher_lora_model_name_or_path", type=str, help="Teacher model path")
+    parser.add_argument(
+        "--train_args",
+        type=str,
+        help="The tokenizer, model and lora config will be loaded with the same config as in training",
+        required=True,
+    )
+    ## this script will directly take the path of generated rejected answers
+    parser.add_argument(
+        "--generation_storage", type=str, default="data_sft.json", help="A json file will store the generated data.",
+        required=True
     )
     parser.add_argument(
-        "--teacher_tokenizer_name",
-        type=str,
-        help="tokenizer name for the teacher",
-        required=False,
+        "--deepspeed_config_file", type=str, help="the path of deepspeed config file"
     )
     parser.add_argument(
-        "--generated_data_path",
-        type=str,
-        help="collected/generated data from the base sft model for its use in teacher model",
-        required=False,
+        "--lambda_value", type=int, default=1, required=False
+    )
+    parser.add_argument(
+        "--max_new_tokens", type=int, default=2048, required=False
     )
 
-    parser.add_argument(
-        "--teacher_model_name_or_path",
-        type=str,
-        help="Path to teacher finetuned model ",
-        required=False,
-    )
-
-    parser.add_argument(
-        "--generation_storage", type=str, default="data_sft.json", help="A json file will store the generated data."
-    )
 
 def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
     logger.info(f"Saving model and tokenizer to {output_dir}", main_process_only=True)
@@ -262,7 +245,92 @@ def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
     logger.info(f"Checkpointing done!", main_process_only=True)
 
 
+def build_optimizer(args, model):
+    # Split weights in two groups, one with weight decay and the other not.
+    no_decay = ["bias", "layer_norm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    if args.use_qlora:
+        from bitsandbytes.optim import AdamW
+        optimizer = AdamW(
+            optimizer_grouped_parameters,
+            lr=args.learning_rate,
+            optim_bits=8 if args.use_8bit_optimizer else 32,
+            is_paged=True
+        )
+    else:
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    return optimizer
+
+
+def build_lr_scheduler(accelerator, args, optimizer, train_dataloader):
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
+    # Create the learning rate scheduler.
+    # Note: the current accelerator.step() calls the .step() of the real scheduler for the `num_processes` times. This is because they assume
+    # the user initialize the scheduler with the entire training set. In the case of data parallel training, each process only
+    # sees a subset (1/num_processes) of the training set. So each time the process needs to update the lr multiple times so that the total
+    # number of updates in the end matches the num_training_steps here.
+    # Here we need to set the num_training_steps to either using the entire training set (when epochs is specified) or we need to multiply the
+    # num_training_steps by num_processes so that the total number of updates matches the num_training_steps.
+    num_training_steps_for_scheduler = args.max_train_steps if overrode_max_train_steps else args.max_train_steps * accelerator.num_processes
+    lr_scheduler = get_scheduler(
+        name=args.lr_scheduler_type,
+        optimizer=optimizer,
+        num_training_steps=num_training_steps_for_scheduler,
+        num_warmup_steps=int(num_training_steps_for_scheduler * args.warmup_ratio),
+    )
+    return lr_scheduler, overrode_max_train_steps
+
+
+def apply_formatting_and_encoding(example, tokenizer, max_seq_length, debug_print=False, logger=None):
+    def empty_assistant_chosen(messages):
+        for msg in messages:
+            if msg["role"] == "assistant":
+                msg["content"] = ""
+        return messages
+
+    example["chosen"] = empty_assistant_chosen(example["chosen"])
+    teacher_encoded = apply_att_template(example, tokenizer, max_seq_length, debug_print, logger)
+    input_ids = teacher_encoded['input_ids']
+    labels = teacher_encoded['labels']
+    prompt_ids = input_ids[labels == -100]
+    teacher_encoded["input_ids"] = prompt_ids
+
+    # prompt_text = tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=False)
+    # print(f"Teacher Prompt: \n\n{prompt_text}\n\n")
+
+    student_encoded = encode_with_chat_template(example["chosen"], tokenizer, max_seq_length, debug_print, logger)
+
+    input_ids = student_encoded['input_ids']
+    labels = student_encoded['labels']
+    prompt_ids = input_ids[labels == -100]
+    student_encoded["input_ids"] = prompt_ids
+    if len(prompt_ids) > max_seq_length + 30:  # 30 is assumed to be the extra token amount.
+        logger.warning(f"Skipping student data: input size  {len(prompt_ids)} exceeds {max_seq_length}")
+        return None
+    # prompt_text = tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=False)
+    # print(f"Student Prompt: \n\n{prompt_text}\n\n")
+
+    return {
+        'teacher_encoded': teacher_encoded,
+        'student_encoded': student_encoded,
+    }
+
+
 def main():
+    mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser(description="Finetune a transformers model using pairwise preference data.")
     add_common_training_args(parser)
     add_distill_args(parser)
@@ -282,27 +350,19 @@ def main():
         accelerator_log_kwargs["log_with"] = args.report_to
         accelerator_log_kwargs["project_dir"] = args.output_dir
 
-    # if you get timeouts (e.g. due to long tokenization) increase this.
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=args.timeout))
-
-
-    # initialize student model before the accelerate - so that we can get inferences for the teacher model as rejected answers (just for inference)
-    model, tokenizer,actual_eos_token, _, _ = load_tokenizer_model(accelerator=None, args=args)
-    tokenizer.eos_token=actual_eos_token
-
-
-    # teacher model
-    # for teacher we need to manipulate the args
-    teacher_args=copy.deepcopy(args)
-    teacher_args.model_name_or_path= args.teacher_model_name_or_path
-    teacher_args.tokenizer_name=args.teacher_tokenizer_name
-    teacher_model, teacher_tokenizer, actual_eos_token, _, _ = load_tokenizer_model(accelerator=None, args=teacher_args)
-    teacher_tokenizer.eos_token=actual_eos_token
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        # deepspeed_plugin=args.deepspeed_config_file,
         **accelerator_log_kwargs,
-        kwargs_handlers=[timeout_kwargs]
+        kwargs_handlers=[timeout_kwargs],
+    )
+
+    accelerator_teacher = Accelerator(
+        **accelerator_log_kwargs,
+        kwargs_handlers=[timeout_kwargs],
+        # deepspeed_plugin=args.deepspeed_config_file
     )
 
     # Make one log on every process with the configuration for debugging.
@@ -329,7 +389,34 @@ def main():
 
     accelerator.wait_for_everyone()
 
+    model, tokenizer, actual_eos_token, generation_config_nucleus, generation_config_greedy \
+        = load_tokenizer_model(accelerator, args, substitute_eos_token=True, load_lora=False)
 
+    model.generation_config = generation_config_greedy
+    model.eos_token = actual_eos_token
+    peft_model = PeftModel.from_pretrained(model, str(args.teacher_lora_model_name_or_path))
+
+    teacher_model = peft_model.merge_and_unload()  # get the merged teacher_model
+
+    # apply lora on top of student model
+    if args.use_lora:
+        logger.info("Initializing LORA model...")
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_lora_modules(model)
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+    elif args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    logger.info(str(model), main_process_only=True)
+    """for name, param in model.named_parameters():
+        print(f"Parameter: {name}, Data Type: {param.dtype}")"""
     run_id = get_run_id(args)
     checkpointing_dir = Path(args.output_dir) / run_id
     # If the output directory already exists, the process was interrupted and restarted by the cluster.
@@ -355,79 +442,56 @@ def main():
     logger.info(f"\n\n\nSaving checkpoints to {checkpointing_dir}\n\n\n")
 
     ######################################## Data Preprocessing ########################################
-    dataset_train, dataset_test = preprocess_hh_common(args)
-    for i in range(10):
-        logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(dataset_train[i]['chosen'])}\n\n"
-                    f"Example {i} rejected:\n{pretty_print_chatml(dataset_train[i]['rejected'])}\n\n")
-        apply_att_template(dataset_test[i], tokenizer, args.max_seq_length, debug_print=True, logger=logger)
-
+    dataset_train, dataset_test = preprocess_data_to_chatml(args)
     filtered_dataset = DatasetDict({
         'train': dataset_train,
         'test': dataset_test
     })
 
-    student_msgs = []
-    for example in filtered_dataset["train"]:
-        content=example["rejected"][-2]["content"]
-        msg= [{"role":"user", "content": content}]
-        student_msgs.append(tokenizer.apply_chat_template(conversation=msg, add_generation_prompt=True, max_length= args.max_seq_length, tokenize=False))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    if args.generated_data_path:
-        generated_responses=[]
-        with open(args.generated_data_path,"r") as file:
+    # Replace the rejected answers in dataset with sft models' responses
+
+    if args.generation_storage:
+        generated_responses = []
+        with open(args.generation_storage, "r") as file:
             for line in file:
                 try:
-                    data=json.loads(line.strip())
+                    data = json.loads(line.strip())
                     generated_responses.extend(data.get("batch_generations", []))
                 except json.JSONDecodeError as e:
                     print(f"Skipping invalid line due to JSONDecodeError:{e}")
         print("Already generated answers are taken, ex:", generated_responses[0])
-    else:
-        generated_responses=generate_completions(model, tokenizer, student_msgs, batch_size=1, max_new_tokens=300, disable_tqdm=False,
-                                                 generation_storage= args.generation_storage, stop_id_sequences=None, do_sample=False)
-    del model #which is not capable of using accelerate, just for generate_completions
-
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    gc.collect()
-
-
 
     for idx, example in enumerate(filtered_dataset["train"]):
         # Check if the example contains "rejected" and it's non-empty
         if "rejected" in example and len(example["rejected"]) > 0:
-           # Access the last item in the "rejected" field
-               last_message = example["rejected"][-1]
+            # Access the last item in the "rejected" field
+            last_message = example["rejected"][-1]
 
-               # Check if the role is "assistant"
-               if last_message["role"] == "assistant":
-                 # Replace the content with the corresponding generated response
-                 last_message["content"] = generated_responses[idx]
-
-
-
-    # get the model with accelerator
-    model, tokenizer, actual_eos_token, generation_config_nucleus, generation_config_greedy= load_tokenizer_model(accelerator, args)
+            # Check if the role is "assistant"
+            if last_message["role"] == "assistant":
+                # Replace the content with the corresponding generated response
+                last_message["content"] = generated_responses[idx]
 
     encode_function = partial(
-        apply_att_template,
+        apply_formatting_and_encoding,
         tokenizer=tokenizer,
         max_seq_length=args.max_seq_length,
+        debug_print=False,
         logger=logger,
     )
+
     with accelerator.main_process_first():
         lm_datasets = filtered_dataset.map(
-                 encode_function,
-                 batched=False,
-                num_proc=args.preprocessing_num_workers,
-                load_from_cache_file=not args.overwrite_cache,
-                remove_columns=[name for name in filtered_dataset["train"].column_names if
-                            name not in ["input_ids", "teacher_input_ids", "attention_mask", "teacher_attention_mask"]],
-                desc="Tokenizing and reformatting instruction data",)
+            encode_function,
+            batched=False,
+            num_proc=args.preprocessing_num_workers,
+            load_from_cache_file=not args.overwrite_cache,
+            remove_columns=[name for name in filtered_dataset["train"].column_names if
+                            name not in ["input_ids", "labels", "attention_mask"]],
+            desc="Tokenizing and reformatting instruction data", )
 
         lm_datasets.set_format(type="pt")
-        lm_datasets = lm_datasets.filter(lambda example: (example['labels'] != -100).any())
+        lm_datasets = lm_datasets.filter(has_responses)
 
     print("Size of training set:", len(filtered_dataset['train']))
     print("Size of test set:", len(filtered_dataset['test']))
@@ -451,8 +515,21 @@ def main():
 
     train_examples = [train_dataset[i] for i in indices_train_ex]
     test_examples = [test_dataset[i] for i in indices_test_ex]
-    for index, ex in enumerate(train_examples):
-        logger.info(f"Sample {index} of the training set: {ex}.")
+
+    def put_big_to_front(dataset):
+        logger.info("Putting the biggest examples to the front of the dataset to catch OOMs early.")
+        lens = [x["teacher_encoded"]["input_ids"].shape[0] for x in dataset]
+        order = list(sorted(range(len(lens)), key=lambda x: lens[x], reverse=True))
+        if len(order) > 128:
+            order = order[:128] + random.sample(order[128:], k=len(order[128:]))
+        dataset = dataset.select(order)
+        return dataset
+
+    train_dataset = put_big_to_front(train_dataset)
+    test_dataset = put_big_to_front(test_dataset)
+
+    print("Size of training set:", len(train_dataset))
+    print("Size of test set:", len(test_dataset))
 
     ######################################## Training Setup ########################################
     # DataLoaders creation:
@@ -460,7 +537,7 @@ def main():
         return DataLoader(
             dataset,
             shuffle=True,
-            collate_fn=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest"),
+            collate_fn=DataCollatorForATT(tokenizer=tokenizer, model=model, padding="longest"),
             batch_size=batch_size
         )
 
@@ -468,50 +545,10 @@ def main():
     test_dataloader = get_dataloader(test_dataset, args.per_device_train_batch_size)
 
     # Optimizer
-    # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "layer_norm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    if args.use_qlora:
-        from bitsandbytes.optim import AdamW
-        optimizer = AdamW(
-            optimizer_grouped_parameters,
-            lr=args.learning_rate,
-            optim_bits=8 if args.use_8bit_optimizer else 32,
-            is_paged=True
-        )
-    else:
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = build_optimizer(args, model)
 
     # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
-
-    # Create the learning rate scheduler.
-    # Note: the current accelerator.step() calls the .step() of the real scheduler for the `num_processes` times. This is because they assume
-    # the user initialize the scheduler with the entire training set. In the case of data parallel training, each process only
-    # sees a subset (1/num_processes) of the training set. So each time the process needs to update the lr multiple times so that the total
-    # number of updates in the end matches the num_training_steps here.
-    # Here we need to set the num_training_steps to either using the entire training set (when epochs is specified) or we need to multiply the
-    # num_training_steps by num_processes so that the total number of updates matches the num_training_steps.
-    num_training_steps_for_scheduler = args.max_train_steps if overrode_max_train_steps else args.max_train_steps * accelerator.num_processes
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_training_steps=num_training_steps_for_scheduler,
-        num_warmup_steps=int(num_training_steps_for_scheduler * args.warmup_ratio),
-    )
+    lr_scheduler, overrode_max_train_steps = build_lr_scheduler(accelerator, args, optimizer, train_dataloader)
 
     # Figure out how many steps we should save the Accelerator states
     checkpointing_steps = args.checkpointing_steps
@@ -549,8 +586,15 @@ def main():
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
+    # teacher_model= accelerator_teacher.prepare(teacher_model)
     test_dataloader = accelerator.prepare(test_dataloader)
 
+    teacher_model = accelerator_teacher.prepare(teacher_model)
+
+    for param in teacher_model.parameters():
+        param.requires_grad = False
+
+    # accelerator.state.select_deepspeed_plugin("student")
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -594,118 +638,16 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
-    # def get_cur_wandb_step():
-    #     return accelerator.get_tracker("wandb").current_step
-
-    def log_examples_to_wandb(step: int):
-        def gen_examples(example, example_idx: int, gen_config: GenerationConfig) -> Tuple[Tuple[float, str, str, str]]:
-            start_time = time.time()
-            is_prompt = example["labels"] == -100
-            is_response = ~is_prompt
-            prompt_ids = example["input_ids"][is_prompt]
-            # if prompt_ids.shape[0] >= args.logging_examples_max_length:
-            #     logger.warning(
-            #         f"Skipping logging of example {example_idx} because it is too long to log. "
-            #         f"Length: {prompt_ids.shape[0]}. Max length: {args.logging_examples_max_length}"
-            #     )
-            #     return
-
-            expected_response_ids = example["input_ids"][is_response]
-            prompt_text = tokenizer.decode(prompt_ids)
-            expected_response_text = tokenizer.decode(expected_response_ids)
-
-            # unwrapped = accelerator.unwrap_model(model)
-            # outputs = unwrapped.generate(input_ids=prompt_ids.to(model.device)[None, :],
-            #                              generation_config=generation_config)
-
-            outputs = model.generate(input_ids=prompt_ids.to(model.device)[None, :],
-                                     generation_config=gen_config, tokenizer=tokenizer,
-                                     synced_gpus=True)
-
-            response_text = tokenizer.decode(outputs[0])
-            if response_text[:len(prompt_text)] != prompt_text:
-                logger.warning(
-                    f"Response does not start with the prompt for example {example_idx}. "
-                    f"Prompt: \n\"\"\"\n{prompt_text}\n\"\"\"\n. Response: \n\"\"\"\n{response_text}\n\"\"\"\n"
-                )
-            else:
-                response_text = response_text[len(prompt_text):]
-
-            # We updated the eos token to avoid the bugs in model.generate, so we have to truncate the output manually
-            if actual_eos_token is not None and actual_eos_token in response_text:
-                response_text = response_text.split(actual_eos_token)[0] + actual_eos_token
-
-            # accelerator.get_tracker("wandb", unwrap=True).log(
-            # wandb.log(
-            #     {f"{prefix}_example_{example_idx + 1}/response": wandb.Html(f"<p>{html.escape(response_text)}</p>")})
-            return ((time.time() - start_time, prompt_text, expected_response_text, response_text),)
-
-        model.eval()
-        sum_time = 0.0
-
-        def gather_and_log(prefix, examples):
-            nonlocal sum_time
-
-            logger.info(f"Logging examples for {prefix}", main_process_only=True)
-            logged_greedy = gen_examples(examples[accelerator.process_index], accelerator.process_index,
-                                         generation_config_greedy)
-            logged_nucleus = gen_examples(examples[accelerator.process_index], accelerator.process_index,
-                                          generation_config_nucleus)
-            logger.info(f"Logged examples for {prefix}", main_process_only=True)
-
-            all_logged_greedy = gather_object(logged_greedy)
-            all_logged_nucleus = gather_object(logged_nucleus)
-            for i, (lg, ln) in enumerate(zip(all_logged_greedy, all_logged_nucleus)):
-                tm_g, prompt, expected, actual_g = lg
-                tm_n, _, _, actual_n = ln
-                sum_time += tm_g + tm_n
-                accelerator.log(
-                    {f"{prefix}_example_{i + 1}/prompt": wandb.Html(f"<p>{html.escape(prompt)}</p>"),
-                     f"{prefix}_example_{i + 1}/expected_response": wandb.Html(f"<p>{html.escape(expected)}</p>"),
-                     f"{prefix}_example_{i + 1}/response_greedy": wandb.Html(f"<p>{html.escape(actual_g)}</p>"),
-                     f"{prefix}_example_{i + 1}/response_nucleus": wandb.Html(f"<p>{html.escape(actual_n)}</p>"), }
-                )
-
-        gather_and_log("train", train_examples)
-        gather_and_log("test", test_examples)
-
-        model.train()
-        accelerator.wait_for_everyone()
-        print(f"Finished evals! pidx={accelerator.process_index}")
-
-        accelerator.log(
-            {"log_examples_time": sum_time,
-             "avg_example_time": sum_time / 2 / (len(train_examples) + len(test_examples))})
-
     ######################################## Training Loop ########################################
     print(f"{accelerator.sync_gradients=}", flush=True)
     accelerator.wait_for_everyone()
 
-    def compute_loss_distill(student_logits, teacher_logits, mode='student_teacher'):
+    # TODO handle the eval after
+    """    if accelerator.sync_gradients and not args.logging_examples_ignore_first:
+        log_examples_to_wandb(completed_steps)"""
 
-        teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
-
-        if mode == 'student_teacher':
-            # Compute the softmax of student logits
-            student_probs = torch.nn.functional.softmax(student_logits, dim=-1)
-
-            # Compute KL Divergence between teacher and student distributions
-            loss = torch.nn.functional.kl_div(
-                torch.nn.functional.log_softmax(student_logits, dim=-1),
-                teacher_probs,
-                reduction='batchmean'
-            )
-        elif mode == 'teacher_only':
-            # Use teacher probabilities directly and compute KL divergence
-            loss = torch.nn.functional.kl_div(
-                teacher_probs.log(),
-                teacher_probs,
-                reduction='batchmean'
-            )
-
-        return loss
-    if accelerator.sync_gradients and not args.logging_examples_ignore_first:
-        log_examples_to_wandb(completed_steps)
+    torch.cuda.empty_cache()
+    checkpoint_path = ""
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_loss = 0
@@ -721,7 +663,6 @@ def main():
             )
         else:
             active_dataloader = train_dataloader
-        
         """
         Algorithm: Generalized Knowledge Distillation (GKD)
         1: Given: Teacher model pT, Student Model pθS, Dataset (X, Y) containing (input, output) pairs
@@ -736,69 +677,195 @@ def main():
         10:  Update θ to minimize LGKD: θ ← θ - η * (1/B) * Σ_{(x,y)∈B} ∇θD(pT∥pθS)(y|x)
         11: end for
         """
-        # Main loop with compute_loss_distill integration
+        num_gpus = torch.cuda.device_count()  # Get the number of available GPUs (e.g., 8 GPUs)
+        all_responses = []  # To store all responses across GPUs
+
         for step, batch in enumerate(active_dataloader):
-            # Student inputs
-            student_inputs = {
-                'input_ids': batch['input_ids'],
-                'attention_mask': batch['attention_mask']
-            }
+            # Check if we want to use the student model's generated outputs (on-policy learning)
+            if random.random() <= args.lambda_value:
 
-            # Teacher inputs
-            teacher_inputs = {
-                'input_ids': batch['teacher_input_ids'],
-                'attention_mask': batch['teacher_attention_mask']
-            }
+                # Split the batch into 8 smaller batches, one for each GPU
+                batch_size_per_gpu = len(batch["student_encoded"]["input_ids"]) // num_gpus
+                small_batches = [
+                    {
+                        "input_ids": batch["student_encoded"]["input_ids"][i:i + batch_size_per_gpu],
+                        "attention_mask": batch["student_encoded"]["attention_mask"][i:i + batch_size_per_gpu],
+                    }
+                    for i in range(0, len(batch["student_encoded"]["input_ids"]), batch_size_per_gpu)
+                ]
+                gpu_sentences_matrix =[[] for _ in range(num_gpus)]
+                input_ids_len_matrix =[[] for _ in range(num_gpus)]
+                # Prepare sampling params
+                sampling_params = {
+                    'max_new_tokens': 128,
+                    'top_p': 0.9,
+                    'temperature': 0.8,
+                    'greedy': False,
+                    'n_sample_per_prompt':1,
+                    'use_vllm':True,
+                    'is_lora': True,
+                    'disable_sliding_window': True
+                }
+                sampling_params = Namespace(**sampling_params)
 
-            # Random decision for lambda threshold
-            u = random.uniform(0, 1)
-            batch_size = len(batch['input_ids'])
-            epoch_data_count += batch_size
+                # List of processes for parallel execution
+                processes = []
+                responses = [None] * num_gpus  # To store the responses from each GPU
 
-            # Accumulate gradients
-            with accelerator.accumulate(model):
-                if u <= args.lambda_value:
-                    # Forward pass for student model
-                    student_outputs = model(**student_inputs, use_cache=False)
-                    student_logits = student_outputs.logits
+                # Get the current timestamp to ensure file uniqueness
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                gpu_id= int(torch.cuda.current_device())
+                print("executing ",gpu_id)
 
-                    # Forward pass for teacher model without gradient
-                    with torch.no_grad():
-                        teacher_outputs = teacher_model(**teacher_inputs, use_cache=False)
-                        teacher_logits = teacher_outputs.logits
+                gpu_sentences_matrix[gpu_id], input_ids_len_matrix[gpu_id] = convert_batches_to_sentences(tokenizer, [small_batches[gpu_id]])
 
-                    # Compute the student-teacher distillation loss
-                    loss = compute_loss_distill(student_logits, teacher_logits, mode='student_teacher')
+                Path("pickles").mkdir(parents=True, exist_ok=True)
+                # Create unique paths for pickle files for each GPU
+                pickle_prompts_path = Path(f"pickles/prompts_{timestamp}_gpu{gpu_id}.pkl").absolute().as_posix()
+                pickle_output_path = Path(f"pickles/output_{timestamp}_gpu{gpu_id}.pkl").absolute().as_posix()
+                pickle_sampling_params_path = Path(f"pickles/sampling_params_{timestamp}_gpu{gpu_id}.pkl").absolute().as_posix()
 
-                else:
-                    # Forward pass for teacher model only
-                    with torch.no_grad():
-                        teacher_outputs = teacher_model(**teacher_inputs, use_cache=False)
-                        teacher_logits = teacher_outputs.logits
+                # Serialize the prompts and sampling parameters into pickle files
+                with open(pickle_prompts_path, "wb") as f:
+                    pickle.dump(gpu_sentences_matrix[gpu_id], f)
 
-                    # Compute loss based on teacher probabilities alone
-                    loss = compute_loss_distill(None, teacher_logits, mode='teacher_only')
+                with open(pickle_sampling_params_path, "wb") as f:
+                    pickle.dump(sampling_params, f)
 
-                # Track the total loss
-                total_loss += loss.detach().float()
+                # Run subprocess on the current GPU and get the results
+                #todo get the results from subprocess - encode them and get the y+
+                #todo crop if needed cases
+                #calculate the losses
+                """  
+                p = subprocess.Popen(
+                    ["python", "run_vllm_student.py", "--model_name_or_path", args.model_name_or_path,
+                     "--lora_model_name_or_path", checkpoint_path,
+                     "--tokenizer_name", args.tokenizer_name,
+                     "--pickle_prompts", pickle_prompts_path,
+                     "--pickle_sampling_params", pickle_sampling_params_path,
+                     "--pickle_outputs",pickle_output_path,
+                     #"--mem_util", str(getattr(sampling_params, "mem_util", 0.4)),
+                     "--batch_size", batch_size_per_gpu],
+                    env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                processes.append((p, gpu_id))
+                
 
-                # Backpropagation
-                accelerator.backward(loss)
+                # Wait for all processes to complete and gather their results
+                for p, gpu_id in processes:
+                    p.wait()  # Wait for the process to finish
 
-                # Gradient clipping
-                if accelerator.sync_gradients and args.clip_grad_norm > 0:
-                    accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+                    # Read the responses from the output pickle file
+                    with open(pickle_output_path, "rb") as f:
+                        responses[gpu_id] = pickle.load(f)
 
-                # Optimizer step
+                    # Optionally, clean up the pickle files after processing
+                    Path(pickle_prompts_path).unlink()
+                    Path(pickle_sampling_params_path).unlink()
+                    Path(pickle_output_path).unlink()
+
+                # Store the responses
+                all_responses.extend(responses)
+
+                generated_tokens = responses_log["input_ids"][:, original_input_length:]
+                new_attention_mask = responses_log["attention_mask"][:, original_input_length:]
+
+                # Use generated student outputs
+                student_inputs = {
+                    'input_ids': responses_log["input_ids"],
+                    'attention_mask': responses_log["attention_mask"]  # New attention mask for generated tokens
+                }
+                
+                # Keep teacher inputs from original data
+                teacher_inputs = {
+                    'input_ids': torch.cat([batch['teacher_input_ids'], generated_tokens], dim=1),
+                    'attention_mask': torch.cat([batch['teacher_attention_mask'], new_attention_mask], dim=1)
+                }
+                """
+            else:
+                original_input_length = batch["attention_mask"].sum(dim=1)
+                # Use original batch data for both student and teacher
+                student_inputs = {
+                    'input_ids': batch['input_ids'],
+                    'attention_mask': batch['attention_mask']
+                }
+                teacher_inputs = {
+                    'input_ids': batch['teacher_input_ids'],
+                    'attention_mask': batch['teacher_attention_mask']
+                }
+
+            # Forward pass for the student model
+            with accelerator.accumulate(model):  # Accumulate gradients
+                student_outputs = model(**student_inputs)
+
+                # Forward pass for the teacher model (in evaluation mode)
+                teacher_model.eval()
+                # Get the teacher input and attention mask
+                teacher_input_ids = batch['teacher_input_ids']
+                teacher_attention_mask = batch['teacher_attention_mask']
+
+                # Calculate the actual non-padding length of each sequence
+                teacher_token_lengths = teacher_attention_mask.sum(
+                    dim=1)  # Number of non-padding tokens for each sequence
+
+                # Dynamically truncate the input sequences for the teacher model based on the non-padding length
+                # We'll loop over the batch to truncate each sequence individually
+
+                truncated_teacher_input_ids = []
+                truncated_teacher_attention_masks = []
+
+                for i in range(teacher_input_ids.size(0)):  # Iterate over the batch
+                    seq_len = teacher_token_lengths[i].item()  # Get the non-padding length for this sequence
+                    truncated_teacher_input_ids.append(teacher_input_ids[i, :seq_len])  # Truncate input_ids
+                    truncated_teacher_attention_masks.append(
+                        teacher_attention_mask[i, :seq_len])  # Truncate attention mask
+
+                # Convert the lists back to tensors with dynamic batch sizes
+                truncated_teacher_input_ids = torch.nn.utils.rnn.pad_sequence(truncated_teacher_input_ids,
+                                                                              batch_first=True,
+                                                                              padding_value=tokenizer.pad_token_id)
+                truncated_teacher_attention_masks = torch.nn.utils.rnn.pad_sequence(truncated_teacher_attention_masks,
+                                                                                    batch_first=True, padding_value=0)
+
+                # Forward pass for the teacher model (in evaluation mode) using truncated inputs
+                teacher_model.eval()
+                with torch.no_grad():
+                    teacher_outputs = teacher_model(**teacher_inputs)
+
+                # Slice logits based on prompt lengths - to compare them over generated responses
+                prompt_lengths_student = batch['input_ids'].shape[1]
+                prompt_lengths_teacher = batch["teacher_input_ids"].shape[1]
+                student_logits = student_outputs.logits[:, prompt_lengths_student - 1:-1,
+                                 :]  # prompt_lengths_teacher - 1: -1, :]
+                teacher_logits = teacher_outputs.logits[:, prompt_lengths_teacher - 1:-1,
+                                 :]  # prompt_lengths_teacher - 1: -1, :]
+                labels = batch['labels'][:, :prompt_lengths_teacher]  # [:, prompt_lengths_student:]
+
+                # Compute the Generalized JSD loss
+                loss = generalized_jsd_loss(
+                    student_logits=student_logits,
+                    teacher_logits=teacher_logits,
+                    labels=labels,
+                    beta=0.5,
+                    temperature=1.0,
+                )
+
+                # Backpropagation and optimizer step
+                accelerator.backward(loss)  # Use accelerator to handle distributed backward pass
+
                 optimizer.step()
                 optimizer.zero_grad()
 
-                # Scheduler step
-                lr_scheduler.step()
+                # Accumulate total loss and count for logging
+                total_loss += loss.item()
+                epoch_data_count += batch['input_ids'].size(0)
 
                 # for cuda out of memory
-                if step % 2000 == 0:
+                if step % 500 == 0:
                     torch.cuda.empty_cache()
+
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 completed_steps += 1
@@ -818,8 +885,8 @@ def main():
 
                     total_loss = 0
 
-                if args.logging_examples_steps and completed_steps % args.logging_examples_steps == 0:
-                    log_examples_to_wandb(completed_steps)
+                """if args.logging_examples_steps and completed_steps % args.logging_examples_steps == 0:
+                    log_examples_to_wandb(completed_steps)"""
 
                 if isinstance(checkpointing_steps, int) and completed_steps % checkpointing_steps == 0:
                     output_dir = checkpointing_dir / f"step_{completed_steps}"
@@ -828,9 +895,9 @@ def main():
                 if completed_steps >= args.max_train_steps:
                     break
 
-        print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
+            print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
 
-        """model.eval()
+        model.eval()
         eval_pbar = tqdm(test_dataloader, desc="Evaluating", disable=not accelerator.is_local_main_process)
         total_loss = 0.0
         total_num_labels = 0
@@ -849,14 +916,14 @@ def main():
 
         logs = {"eval_loss": total_loss / total_num_labels, "eval_ppl": math.exp(total_loss / total_num_labels)}
         if args.with_tracking:
-            accelerator.log(logs)"""
+            accelerator.log(logs)
         model.train()
 
         if args.checkpointing_steps == "epoch":
             output_dir = checkpointing_dir / f"epoch_{epoch}"
             save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
-            """with open(output_dir / "logs.json", "w") as f:
-                json.dump(logs, f)"""
+            with open(output_dir / "logs.json", "w") as f:
+                json.dump(logs, f)
 
     output_dir = checkpointing_dir / "final"
     save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
@@ -868,3 +935,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
