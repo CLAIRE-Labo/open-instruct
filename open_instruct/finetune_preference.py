@@ -45,7 +45,7 @@ sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 from load_utils import (add_common_training_args, pretty_print_chatml, preprocess_data_to_chatml, \
                         load_tokenizer_model, save_args, load_args)
 from att import apply_att_template, add_att_args, neg_crossentropy, DataCollatorForATT, preprocess_for_symmetric_att, \
-    has_responses, compute_loss_att, load_base_generations
+    has_responses, compute_loss_att
 
 from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
 
@@ -277,11 +277,6 @@ def main():
 
     ######################################## Data Preprocessing ########################################
     dataset_train, dataset_test = preprocess_data_to_chatml(args)
-    if args.base_generations_dir is not None:
-        base_data = load_base_generations(args.base_generations_dir, dataset_train)
-        dataset_train = dataset_train.concatenate(base_data)
-        dataset_train = dataset_train.shuffle(seed=args.seed)
-
 
     # COMMENT OUT! This is for debugging
     # dataset_train = dataset_train.select(range(24))
@@ -398,7 +393,7 @@ def main():
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
         accelerator.init_trackers(project_name="alignment_translation", config=experiment_config,
-                                  init_kwargs={"wandb": {"entity": "claire-labo"}})
+                                  init_kwargs={"wandb": {"entity": args.wandb_entity, "name": args.wandb_name}})
 
     # Define custom step metric for evaluation
     # run_id = wandb.run.id

@@ -31,13 +31,13 @@ logger = get_logger(__name__)
 
 
 def get_hf_token() -> str:
-    if 'HUGGINGFACE_HUB_TOKEN' in os.environ:
-        return os.environ['HUGGINGFACE_HUB_TOKEN']
-    elif 'HUGGINGFACE_HUB_TOKEN_FILE_AT' in os.environ:
-        with open(os.environ['HUGGINGFACE_HUB_TOKEN_FILE_AT'], 'r') as file:
+    if 'HF_TOKEN' in os.environ:
+        return os.environ['HF_TOKEN']
+    elif 'HF_TOKEN_AT' in os.environ:
+        with open(os.environ['HF_TOKEN_AT'], 'r') as file:
             return file.read().strip()
     else:
-        raise ValueError("Please set the HUGGINGFACE_HUB_TOKEN or HUGGINGFACE_HUB_TOKEN_FILE_AT variable.")
+        raise ValueError("Please set the HF_TOKEN or HF_TOKEN_AT variable.")
 
 
 def add_common_training_args(parser: argparse.ArgumentParser):
@@ -270,6 +270,11 @@ def add_common_training_args(parser: argparse.ArgumentParser):
         type=str,
         default="claire-labo",
         help="The entity to use for W&B logging.",
+    )
+    parser.add_argument(
+        "--wandb_name",
+        type=str,
+        help="The name of the wandb run.",
     )
     parser.add_argument(
         "--gradient_checkpointing",
