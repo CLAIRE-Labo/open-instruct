@@ -276,7 +276,7 @@ def main():
     checkpointing_dir = setup_checkpointing(accelerator, args)
 
     ######################################## Data Preprocessing ########################################
-    dataset_train, dataset_test = preprocess_data_to_chatml(args)
+    dataset_train, dataset_test = preprocess_data_to_chatml(accelerator, args)
 
     # COMMENT OUT! This is for debugging
     # dataset_train = dataset_train.select(range(24))
