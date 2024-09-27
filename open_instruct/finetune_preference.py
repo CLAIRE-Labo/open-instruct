@@ -27,7 +27,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed, InitProcessGroupKwargs, gather_object, broadcast_object_list
 import datasets
-from datasets import DatasetDict
+from datasets import DatasetDict, concatenate_datasets
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import deepspeed
@@ -45,7 +45,7 @@ sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 from load_utils import (add_common_training_args, pretty_print_chatml, preprocess_data_to_chatml, \
                         load_tokenizer_model, save_args, load_args)
 from att import apply_att_template, add_att_args, neg_crossentropy, DataCollatorForATT, preprocess_for_symmetric_att, \
-    has_responses, compute_loss_att
+    has_responses, compute_loss_att, load_base_generations
 
 from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
 
@@ -277,6 +277,12 @@ def main():
 
     ######################################## Data Preprocessing ########################################
     dataset_train, dataset_test = preprocess_data_to_chatml(accelerator, args)
+    if args.base_generations_dir is not None:
+        self_impr_dataset = load_base_generations(args.base_generations_dir, dataset_train)
+        dataset_train = concatenate_datasets([dataset_train, self_impr_dataset])
+        dataset_train = dataset_train.shuffle(seed=args.seed)
+
+
 
     # COMMENT OUT! This is for debugging
     # dataset_train = dataset_train.select(range(24))

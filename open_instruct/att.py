@@ -29,7 +29,7 @@ def add_att_args(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--base_generations_dir",
-        type=Path,
+        type=str,
         default=None,
         help="If provided, these generations (produced by generate_vllm.py from the ATT repo) are used as y_ref. We extend the dataset, which originally contains triplets (x, y+, y-) to include also (x, y+, y_ref)."
     )
@@ -56,10 +56,10 @@ def add_att_args(parser: argparse.ArgumentParser):
     )
 
 
-def load_base_generations(base_generations_dir: Path, existing_dataset: Dataset) -> Dataset:
-    with open(base_generations_dir / "prompts.json") as f:
+def load_base_generations(base_generations_dir: str, existing_dataset: Dataset) -> Dataset:
+    with open(Path(base_generations_dir) / "prompts.json") as f:
         prompts = json.load(f)
-    with open(base_generations_dir / "generations.json") as f:
+    with open(Path(base_generations_dir) / "generations.json") as f:
         responses = json.load(f)
 
     assert len(prompts) == len(responses), f"Prompt length mismatch: {len(prompts)} vs {len(responses)}"
