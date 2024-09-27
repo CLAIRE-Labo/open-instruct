@@ -1,31 +1,23 @@
-import gc
 import sys
 import argparse
 from pathlib import Path
-import logging
 import json
 
 import pandas as pd
-from tqdm import tqdm
-import torch
 import datasets
 import accelerate
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from transformers import GenerationConfig, AutoTokenizer
 from alpaca_eval import evaluate as alpaca_farm_evaluate
 
 sys.path.append(str(Path(__file__).parents[2].absolute().as_posix()))
 from eval.utils import query_openai_chat_model, query_openai_model, run_att_model_for_eval, add_eval_args
-from eval.chat import generate_response, generate_response_att_lora, generate_responses_vllm, \
-    generate_responses_vllm_att
-from open_instruct.att import apply_att_template
 from open_instruct.load_utils import load_args, load_tokenizer_model
 
 logger = get_logger(__name__)
 
 
-def evaluate(accelerator, args):
+def evaluate(args):
     set_seed(239)
 
     train_args = load_args(args.train_run_args)
@@ -131,4 +123,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     accelerator = accelerate.Accelerator()
-    evaluate(accelerator, args)
+    evaluate(args)

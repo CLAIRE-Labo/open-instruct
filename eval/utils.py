@@ -9,14 +9,16 @@ import os
 from importlib import import_module
 import shutil
 import warnings
+from logging import getLogger
 
 from transformers import StoppingCriteria, AutoTokenizer
 from safetensors import safe_open
 from safetensors.torch import save_file
 from eval.dispatch_openai_requests import dispatch_openai_chat_requesets, dispatch_openai_prompt_requesets
-from accelerate.logging import get_logger
+# from accelerate.logging import get_logger
 
-logger = get_logger(__name__)
+# logger = get_logger(__name__)
+# logger = getLogger(__name__)
 
 sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
 from eval.chat import (
@@ -613,12 +615,12 @@ def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint, cache_dir=None):
     else:
         rel_path = Path(*tuned_checkpoint.parent.absolute().parts[1:])
         reformatted_checkpoint = Path(cache_dir) / rel_path / f"{tuned_checkpoint.stem}_reformatted"
-    logger.info(f"Reformatted checkpoint path: {reformatted_checkpoint}")
+    print(f"Reformatted checkpoint path: {reformatted_checkpoint}")
     if reformatted_checkpoint.exists():
-        logger.info("Reformatted checkpoint already exists. Skipping.")
+        print("Reformatted checkpoint already exists. Skipping.")
         return reformatted_checkpoint
 
-    logger.info("Reformatting checkpoint...")
+    print("Reformatting checkpoint...")
     reformatted_checkpoint.mkdir(parents=True)
     shutil.copyfile(tuned_checkpoint / "adapter_config.json", reformatted_checkpoint / "adapter_config.json")
 
@@ -638,7 +640,7 @@ def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint, cache_dir=None):
             else:
                 tensors_remaining[tensor_name] = tensor
 
-    logger.info(f"Saving the following weights into the embedding file: {list(tensors_to_move.keys())}")
+    print(f"Saving the following weights into the embedding file: {list(tensors_to_move.keys())}")
 
     # Save the tensors without 'lm_head' and 'embeddings'
     save_file(tensors_remaining, reformatted_checkpoint / "adapter_model.safetensors")
