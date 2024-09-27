@@ -41,7 +41,7 @@ def add_att_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--loss",
         default="ce",
-        choices=["ce", "symmetric", "symmetric_dpo", "symmetric_hinge"],
+        choices=["ce", "symmetric", "symmetric_dpo", "symmetric_hinge", "ipo"],
     )
 
     parser.add_argument('--dpo_beta', type=float, default=0.1, help='Beta in the DPO loss.')
@@ -443,7 +443,7 @@ def compute_loss_att(accelerator, model, batch, args, eval=False, debug=False):
         diff = yplus_neg_ce.detach() - args.neg_example_strength * yminus_neg_ce
         logs["log_pi_t_diff"] = diff.item()
         return yplus_neg_ce + args.loss_lambda * torch.relu(args.hinge_delta - diff), logs
-    elif args.loss == "symmetric_dpo":
+    elif args.loss in ["symmetric_dpo", "ipo"]:
         # assert isinstance(model, )
         yplus_ref_outputs = None
         yminus_ref_outputs = None
@@ -476,7 +476,10 @@ def compute_loss_att(accelerator, model, batch, args, eval=False, debug=False):
                - args.neg_example_strength * (yminus_neg_ce - yminus_ref_ce)
         logs["log_pi_t_diff_dpo"] = diff.item()
 
-        return F.softplus(-args.dpo_beta * diff), logs
+        if args.loss == "symmetric_dpo":
+            return F.softplus(-args.dpo_beta * diff), logs
+        elif args.loss == "ipo":
+            return (diff - 1 / (2 * args.dpo_beta)) ** 2, logs
     else:
         raise ValueError(f"Unknown loss type: {args.loss}")
 
