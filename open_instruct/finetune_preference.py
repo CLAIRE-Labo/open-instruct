@@ -281,8 +281,7 @@ def main():
         self_impr_dataset = load_base_generations(args.base_generations_dir, dataset_train)
         dataset_train = concatenate_datasets([dataset_train, self_impr_dataset])
         dataset_train = dataset_train.shuffle(seed=args.seed)
-
-
+        dataset_train = dataset_train.flatten_indices()
 
     # COMMENT OUT! This is for debugging
     # dataset_train = dataset_train.select(range(24))
