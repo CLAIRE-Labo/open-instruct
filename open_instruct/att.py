@@ -44,6 +44,7 @@ def add_att_args(parser: argparse.ArgumentParser):
         choices=["ce", "symmetric", "symmetric_dpo", "symmetric_hinge", "ipo"],
     )
 
+    parser.add_argument('--dpo_use_lambda', action='store_true', help='If set, DPO is mixed with an SFT loss.')
     parser.add_argument('--dpo_beta', type=float, default=0.1, help='Beta in the DPO loss.')
     parser.add_argument('--loss_lambda', type=float, default=1.0, help='Lambda in the symmetric and hinge losses.')
     parser.add_argument(
@@ -477,7 +478,10 @@ def compute_loss_att(accelerator, model, batch, args, eval=False, debug=False):
         logs["log_pi_t_diff_dpo"] = diff.item()
 
         if args.loss == "symmetric_dpo":
-            return F.softplus(-args.dpo_beta * diff), logs
+            if args.dpo_use_lambda:
+                return yplus_neg_ce + args.loss_lambda * F.softplus(-args.dpo_beta * diff), logs
+            else:
+                return F.softplus(-args.dpo_beta * diff), logs
         elif args.loss == "ipo":
             return (diff - 1 / (2 * args.dpo_beta)) ** 2, logs
     else:
