@@ -576,12 +576,14 @@ def main():
         else:
             active_dataloader = train_dataloader
         for step, batch in enumerate(active_dataloader):
+            global_step = step + len(train_dataloader) * epoch
+            percentage_complete = global_step / args.max_train_steps
             # Print the size of each component in the batch
             batch_size = len(batch['yplus_att']['input_ids'])  # Assuming 'input_ids' is the key for input data
             epoch_data_count += batch_size
             with accelerator.accumulate(model):
-                loss, logs = compute_loss_att(accelerator, model, batch, args, eval=False, debug=False)
-                # loss = neg_crossentropy(outputs, batch['labels'], reduce_loss=args.reduce_loss)
+                loss, logs = compute_loss_att(accelerator, model, batch, args, percentage_complete=percentage_complete,
+                                              eval=False, debug=False)
 
                 # For adam this doesn't matter, but to sleep better we still do it
                 loss /= batch_size
@@ -615,6 +617,7 @@ def main():
                             {
                                 "learning_rate": lr_scheduler.get_last_lr()[0],
                                 "train_loss": avg_loss,
+                                "global_step": global_step,
                                 **avg_logs,
                             },
                         )

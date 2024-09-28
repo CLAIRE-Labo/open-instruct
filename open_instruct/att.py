@@ -41,7 +41,8 @@ def add_att_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--loss",
         default="ce",
-        choices=["ce", "symmetric", "symmetric_dpo", "symmetric_hinge", "ipo"],
+        choices=["ce", "symmetric", "symmetric_progressive", "symmetric_dpo", "symmetric_dpo_progressive",
+                 "symmetric_hinge", "ipo"],
     )
 
     parser.add_argument('--dpo_use_lambda', action='store_true', help='If set, DPO is mixed with an SFT loss.')
@@ -412,7 +413,7 @@ def neg_crossentropy(outputs, labels, reduce_loss='sum'):
     return loss
 
 
-def compute_loss_att(accelerator, model, batch, args, eval=False, debug=False):
+def compute_loss_att(accelerator, model, batch, args, percentage_complete: float=0.5, eval=False, debug=False):
     def log_neg_ce(value, labels, name):
         num_predicted = (labels != -100).sum().item()
         if args.reduce_loss == 'mean':
@@ -426,6 +427,12 @@ def compute_loss_att(accelerator, model, batch, args, eval=False, debug=False):
         yplus_neg_ce = neg_crossentropy(yplus_outputs, batch["yplus_att"]["labels"], args.reduce_loss)
     logs = {**logs, **log_neg_ce(yplus_neg_ce, batch["yplus_att"]["labels"], "mlog_pi_t_yplus")}
 
+    if "progressive" in args.loss:
+        lam = args.loss_lambda * percentage_complete
+        logs["loss_lambda"] = lam
+    else:
+        lam = args.loss_lambda
+
     if args.loss == "ce":
         return yplus_neg_ce, logs
 
@@ -434,17 +441,17 @@ def compute_loss_att(accelerator, model, batch, args, eval=False, debug=False):
         yminus_neg_ce = neg_crossentropy(yminus_outputs, batch["yminus_att"]["labels"], args.reduce_loss)
     logs = {**logs, **log_neg_ce(yminus_neg_ce, batch["yminus_att"]["labels"], "mlog_pi_t_yminus")}
 
-    if args.loss == "symmetric":
+    if args.loss in ["symmetric", "symmetric_progressive"]:
         # Loss1
         diff = yplus_neg_ce.detach() - args.neg_example_strength * yminus_neg_ce
         logs["log_pi_t_diff"] = diff.item()
-        return yplus_neg_ce + args.loss_lambda * F.softplus(-diff), logs
+        return yplus_neg_ce + lam * F.softplus(-diff), logs
     elif args.loss == "symmetric_hinge":
         # Loss2
         diff = yplus_neg_ce.detach() - args.neg_example_strength * yminus_neg_ce
         logs["log_pi_t_diff"] = diff.item()
         return yplus_neg_ce + args.loss_lambda * torch.relu(args.hinge_delta - diff), logs
-    elif args.loss in ["symmetric_dpo", "ipo"]:
+    elif args.loss in ["symmetric_dpo", "symmetric_dpo_progressive", "ipo"]:
         # assert isinstance(model, )
         yplus_ref_outputs = None
         yminus_ref_outputs = None
@@ -477,11 +484,10 @@ def compute_loss_att(accelerator, model, batch, args, eval=False, debug=False):
                - args.neg_example_strength * (yminus_neg_ce - yminus_ref_ce)
         logs["log_pi_t_diff_dpo"] = diff.item()
 
-        if args.loss == "symmetric_dpo":
-            if args.dpo_use_lambda:
-                return yplus_neg_ce + args.loss_lambda * F.softplus(-args.dpo_beta * diff), logs
-            else:
-                return F.softplus(-args.dpo_beta * diff), logs
+        if (args.loss == "symmetric_dpo" and args.dpo_use_lambda) or args.loss == "symmetric_dpo_progressive":
+            return yplus_neg_ce + lam * F.softplus(-args.dpo_beta * diff), logs
+        elif args.loss == "symmetric_dpo":
+            return F.softplus(-args.dpo_beta * diff), logs
         elif args.loss == "ipo":
             return (diff - 1 / (2 * args.dpo_beta)) ** 2, logs
     else:

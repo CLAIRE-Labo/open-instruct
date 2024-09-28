@@ -77,69 +77,71 @@ def evaluate(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     responses_log_path = output_dir / "responses.json"
     responses_graded_path = output_dir / "responses_graded.json"
-    if responses_graded_path.exists():
-        print(f"Results already exist at {responses_graded_path}. Exiting.")
-        return
+    if not responses_graded_path.exists():
+        # Load the data
+        data = load_dataset(args.prompt_dataset, split="test")
+        prompt_chats = [x[:-1] for x in data["chosen"]]
+        if args.num_instances is not None:
+            prompt_chats = prompt_chats[:args.num_instances]
 
-    # Load the data
-    data = load_dataset(args.prompt_dataset, split="test")
-    prompt_chats = [x[:-1] for x in data["chosen"]]
-    if args.num_instances is not None:
-        prompt_chats = prompt_chats[:args.num_instances]
+        responses_log = []
+        if responses_log_path.exists():
+            with open(responses_log_path, "r") as f:
+                responses_log = json.load(f)
+            print(f"Loaded responses from {responses_log_path}")
+        else:
+            responses_log = run_att_model_for_eval(train_args, args, prompt_chats)
+            with open(responses_log_path, "w") as f:
+                json.dump(responses_log, f)
 
-    responses_log = []
-    if responses_log_path.exists():
-        with open(responses_log_path, "r") as f:
-            responses_log = json.load(f)
-        print(f"Loaded responses from {responses_log_path}")
-    else:
-        responses_log = run_att_model_for_eval(train_args, args, prompt_chats)
-        with open(responses_log_path, "w") as f:
-            json.dump(responses_log, f)
+        # Evaluate the responses
+        chats = [deepcopy(prompt) + [{"role": "assistant", "content": log["output"]}] \
+                 for prompt, log in zip(prompt_chats, responses_log)]
 
-    # Evaluate the responses
-    chats = [deepcopy(prompt) + [{"role": "assistant", "content": log["output"]}] \
-             for prompt, log in zip(prompt_chats, responses_log)]
+        assert args.reward_model == "RLHFlow/ArmoRM-Llama3-8B-v0.1", "Only the ArmoRM model is supported for now."
+        reward_model = ArmoRMPipeline("RLHFlow/ArmoRM-Llama3-8B-v0.1", trust_remote_code=True)
 
-    assert args.reward_model == "RLHFlow/ArmoRM-Llama3-8B-v0.1", "Only the ArmoRM model is supported for now."
-    reward_model = ArmoRMPipeline("RLHFlow/ArmoRM-Llama3-8B-v0.1", trust_remote_code=True)
-
-    scores = []
-    score_key = f"{args.evaluated_name}_score"
-    for i, chat in enumerate(tqdm(chats, "Scoring the responses")):
-        chat_score = reward_model(chat)
-        responses_log[i][score_key] = chat_score['score']
-    score_vals = [log[score_key] for log in responses_log]
-
-    if args.att_evaluate_base:
-        base_chats = [deepcopy(prompt) + [{"role": "assistant", "content": log["response_base"]}] \
-                      for prompt, log in zip(prompt_chats, responses_log)]
-        base_scores = []
-        base_score_key = f"{args.evaluated_name}_base_score"
-        for i, chat in enumerate(tqdm(base_chats, "Scoring the base responses")):
+        scores = []
+        score_key = f"{args.evaluated_name}_score"
+        for i, chat in enumerate(tqdm(chats, "Scoring the responses")):
             chat_score = reward_model(chat)
-            responses_log[i][base_score_key] = chat_score['score']
-        score_vals_base = [log[base_score_key] for log in responses_log]
+            responses_log[i][score_key] = chat_score['score']
+        score_vals = [log[score_key] for log in responses_log]
 
-        # Some comparison stats
-        score_vals = np.array(score_vals)
-        score_vals_base = np.array(score_vals_base)
-        print(f"Mean score: {score_vals.mean():.2f}+-{score_vals.std():.2f}"
-              f" vs {score_vals_base.mean():.2f}+-{score_vals_base.std():.2f}")
-        print(f"Mean diff: {score_vals.mean() - score_vals_base.mean():.2f}")
-        print(f"Median score: {np.median(score_vals):.2f} vs {np.median(score_vals_base):.2f}")
-        print(f"Max score: {score_vals.max():.2f} vs {score_vals_base.max():.2f}")
-        print(f"Min score: {score_vals.min():.2f} vs {score_vals_base.min():.2f}")
+        if args.att_evaluate_base:
+            base_chats = [deepcopy(prompt) + [{"role": "assistant", "content": log["response_base"]}] \
+                          for prompt, log in zip(prompt_chats, responses_log)]
+            base_scores = []
+            base_score_key = f"{args.evaluated_name}_base_score"
+            for i, chat in enumerate(tqdm(base_chats, "Scoring the base responses")):
+                chat_score = reward_model(chat)
+                responses_log[i][base_score_key] = chat_score['score']
+            score_vals_base = [log[base_score_key] for log in responses_log]
+
+        with open(responses_graded_path, "w") as f:
+            json.dump(responses_log, f)
+        print(f"Results saved to {responses_graded_path}")
     else:
-        score_vals = np.array(score_vals)
-        print(f"Mean score: {score_vals.mean():.2f}+-{score_vals.std():.2f}")
-        print(f"Median score: {np.median(score_vals):.2f}")
-        print(f"Max score: {score_vals.max():.2f}")
-        print(f"Min score: {score_vals.min():.2f}")
+        print(f"Results already exist at {responses_graded_path}.")
 
-    with open(responses_graded_path, "w") as f:
-        json.dump(responses_log, f)
-    print(f"Results saved to {responses_graded_path}")
+    responses_log = json.load(open(responses_graded_path, "r"))
+    score_key = f"{args.evaluated_name}_score"
+    score_base_key = f"{args.evaluated_name}_base_score"
+    score_vals = np.array([log[score_key] for log in responses_log])
+    if score_base_key in responses_log[0]:
+        score_vals_base = np.array([log[score_base_key] for log in responses_log])
+        # Some comparison stats
+        print(f"Mean score: {score_vals.mean():.4f}+-{score_vals.std():.4f}"
+              f" vs {score_vals_base.mean():.4f}+-{score_vals_base.std():.4f}")
+        print(f"Mean diff: {score_vals.mean() - score_vals_base.mean():.4f}")
+        print(f"Median score: {np.median(score_vals):.4f} vs {np.median(score_vals_base):.4f}")
+        print(f"Max score: {score_vals.max():.4f} vs {score_vals_base.max():.4f}")
+        print(f"Min score: {score_vals.min():.4f} vs {score_vals_base.min():.4f}")
+    else:
+        print(f"Mean score: {score_vals.mean():.4f}+-{score_vals.std():.4f}")
+        print(f"Median score: {np.median(score_vals):.4f}")
+        print(f"Max score: {score_vals.max():.4f}")
+        print(f"Min score: {score_vals.min():.4f}")
 
 
 if __name__ == '__main__':
