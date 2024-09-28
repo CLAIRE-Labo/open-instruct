@@ -143,6 +143,7 @@ def evaluate(args):
 
 
 if __name__ == '__main__':
+    print(f"Entered the script")
     # Iterate over a list of environment variables whose value contains "pinot"
     for var in list(os.environ):  # Convert to list to avoid runtime changes during iteration
         if "pinot" in os.environ[var]:
