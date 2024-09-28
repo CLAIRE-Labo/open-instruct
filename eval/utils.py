@@ -15,6 +15,7 @@ from transformers import StoppingCriteria, AutoTokenizer
 from safetensors import safe_open
 from safetensors.torch import save_file
 from eval.dispatch_openai_requests import dispatch_openai_chat_requesets, dispatch_openai_prompt_requesets
+
 # from accelerate.logging import get_logger
 
 # logger = get_logger(__name__)
@@ -524,6 +525,9 @@ def add_eval_args(parser):
         type=Path,
         help="LoRA adapter or a full fine-tuned model checkpoint.",
     )
+    parser.add_argument(
+        "--base_model_root", type=Path, help="If provided, prepended to the base model path in the train_run_args."
+    )
     parser.add_argument("--evaluated_name", required=True, type=str, help="The name of the model that will be saved.")
 
     parser.add_argument(
@@ -666,6 +670,8 @@ def run_att_model_for_eval(train_args, eval_args, chats):
     import vllm
 
     model_name_or_path = train_args.model_name_or_path
+    if eval_args.base_model_root is not None and (eval_args.base_model_root / model_name_or_path).exists():
+            model_name_or_path = str(eval_args.base_model_root / model_name_or_path)
     tokenizer_name_or_path = (
         train_args.tokenizer_name if train_args.tokenizer_name else model_name_or_path
     )
