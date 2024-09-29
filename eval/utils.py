@@ -733,7 +733,9 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                             f' --output_dir {merge_dir}' \
                             f' --save_tokenizer'
                         tmp_args_fname.unlink()
-                        merge_subprocess = subprocess.run(merge_command, shell=True, capture_output=True)
+                        env = os.environ.copy()
+                        env["CUDA_VISIBLE_DEVICES"] = "0"
+                        merge_subprocess = subprocess.run(merge_command, shell=True, capture_output=True, env=env)
                         if merge_subprocess.returncode != 0:
                             print("Error while merging the model.")
                             print(merge_subprocess.stdout.decode())
