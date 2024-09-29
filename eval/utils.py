@@ -726,16 +726,14 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                         tmp_args_fname = Path(f"tmp_args_{timestamp}.json")
                         save_args(train_args, tmp_args_fname)
                         merge_command = \
-                            f'accelerate launch --num_processes 1' \
-                            f' {Path(__file__).parents[1] / "open_instruct/merge_lora_from_training.py"}' \
+                            f'python {Path(__file__).parents[1] / "open_instruct/merge_lora_from_training.py"}' \
                             f' --lora_model_name_or_path {eval_args.tuned_checkpoint.absolute().as_posix()}' \
                             f' --train_args {tmp_args_fname.absolute().as_posix()}' \
                             f' --output_dir {merge_dir}' \
                             f' --save_tokenizer'
+                        print(f"Running merge command:\n{merge_command}")
+                        merge_subprocess = subprocess.run(merge_command, shell=True, capture_output=True)
                         tmp_args_fname.unlink()
-                        env = os.environ.copy()
-                        env["CUDA_VISIBLE_DEVICES"] = "0"
-                        merge_subprocess = subprocess.run(merge_command, shell=True, capture_output=True, env=env)
                         if merge_subprocess.returncode != 0:
                             print("Error while merging the model.")
                             print(merge_subprocess.stdout.decode())

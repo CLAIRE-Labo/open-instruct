@@ -26,11 +26,9 @@ def parse_args():
 
 
 def main(args):
-    accelerator = accelerate.Accelerator()
-
     train_args = load_args(args.train_args)
     model, tokenizer, actual_eos_token, generation_config_sampling, generation_config_greedy \
-        = load_tokenizer_model(accelerator, train_args, substitute_eos_token=True, load_lora=False)
+        = load_tokenizer_model(None, train_args, substitute_eos_token=True, load_lora=False)
     model.generation_config = generation_config_greedy
     tokenizer.eos_token = actual_eos_token
     peft_model = PeftModel.from_pretrained(model, str(args.lora_model_name_or_path))

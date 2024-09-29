@@ -7,6 +7,7 @@ import json
 import argparse
 import logging
 from copy import deepcopy
+from contextlib import nullcontext
 
 import torch
 import huggingface_hub
@@ -434,7 +435,7 @@ def preprocess_data_to_chatml(accelerator, args):
     chatml_datasets_train = []
     chatml_datasets_test = []
     for dataset_name in args.dataset_name:
-        with accelerator.main_process_first():
+        with accelerator.main_process_first() if accelerator is not None else nullcontext():
             raw_data = load_dataset(dataset_name)
         if dataset_name == "Anthropic/hh-rlhf":
             dataset_train, dataset_test = preprocess_hh_common(raw_data, remove_multiturn_data=True)
@@ -590,7 +591,7 @@ def load_tokenizer_model(accelerator, args, substitute_eos_token=True, load_lora
                 "You are instantiating a new config instance from scratch. This is not supported by this script."
             )
 
-    with accelerator.main_process_first():
+    with accelerator.main_process_first() if accelerator is not None else nullcontext():
         try:
             config = try_load_config()
         except OSError as e:
@@ -604,6 +605,7 @@ def load_tokenizer_model(accelerator, args, substitute_eos_token=True, load_lora
         if args.model_name_or_path:
             def try_load_model():
                 if args.use_qlora:
+                    assert accelerator is not None
                     bnb_config = BitsAndBytesConfig(
                         load_in_4bit=True,
                         bnb_4bit_use_double_quant=True,
@@ -644,7 +646,7 @@ def load_tokenizer_model(accelerator, args, substitute_eos_token=True, load_lora
             except Exception as e:
                 model = try_load_model()
         else:
-            logger.info("Training new model from scratch")
+            print("Training new model from scratch")
             model = AutoModelForCausalLM.from_config(config)
 
         # Have to use a "fake" eos token that the model never generates as a hack to work around a bug in model.generate
@@ -669,7 +671,7 @@ def load_tokenizer_model(accelerator, args, substitute_eos_token=True, load_lora
             generation_config.suppress_tokens = list(range(len(tokenizer), embedding_size))
 
         if load_lora and args.use_lora:
-            logger.info("Initializing LORA model...")
+            print("Initializing LORA model...")
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 inference_mode=False,
@@ -683,7 +685,8 @@ def load_tokenizer_model(accelerator, args, substitute_eos_token=True, load_lora
         elif args.gradient_checkpointing:
             model.gradient_checkpointing_enable()
 
-        logger.info(str(model), main_process_only=True)
+        if (accelerator is None) or accelerator.is_main_process:
+            print(str(model))
 
         generation_config_nucleus = deepcopy(generation_config)
         generation_config_nucleus.do_sample = True
@@ -693,7 +696,8 @@ def load_tokenizer_model(accelerator, args, substitute_eos_token=True, load_lora
         generation_config_greedy = deepcopy(generation_config)
         generation_config_greedy.do_sample = False
 
-    accelerator.wait_for_everyone()
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
 
     return model, tokenizer, actual_eos_token, generation_config_nucleus, generation_config_greedy
 
