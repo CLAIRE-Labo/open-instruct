@@ -741,7 +741,23 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                             raise RuntimeError("Error while merging the model.")
                     eval_args.is_lora = False
                     eval_args.tuned_checkpoint = merge_dir
-                    # Don't need the base model anymore, will load the merged model later
+                    # Don't need the base model anymore if evaluating a non-ATT model, will load the merged model later
+                    # For ATT, will still need a base model
+                    if not eval_args.not_att:
+                        base_model = vllm.LLM(
+                            model=model_name_or_path,
+                            revision=hf_revision,
+                            tokenizer=tokenizer_name_or_path,
+                            tokenizer_revision=hf_revision,
+                            tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
+                            trust_remote_code=True,
+                            enable_lora=False,
+                            max_lora_rank=128,
+                            disable_sliding_window=False,
+                            # disable_sliding_window=True if not hasattr(eval_args, "disable_sliding_window") \
+                            #     else eval_args.disable_sliding_window,
+                            gpu_memory_utilization=mem_util,
+                        )
                 else:
                     raise e
 
@@ -754,7 +770,6 @@ def run_att_model_for_eval(train_args, eval_args, chats):
         )
 
         responses_log = []
-        # Generate outputs based on ATT and LoRA settings
         if hasattr(eval_args, "is_base_model") and eval_args.is_base_model:
             formatted_prompts, outputs = generate_responses_vllm(
                 base_model,
@@ -849,7 +864,6 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                     }
                 )
 
-        del base_model  # Free up GPU memory
     else:
         assert False, "Currently only supporting vLLM generations."
         # If we need non-vLLM, need to debug and test this
