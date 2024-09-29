@@ -443,12 +443,12 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
 
     if args.loss in ["symmetric", "symmetric_progressive"]:
         # Loss1
-        diff = yplus_neg_ce.detach() - args.neg_example_strength * yminus_neg_ce
+        diff = -yplus_neg_ce.detach() + args.neg_example_strength * yminus_neg_ce
         logs["log_pi_t_diff"] = diff.item()
         return yplus_neg_ce + lam * F.softplus(-diff), logs
     elif args.loss == "symmetric_hinge":
         # Loss2
-        diff = yplus_neg_ce.detach() - args.neg_example_strength * yminus_neg_ce
+        diff = -yplus_neg_ce.detach() + args.neg_example_strength * yminus_neg_ce
         logs["log_pi_t_diff"] = diff.item()
         return yplus_neg_ce + args.loss_lambda * torch.relu(args.hinge_delta - diff), logs
     elif args.loss in ["symmetric_dpo", "symmetric_dpo_progressive", "ipo"]:
@@ -480,8 +480,8 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
             yminus_ref_ce = neg_crossentropy(yminus_ref_outputs, batch["yminus_ref"]["labels"], args.reduce_loss)
             logs = {**logs, **log_neg_ce(yminus_ref_ce, batch["yminus_ref"]["labels"], "mlog_pi_ref_yminus")}
 
-        diff = yplus_neg_ce - yplus_ref_ce \
-               - args.neg_example_strength * (yminus_neg_ce - yminus_ref_ce)
+        diff = -yplus_neg_ce + yplus_ref_ce \
+               - args.neg_example_strength * (-yminus_neg_ce + yminus_ref_ce)
         logs["log_pi_t_diff_dpo"] = diff.item()
 
         if (args.loss == "symmetric_dpo" and args.dpo_use_lambda) or args.loss == "symmetric_dpo_progressive":
