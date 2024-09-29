@@ -10,6 +10,9 @@ from importlib import import_module
 import shutil
 import warnings
 from logging import getLogger
+from datetime import datetime
+import subprocess
+from copy import deepcopy
 
 from transformers import StoppingCriteria, AutoTokenizer
 from safetensors import safe_open
@@ -28,7 +31,7 @@ from eval.chat import (
     generate_response_att_lora,
     generate_response,
 )
-from open_instruct.load_utils import load_tokenizer
+from open_instruct.load_utils import load_tokenizer, save_args
 
 
 class KeyWordsCriteria(StoppingCriteria):
@@ -669,9 +672,11 @@ def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint, cache_dir=None):
 def run_att_model_for_eval(train_args, eval_args, chats):
     import vllm
 
+    eval_args = deepcopy(eval_args)
+
     model_name_or_path = train_args.model_name_or_path
     if eval_args.base_model_root is not None and (eval_args.base_model_root / model_name_or_path).exists():
-            model_name_or_path = str(eval_args.base_model_root / model_name_or_path)
+        model_name_or_path = str(eval_args.base_model_root / model_name_or_path)
     tokenizer_name_or_path = (
         train_args.tokenizer_name if train_args.tokenizer_name else model_name_or_path
     )
@@ -686,19 +691,51 @@ def run_att_model_for_eval(train_args, eval_args, chats):
         else:
             mem_util = 0.9 if eval_args.is_lora else 0.4
 
-        base_model = vllm.LLM(
-            model=model_name_or_path,
-            revision=hf_revision,
-            tokenizer=tokenizer_name_or_path,
-            tokenizer_revision=hf_revision,
-            tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
-            trust_remote_code=True,
-            enable_lora=eval_args.is_lora,
-            max_lora_rank=128,
-            disable_sliding_window=True if not hasattr(eval_args,
-                                                       "disable_sliding_window") else eval_args.disable_sliding_window,
-            gpu_memory_utilization=mem_util,
-        )
+        merged_lora = None
+        need_base = eval_args.is_lora or not eval_args.not_att
+        if need_base:
+            try:
+                base_model = vllm.LLM(
+                    model=model_name_or_path,
+                    revision=hf_revision,
+                    tokenizer=tokenizer_name_or_path,
+                    tokenizer_revision=hf_revision,
+                    tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
+                    trust_remote_code=True,
+                    enable_lora=eval_args.is_lora,
+                    max_lora_rank=128,
+                    disable_sliding_window=True if not hasattr(eval_args, "disable_sliding_window") \
+                        else eval_args.disable_sliding_window,
+                    gpu_memory_utilization=mem_util,
+                )
+            except ValueError as e:
+                if "does not support LoRA" in str(e):
+                    print("Model does not support LoRA. We will merge the lora adapter into the base model.")
+                    # Will have to store both base and tuned in memory
+                    mem_util = 0.4
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    tmp_args_fname = Path(f"tmp_args_{timestamp}.json")
+                    save_args(train_args, tmp_args_fname)
+                    if eval_args.cache_dir is None:
+                        merge_dir = eval_args.tuned_checkpoint.parent / f"{eval_args.tuned_checkpoint.name}_merged"
+                    else:
+                        rel_path = Path(*eval_args.tuned_checkpoint.parent.absolute().parts[1:])
+                        merge_dir = Path(eval_args.cache_dir) / rel_path / f"{eval_args.tuned_checkpoint.name}_merged"
+                    merge_command = \
+                        f'accelerate launch --num_processes 1' \
+                        f' {Path(__file__).parents[1] / "open_instruct/merge_lora_from_training.py"}' \
+                        f' --lora_model_name_or_path {eval_args.tuned_checkpoint}' \
+                        f' --train_args {tmp_args_fname}' \
+                        f' --output_dir {merge_dir}' \
+                        f' --save_tokenizer'
+                    eval_args.is_lora = False
+                    merge_subprocess = subprocess.run(merge_command, shell=True, check=True, capture_output=True)
+                    eval_args.tuned_checkpoint = merge_dir
+                    tmp_args_fname.unlink()
+
+                    # Don't need the base model anymore, will load the merged model later
+                else:
+                    raise e
 
         sampling_params = vllm.SamplingParams(
             top_p=1.0 if eval_args.greedy else eval_args.top_p,
@@ -749,7 +786,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                     gpu_memory_utilization=mem_util,
                 )
                 formatted_prompts, outputs = generate_responses_vllm(
-                    tuned_model, tokenizer, chats, sampling_params
+                    tuned_model, tokenizer, chats, sampling_params, batch_size=eval_args.batch_size
                 )
             # Collect responses
             for chat, prompt, output in zip(chats, formatted_prompts, outputs):
@@ -776,8 +813,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                     outputs,
                 ) = generate_responses_vllm_att(base_model, tokenizer, chats, sampling_params,
                                                 lora_request=lora_request,
-                                                batch_size=eval_args.batch_size
-                                                )
+                                                batch_size=eval_args.batch_size)
             else:
                 # ATT, not using LoRA
                 (
@@ -788,8 +824,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                 ) = generate_responses_vllm_att(base_model, tokenizer, chats, sampling_params,
                                                 att_model_checkpoint=eval_args.tuned_checkpoint.absolute().as_posix(),
                                                 tokenizer_name=tokenizer_name_or_path,
-                                                batch_size=30
-                                                )
+                                                batch_size=eval_args.batch_size)
             # Collect responses
             for chat, prompt_base, response_base, prompt_att, output in zip(
                     chats, prompts_base, responses_base, prompts_att, outputs

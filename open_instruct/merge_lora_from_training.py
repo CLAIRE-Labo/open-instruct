@@ -26,7 +26,7 @@ def parse_args():
 
 
 def main(args):
-    accelerator = accelerate.Accelerator()
+    accelerator = accelerate.PartialState()
 
     train_args = load_args(args.train_args)
     model, tokenizer, actual_eos_token, generation_config_sampling, generation_config_greedy \
