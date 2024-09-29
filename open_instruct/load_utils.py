@@ -84,6 +84,10 @@ def add_common_training_args(parser: argparse.ArgumentParser):
         help="Pretrained config name or path if not the same as model_name",
     )
     parser.add_argument(
+        "--half_dataset",
+        action="store_true",
+    )
+    parser.add_argument(
         "--model_revision",
         help="""If given, specifies a model revision (for HuggingFace models). This will 
         be applied to both the `model_name_or_path` and `config_name` args.""",

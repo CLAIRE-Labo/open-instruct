@@ -283,6 +283,11 @@ def main():
         dataset_train = dataset_train.shuffle(seed=args.seed)
         dataset_train = dataset_train.flatten_indices()
 
+    # Temporary solution for the self-improvement dataset
+    if args.half_dataset:
+        dataset_train = dataset_train.select(range(len(dataset_train) // 2))
+
+
     # COMMENT OUT! This is for debugging
     # dataset_train = dataset_train.select(range(24))
     # dataset_test = dataset_test.select(range(24))
