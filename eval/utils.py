@@ -704,8 +704,9 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                     trust_remote_code=True,
                     enable_lora=eval_args.is_lora,
                     max_lora_rank=128,
-                    disable_sliding_window=True if not hasattr(eval_args, "disable_sliding_window") \
-                        else eval_args.disable_sliding_window,
+                    disable_sliding_window=False,
+                    # disable_sliding_window=True if not hasattr(eval_args, "disable_sliding_window") \
+                    #     else eval_args.disable_sliding_window,
                     gpu_memory_utilization=mem_util,
                 )
             except ValueError as e:
@@ -713,26 +714,33 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                     print("Model does not support LoRA. We will merge the lora adapter into the base model.")
                     # Will have to store both base and tuned in memory
                     mem_util = 0.4
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                    tmp_args_fname = Path(f"tmp_args_{timestamp}.json")
-                    save_args(train_args, tmp_args_fname)
                     if eval_args.cache_dir is None:
                         merge_dir = eval_args.tuned_checkpoint.parent / f"{eval_args.tuned_checkpoint.name}_merged"
                     else:
                         rel_path = Path(*eval_args.tuned_checkpoint.parent.absolute().parts[1:])
                         merge_dir = Path(eval_args.cache_dir) / rel_path / f"{eval_args.tuned_checkpoint.name}_merged"
-                    merge_command = \
-                        f'accelerate launch --num_processes 1' \
-                        f' {Path(__file__).parents[1] / "open_instruct/merge_lora_from_training.py"}' \
-                        f' --lora_model_name_or_path {eval_args.tuned_checkpoint}' \
-                        f' --train_args {tmp_args_fname}' \
-                        f' --output_dir {merge_dir}' \
-                        f' --save_tokenizer'
+                    if merge_dir.exists():
+                        print(f"The merged model directory {merge_dir} already exists. Skipping.")
+                    else:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                        tmp_args_fname = Path(f"tmp_args_{timestamp}.json")
+                        save_args(train_args, tmp_args_fname)
+                        merge_command = \
+                            f'accelerate launch --num_processes 1' \
+                            f' {Path(__file__).parents[1] / "open_instruct/merge_lora_from_training.py"}' \
+                            f' --lora_model_name_or_path {eval_args.tuned_checkpoint.absolute().as_posix()}' \
+                            f' --train_args {tmp_args_fname.absolute().as_posix()}' \
+                            f' --output_dir {merge_dir}' \
+                            f' --save_tokenizer'
+                        tmp_args_fname.unlink()
+                        merge_subprocess = subprocess.run(merge_command, shell=True, capture_output=True)
+                        if merge_subprocess.returncode != 0:
+                            print("Error while merging the model.")
+                            print(merge_subprocess.stdout.decode())
+                            print(merge_subprocess.stderr.decode())
+                            raise RuntimeError("Error while merging the model.")
                     eval_args.is_lora = False
-                    merge_subprocess = subprocess.run(merge_command, shell=True, check=True, capture_output=True)
                     eval_args.tuned_checkpoint = merge_dir
-                    tmp_args_fname.unlink()
-
                     # Don't need the base model anymore, will load the merged model later
                 else:
                     raise e
@@ -782,7 +790,8 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                     tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
                     trust_remote_code=True,
                     enable_lora=False,
-                    disable_sliding_window=True,
+                    disable_sliding_window=False,
+                    # disable_sliding_window=True,
                     gpu_memory_utilization=mem_util,
                 )
                 formatted_prompts, outputs = generate_responses_vllm(
