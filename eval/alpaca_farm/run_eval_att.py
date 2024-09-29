@@ -2,11 +2,10 @@ import sys
 import argparse
 from pathlib import Path
 import json
+from logging import getLogger
 
 import pandas as pd
 import datasets
-import accelerate
-from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from alpaca_eval import evaluate as alpaca_farm_evaluate
 
@@ -14,7 +13,8 @@ sys.path.append(str(Path(__file__).parents[2].absolute().as_posix()))
 from eval.utils import query_openai_chat_model, query_openai_model, run_att_model_for_eval, add_eval_args
 from open_instruct.load_utils import load_args, load_tokenizer_model
 
-logger = get_logger(__name__)
+# logger = get_logger(__name__)
+logger = getLogger(__name__)
 
 
 def evaluate(args):
@@ -122,5 +122,4 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
 
-    accelerator = accelerate.Accelerator()
     evaluate(args)
