@@ -125,10 +125,14 @@ def evaluate(args):
         print(f"Results already exist at {responses_graded_path}.")
 
     responses_log = json.load(open(responses_graded_path, "r"))
-    score_key = f"{args.evaluated_name}_score"
-    score_base_key = f"{args.evaluated_name}_base_score"
+    score_keys = [k for k in responses_log[0].keys() if k.endswith("_score") and not k.endswith("_base_score")]
+    assert len(score_keys) == 1, "Only one score key is supported for now."
+    score_key = score_keys[0]
     score_vals = np.array([log[score_key] for log in responses_log])
-    if score_base_key in responses_log[0]:
+
+    score_base_keys = [k for k in responses_log[0].keys() if k.endswith("_base_score")]
+    if score_base_keys:
+        score_base_key = score_base_keys[0]
         score_vals_base = np.array([log[score_base_key] for log in responses_log])
         # Some comparison stats
         print(f"Mean score: {score_vals.mean():.4f}+-{score_vals.std():.4f}"
