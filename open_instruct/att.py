@@ -170,6 +170,9 @@ def apply_att_template(example, tokenizer, max_seq_length, debug_print=False, lo
 
     prompt_text = tokenizer.decode(tokens, skip_special_tokens=False)
 
+    # something's up with this template
+    if tokenizer.chat_template == BAD_MISTRAL_CHAT_TEMPLATE:
+        prompt_text += " "
     prompt_text += ATT_RESPONSE_PREFIX
     prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
     end_idx = len(prompt_tokens)
