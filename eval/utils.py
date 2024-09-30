@@ -670,16 +670,24 @@ def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint, cache_dir=None):
 
 
 def run_att_model_for_eval(train_args, eval_args, chats):
+    def maybe_prepend_root(name_or_path):
+        if eval_args.base_model_root is not None and name_or_path is not None \
+                and (eval_args.base_model_root / name_or_path).exists():
+            return str(eval_args.base_model_root / name_or_path)
+        else:
+            return name_or_path
+
     import vllm
 
     eval_args = deepcopy(eval_args)
 
-    model_name_or_path = train_args.model_name_or_path
-    if eval_args.base_model_root is not None and (eval_args.base_model_root / model_name_or_path).exists():
-        model_name_or_path = str(eval_args.base_model_root / model_name_or_path)
-    tokenizer_name_or_path = (
-        train_args.tokenizer_name if train_args.tokenizer_name else model_name_or_path
-    )
+    model_name_or_path = maybe_prepend_root(train_args.model_name_or_path)
+    tokenizer_name_or_path = None
+    if hasattr(train_args, "tokenizer_name"):
+        tokenizer_name_or_path = maybe_prepend_root(train_args.tokenizer_name)
+    if tokenizer_name_or_path is None:
+        tokenizer_name_or_path = model_name_or_path
+
     hf_revision = train_args.model_revision
 
     tokenizer, _ = load_tokenizer(train_args, False)
@@ -724,7 +732,11 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                     else:
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                         tmp_args_fname = Path(f"tmp_args_{timestamp}.json")
-                        save_args(train_args, tmp_args_fname)
+                        train_args_copy = deepcopy(train_args)
+                        train_args_copy.model_name_or_path = maybe_prepend_root(train_args.model_name_or_path)
+                        if hasattr(train_args_copy, "tokenizer_name"):
+                            train_args_copy.tokenizer_name = maybe_prepend_root(train_args.tokenizer_name)
+                        save_args(train_args_copy, tmp_args_fname)
                         merge_command = \
                             f'python {Path(__file__).parents[1] / "open_instruct/merge_lora_from_training.py"}' \
                             f' --lora_model_name_or_path {eval_args.tuned_checkpoint.absolute().as_posix()}' \
@@ -925,4 +937,3 @@ def prepare_env():
         if "pinot" in os.environ[var]:
             print(f"Unsetting variable: {var}")
             os.environ.pop(var, None)  # Unset the variable
-
