@@ -58,6 +58,17 @@ def evaluate(args):
     alpaca_eval_data = alpaca_eval_data.filter(lambda x: x["instruction"] in prompts)
     # responses = [resp[""] for resp in responses_log]
 
+    if args.skip_scoring:
+        print(f'Skipping scoring step. The responses are saved in {responses_log_path.absolute()}')
+        return
+
+    metrics_file = output_dir / "metrics.json"
+    if metrics_file.exists():
+        with open(metrics_file, "r") as f:
+            metrics = json.load(f)
+        logger.info(f"Loaded metrics from {metrics_file}")
+        return metrics
+
     df_leaderboard, annotations = alpaca_farm_evaluate(
         model_outputs=responses_log,
         reference_outputs=alpaca_eval_data,
@@ -112,6 +123,8 @@ if __name__ == '__main__':
         type=int,
         help="The number of instances to subsample from the data."
     )
+    parser.add_argument('--skip_scoring', action='store_true',
+                        help='If set, the scoring step is skipped. Scoring does not need gpus.')
     parser.add_argument('--att_evaluate_base', action='store_true',
                         help='If set, evaluation is also run on the base model. Like this we dont need to run the base eval separately.')
     parser.add_argument('--output_dir', type=Path,
