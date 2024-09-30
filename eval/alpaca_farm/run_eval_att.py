@@ -11,7 +11,7 @@ from accelerate.utils import set_seed
 from alpaca_eval import evaluate as alpaca_farm_evaluate
 
 sys.path.append(str(Path(__file__).parents[2].absolute().as_posix()))
-from eval.utils import query_openai_chat_model, query_openai_model, run_att_model_for_eval, add_eval_args
+from eval.utils import query_openai_chat_model, query_openai_model, run_att_model_for_eval, add_eval_args, prepare_env
 from open_instruct.load_utils import load_args, load_tokenizer_model
 
 # logger = get_logger(__name__)
@@ -101,6 +101,8 @@ def evaluate(args):
 
 
 if __name__ == '__main__':
+    prepare_env()
+
     parser = argparse.ArgumentParser()
 
     add_eval_args(parser)
