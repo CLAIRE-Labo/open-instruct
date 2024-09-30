@@ -19,7 +19,7 @@ from alpaca_eval import evaluate as alpaca_farm_evaluate
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 sys.path.append(str(Path(__file__).parents[2].absolute().as_posix()))
-from eval.utils import query_openai_chat_model, query_openai_model, run_att_model_for_eval, add_eval_args
+from eval.utils import query_openai_chat_model, query_openai_model, run_att_model_for_eval, add_eval_args, prepare_env
 from open_instruct.load_utils import load_args, load_tokenizer_model
 
 # logger = get_logger(__name__)
@@ -145,15 +145,7 @@ def evaluate(args):
 
 
 if __name__ == '__main__':
-    print(f"Entered the script")
-    # Iterate over a list of environment variables whose value contains "pinot"
-    for var in list(os.environ):  # Convert to list to avoid runtime changes during iteration
-        if "pinot" in os.environ[var]:
-            print(f"Unsetting variable: {var}")
-            os.environ.pop(var, None)  # Unset the variable
-
-    variables_to_check = [var for var in os.environ if 'pino' in os.environ.get(var, '')]
-    print(f"Variables to check: {variables_to_check}")
+    prepare_env()
 
     parser = argparse.ArgumentParser()
 
@@ -174,7 +166,7 @@ if __name__ == '__main__':
                         help='If set, evaluation is also run on the base model. Like this we dont need to run the base eval separately.')
     parser.add_argument('--output_dir', type=Path,
                         default="reward",
-                        help='Output directory to save results. Default is into {tuned_checkpoint}/eval/alpaca_farm ')
+                        help='Output directory to save results. Default is into {tuned_checkpoint}/eval/reward ')
     parser.add_argument(
         "--reward_model",
         type=str,

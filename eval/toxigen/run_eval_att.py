@@ -6,21 +6,19 @@ import os
 import random
 from collections import defaultdict
 from pathlib import Path
+from logging import getLogger
 
 import torch
-import vllm
 from tqdm import tqdm, trange
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import accelerate
-from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 
 sys.path.append(str(Path(__file__).parents[2].absolute().as_posix()))
-from eval.utils import add_eval_args, run_att_model_for_eval
+from eval.utils import add_eval_args, run_att_model_for_eval, prepare_env
 
 from open_instruct.load_utils import load_args
 
-logger = get_logger(__name__)
+logger = getLogger(__name__)
 
 
 @torch.no_grad()
@@ -38,14 +36,17 @@ def score_generations(
     return classifications
 
 
-def evaluate(accelerator, args):
+def evaluate(args):
     set_seed(239)
 
     train_args = load_args(args.train_run_args)
-
-    output_dir = args.tuned_checkpoint / "eval" / "toxigen" if args.output_dir is None else args.output_dir
+    if args.cache_dir is not None:
+        rel_path = Path(*args.tuned_checkpoint.absolute().parts[1:])
+        output_dir = args.cache_dir / rel_path / "eval" / args.output_dir
+    else:
+        output_dir = args.tuned_checkpoint / "eval" / args.output_dir
     if output_dir.exists():
-        logger.warning(f"Output directory {output_dir} already exists. Will see if the outputs are cached.")
+        print(f"Output directory {output_dir} already exists. Will see if the outputs are cached.")
     output_dir.mkdir(parents=True, exist_ok=True)
     responses_log_path = output_dir / "responses.json"
 
@@ -81,8 +82,6 @@ def evaluate(accelerator, args):
             }
         ]
         chats.append(messages)
-
-    chats = chats[:10]  # For testing
 
     responses_log = []
     if responses_log_path.exists():
@@ -150,18 +149,28 @@ def evaluate(accelerator, args):
 
 
 if __name__ == "__main__":
+    prepare_env()
+
     parser = argparse.ArgumentParser()
 
     # model and data loading
     add_eval_args(parser)
 
     parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument('--output_dir', type=Path,
+                        default="toxigen",
+                        help='Output directory to save results. Default is into {tuned_checkpoint}/eval/toxigen ')
     # toxicity classifier
     parser.add_argument(
         "--classifier_batch_size",
         type=int,
         default=32,
         help="Batch size to use for toxicity classifier.",
+    )
+    parser.add_argument(
+        "--att_evaluate_base",
+        action="store_true",
+        help="If given, we will also evaluate the base model. Only works if the main method is ATT",
     )
     parser.add_argument(
         "--classifier_device",
@@ -177,5 +186,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    accelerator = accelerate.Accelerator()
-    evaluate(accelerator, args)
+    evaluate(args)

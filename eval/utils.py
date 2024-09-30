@@ -913,3 +913,16 @@ def run_att_model_for_eval(train_args, eval_args, chats):
             print(f"Prompt: {prompt} \nResponse: {log_entry['output']}")
 
     return responses_log
+
+
+def prepare_env():
+    if 'OPENAI_API_KEY_AT' in os.environ:
+        with open(os.environ.get('OPENAI_API_KEY_AT', '.openai'), 'r') as f:
+            os.environ['OPENAI_API_KEY'] = f.read().strip()
+
+    # Iterate over a list of environment variables whose value contains "pinot"
+    for var in list(os.environ):  # Convert to list to avoid runtime changes during iteration
+        if "pinot" in os.environ[var]:
+            print(f"Unsetting variable: {var}")
+            os.environ.pop(var, None)  # Unset the variable
+

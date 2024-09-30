@@ -11,12 +11,11 @@ import gpustat
 import random
 import wandb
 from pathlib import Path
+from logging import getLogger
 
-import accelerate
-from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 
-sys.path.append(Path(__file__).parents[1].absolute().as_posix())
+sys.path.append(Path(__file__).parents[2].absolute().as_posix())
 from open_instruct.load_utils import load_args
 from eval.utils import (
     load_hf_lm,
@@ -27,6 +26,7 @@ from eval.utils import (
     generate_completions,
     score_completions,
     dynamic_import_function,
+    prepare_env,
 )
 from eval.truthfulqa.utilities import (
     format_prompt,
@@ -39,7 +39,7 @@ from eval.truthfulqa.metrics import run_gpt_classifier_eval, run_hf_classifier_e
     run_BLEURT, run_MAUVE
 from eval.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
 
-logger = get_logger(__name__)
+logger = getLogger(__name__)
 
 
 def get_gpu_memory():
@@ -110,20 +110,25 @@ def format_frame(results):
 
 
 def main(args):
+    prepare_env()
+
     global bleurt_scorer
 
-    accelerator = accelerate.Accelerator()
     set_seed(239)
 
     train_args = load_args(args.train_run_args)
-    model_key_tuned = train_args.model_name_or_path + "+" + args.name_tag
-    model_keys = [model_key_tuned]
-
-    output_dir = args.tuned_checkpoint / "eval" / args.output_dir
+    if args.cache_dir is not None:
+        rel_path = Path(*args.tuned_checkpoint.absolute().parts[1:])
+        output_dir = args.cache_dir / rel_path / "eval" / args.output_dir
+    else:
+        output_dir = args.tuned_checkpoint / "eval" / args.output_dir
     if output_dir.exists():
-        logger.warning(f"Output directory {output_dir} already exists. Will see if the outputs are cached.")
+        print(f"Output directory {output_dir} already exists. Will see if the outputs are cached.")
     output_dir.mkdir(parents=True, exist_ok=True)
     responses_log_path = output_dir / "responses.json"
+
+    model_key_tuned = train_args.model_name_or_path + "-tuned"
+    model_keys = [model_key_tuned]
 
     questions = pd.read_csv(os.path.join(args.data_dir, "TruthfulQA.csv"))  # .head(10)
 
@@ -270,8 +275,6 @@ def parse_args():
         action="store_true",
         help="Set to evaluate the base model in addition to ATT"
     )
-    parser.add_argument("--name_tag", type=str, required=True,
-                        help="Name tag for the evaluated model. Will be used to name the columns with results")
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -295,7 +298,7 @@ def parse_args():
     parser.add_argument(
         '--metrics',
         nargs='+',
-        default=['bleu', 'rouge', 'bleurt'],
+        default=['truth', 'info'],
         choices=['truth', 'info', 'mc', 'bleu', 'rouge', 'bleurt'],
         help='Metrics to run'
     )
@@ -315,13 +318,15 @@ def parse_args():
         '--hf_truth_model_name_or_path',
         type=str,
         help='A trained HuggingFace judge model name to be used for computing the metrics for `truth` if it is specified.' \
-             'Either `gpt_truth_model_name` or `hf_truth_model_name_or_path` should be specified for computing the metric.'
+             'Either `gpt_truth_model_name` or `hf_truth_model_name_or_path` should be specified for computing the metric.',
+        default='allenai/truthfulqa-truth-judge-llama2-7B'
     )
     parser.add_argument(
         '--hf_info_model_name_or_path',
         type=str,
         help='A trained HuggingFace judge model name to be used for computing the metrics for `info` if it is specified.' \
-             'Either `gpt_info_model_name` or `hf_info_model_name_or_path` should be specified for computing the metric.'
+             'Either `gpt_info_model_name` or `hf_info_model_name_or_path` should be specified for computing the metric.',
+        default='allenai/truthfulqa-info-judge-llama2-7B'
     )
     parser.add_argument(
         "--recursive_test",
@@ -334,5 +339,7 @@ def parse_args():
 
 
 if __name__ == '__main__':
+    prepare_env()
+
     args = parse_args()
     main(args)
