@@ -106,7 +106,7 @@ def evaluate(args):
     print(df_leaderboard.to_string(float_format="%.2f"))
 
     # save to json
-    with open(output_dir / f"metrics.json", "w") as fout:
+    with open(metrics_file, "w") as fout:
         json.dump(df_leaderboard.to_dict(), fout)
     return df_leaderboard.to_dict()
 
