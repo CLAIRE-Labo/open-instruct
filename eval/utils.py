@@ -623,7 +623,9 @@ def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint, cache_dir=None):
         rel_path = Path(*tuned_checkpoint.parent.absolute().parts[1:])
         reformatted_checkpoint = Path(cache_dir) / rel_path / f"{tuned_checkpoint.stem}_reformatted"
     print(f"Reformatted checkpoint path: {reformatted_checkpoint}")
-    if reformatted_checkpoint.exists():
+    if reformatted_checkpoint.exists() \
+            and (reformatted_checkpoint / "adapter_model.safetensors").exists() \
+            and (reformatted_checkpoint / "new_embeddings.safetensors").exists():
         print("Reformatted checkpoint already exists. Skipping.")
         return reformatted_checkpoint
 
@@ -745,12 +747,13 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                             f' --save_tokenizer'
                         print(f"Running merge command:\n{merge_command}")
                         merge_subprocess = subprocess.run(merge_command, shell=True, capture_output=True)
-                        tmp_args_fname.unlink()
                         if merge_subprocess.returncode != 0:
                             print("Error while merging the model.")
                             print(merge_subprocess.stdout.decode())
                             print(merge_subprocess.stderr.decode())
                             raise RuntimeError("Error while merging the model.")
+                        tmp_args_fname.unlink()
+
                     eval_args.is_lora = False
                     eval_args.tuned_checkpoint = merge_dir
                     # Don't need the base model anymore if evaluating a non-ATT model, will load the merged model later
