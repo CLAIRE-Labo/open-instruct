@@ -682,6 +682,9 @@ def run_att_model_for_eval(train_args, eval_args, chats):
     import vllm
 
     eval_args = deepcopy(eval_args)
+    train_args = deepcopy(train_args)
+    # Otherwise causes every process to redownload the tokenizer, and everything crumbles horribly
+    train_args.ignore_model_cache = False
 
     model_name_or_path = maybe_prepend_root(train_args.model_name_or_path)
     tokenizer_name_or_path = None
@@ -691,6 +694,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
         tokenizer_name_or_path = model_name_or_path
 
     hf_revision = train_args.model_revision
+
 
     tokenizer, _ = load_tokenizer(train_args, False)
 
