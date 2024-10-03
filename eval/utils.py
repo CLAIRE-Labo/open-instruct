@@ -630,7 +630,7 @@ def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint, cache_dir=None):
         return reformatted_checkpoint
 
     print("Reformatting checkpoint...")
-    reformatted_checkpoint.mkdir(parents=True)
+    reformatted_checkpoint.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(tuned_checkpoint / "adapter_config.json", reformatted_checkpoint / "adapter_config.json")
 
     all_tensors = {}
