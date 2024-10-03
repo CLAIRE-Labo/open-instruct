@@ -17,15 +17,13 @@ sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 from open_instruct.att import apply_att_template
 from open_instruct.load_utils import load_args, load_tokenizer_model
 
-logger = get_logger(__name__)
-
 
 def generate_response(model, tokenizer, chat, generation_config):
     assert generation_config.max_new_tokens is not None
     max_prompt_len = generation_config.max_length - generation_config.max_new_tokens
     input_ids = tokenizer.apply_chat_template(chat, add_generation_prompt=True)
     if len(input_ids) > max_prompt_len:
-        logger.warning(f"generate_response: truncated input of size {len(input_ids)} to {max_prompt_len}")
+        print(f"WARNING: generate_response: truncated input of size {len(input_ids)} to {max_prompt_len}")
         input_ids = input_ids[-max_prompt_len:]
     input_text = tokenizer.decode(input_ids)
 
@@ -84,12 +82,12 @@ def generate_responses_vllm_att(model, tokenizer, chats, sampling_params, lora_r
         chosen.append({"role": "assistant", "content": ""})
 
         data = apply_att_template({'chosen': chosen, 'rejected': rejected}, tokenizer=tokenizer, max_seq_length=1024,
-                                  debug_print=False, logger=logger)
+                                  debug_print=False, logger=None)
         input_ids = data['input_ids']
         labels = data['labels']
         prompt_ids = input_ids[labels == -100]
         if len(prompt_ids) > 2048:
-            logger.warning(f"generate_responses_vllm_att_lora truncated input of size {len(prompt_ids)} to 2048")
+            print(f"WARNING: generate_responses_vllm_att_lora truncated input of size {len(prompt_ids)} to 2048")
             prompt_ids = input_ids[-2048:]
         prompt_text = tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=False)
         prompts_att.append(prompt_text)
@@ -121,7 +119,7 @@ def generate_responses_vllm_att(model, tokenizer, chats, sampling_params, lora_r
         args = ["python", vllm_script, att_model_checkpoint, "--tokenizer_name", tokenizer_name, "--pickle_prompts",
                 pickle_prompts, "--pickle_sampling_params", pickle_sampling_params, "--pickle_output", pickle_output,
                 "--mem_util", "0.4", "--batch_size", "30"]
-        logger.info(f"Running: {' '.join(args)}")
+        print(f"Running: {' '.join(args)}")
         subprocess.run(args, capture_output=True, check=True)
         with open(pickle_output, "rb") as f:
             responses_att = pickle.load(f)
@@ -159,12 +157,12 @@ def generate_response_att_lora(model, tokenizer, chat, generation_config):
     chosen.append({"role": "assistant", "content": ""})
 
     data = apply_att_template({'chosen': chosen, 'rejected': rejected}, tokenizer=tokenizer, max_seq_length=1024,
-                              debug_print=False, logger=logger)
+                              debug_print=False)
     input_ids = data['input_ids']
     labels = data['labels']
     prompt_ids = input_ids[labels == -100]
     if len(prompt_ids) > max_prompt_len:
-        logger.warning(f"generate_response_att_lora truncated input of size {len(prompt_ids)} to {max_prompt_len}")
+        print(f"WARNING: generate_response_att_lora truncated input of size {len(prompt_ids)} to {max_prompt_len}")
         prompt_ids = input_ids[-max_prompt_len:]
     prompt_text = tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=False)
     # print(f"Prompt: \n\n{prompt_text}\n\n")
@@ -192,7 +190,7 @@ def main(args):
     train_args = load_args(args.train_run_args)
     model, tokenizer, actual_eos_token, _, _ = load_tokenizer_model(accelerator, train_args)
     actual_eos_token_id = tokenizer.encode(actual_eos_token)[0]
-    logger.info(f"{actual_eos_token_id=}")
+    print(f"{actual_eos_token_id=}")
     print(f"{actual_eos_token_id=}")
     model.load_adapter(str(args.lora_checkpoint))
     model = model.cuda()
