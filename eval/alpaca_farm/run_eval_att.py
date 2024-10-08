@@ -67,48 +67,55 @@ def evaluate(args):
         with open(metrics_file, "r") as f:
             metrics = json.load(f)
         logger.info(f"Loaded metrics from {metrics_file}")
-        return metrics
-
-    df_leaderboard, annotations = alpaca_farm_evaluate(
-        model_outputs=responses_log,
-        reference_outputs=alpaca_eval_data,
-        annotators_config="alpaca_eval_gpt4",
-        output_path=output_dir,
-        is_return_instead_of_print=True,
-        caching_path=output_dir / "alpaca_eval_annotator_cache_att.json",
-        precomputed_leaderboard=None,
-        is_cache_leaderboard=False,
-        metric_kwargs={"save_weights_dir": output_dir / "weights/finetuned"},
-    )
-
-    if (not args.not_att) and args.att_evaluate_base:
-        # We also evaluate the base model
-        base_data = []
-        for resp in responses_log:
-            base_data.append({
-                "instruction": resp["instruction"],
-                "output": resp["response_base"],
-                "generator": train_args.model_name_or_path
-            })
-        base_leaderboard, base_annotations = alpaca_farm_evaluate(
-            model_outputs=base_data,
+        print(pd.DataFrame(metrics).to_string(float_format="%.2f"))
+    else:
+        df_leaderboard, annotations = alpaca_farm_evaluate(
+            model_outputs=responses_log,
             reference_outputs=alpaca_eval_data,
             annotators_config="alpaca_eval_gpt4",
             output_path=output_dir,
             is_return_instead_of_print=True,
-            caching_path=output_dir / "alpaca_eval_annotator_cache_base.json",
+            caching_path=output_dir / "alpaca_eval_annotator_cache_att.json",
             precomputed_leaderboard=None,
             is_cache_leaderboard=False,
-            metric_kwargs={"save_weights_dir": output_dir / "weights/base"},
+            metric_kwargs={"save_weights_dir": output_dir / "weights/finetuned"},
         )
-        df_leaderboard = pd.concat([df_leaderboard, base_leaderboard])
+        print(df_leaderboard.to_string(float_format="%.2f"))
+        # save to json
+        with open(metrics_file, "w") as fout:
+            json.dump(df_leaderboard.to_dict(), fout)
 
-    print(df_leaderboard.to_string(float_format="%.2f"))
+    if (not args.not_att) and args.att_evaluate_base:
+        base_metrics_file = output_dir / "metrics_base.json"
+        if base_metrics_file.exists():
+            with open(base_metrics_file, "r") as f:
+                base_metrics = json.load(f)
+            logger.info(f"Loaded metrics from {base_metrics_file}")
+            print(pd.DataFrame(base_metrics).to_string(float_format="%.2f"))
+        else:
+            # We also evaluate the base model
+            base_data = []
+            for resp in responses_log:
+                base_data.append({
+                    "instruction": resp["instruction"],
+                    "output": resp["response_base"],
+                    "generator": train_args.model_name_or_path
+                })
+            base_leaderboard, base_annotations = alpaca_farm_evaluate(
+                model_outputs=base_data,
+                reference_outputs=alpaca_eval_data,
+                annotators_config="alpaca_eval_gpt4",
+                output_path=output_dir,
+                is_return_instead_of_print=True,
+                caching_path=output_dir / "alpaca_eval_annotator_cache_base.json",
+                precomputed_leaderboard=None,
+                is_cache_leaderboard=False,
+                metric_kwargs={"save_weights_dir": output_dir / "weights/base"},
+            )
+            print(base_leaderboard.to_string(float_format="%.2f"))
+            with open(base_metrics_file, "w") as fout:
+                json.dump(base_leaderboard.to_dict(), fout)
 
-    # save to json
-    with open(metrics_file, "w") as fout:
-        json.dump(df_leaderboard.to_dict(), fout)
-    return df_leaderboard.to_dict()
 
 
 if __name__ == '__main__':

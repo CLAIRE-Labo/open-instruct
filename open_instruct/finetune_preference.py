@@ -1,28 +1,24 @@
 #!/usr/bin/env python
 # coding=utf-8
+
 import os
 import sys
 import time
 import html
 import json
-from heapq import merge
-from copy import deepcopy
 from typing import Dict, List, Tuple
 from pathlib import Path
 import argparse
 from argparse import Namespace
 import logging
 import math
-import ast
 import os
 import random
 from datetime import timedelta, datetime
 import torch
 from functools import partial
-import subprocess
 
 import numpy as np
-from torch.cuda import memory_allocated
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed, InitProcessGroupKwargs, gather_object, broadcast_object_list
@@ -37,7 +33,6 @@ import huggingface_hub
 import transformers
 from transformers import (
     GenerationConfig,
-    DataCollatorForSeq2Seq,
     get_scheduler,
 )
 
@@ -47,7 +42,6 @@ from load_utils import (add_common_training_args, pretty_print_chatml, preproces
 from att import apply_att_template, add_att_args, neg_crossentropy, DataCollatorForATT, preprocess_for_symmetric_att, \
     has_responses, compute_loss_att, load_base_generations
 
-from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
 
 # from eval.truthfulqa.run_eval import main as run_eval
 # from eval.truthfulqa.run_eval import parse_args as parse_args_eval
@@ -58,11 +52,12 @@ from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
 logger = get_logger(__name__)
 import pandas as pd
 
+
 if __name__ == "__main__":
-    try:
-        from hf_olmo import OLMoTokenizerFast
-    except ImportError:
-        logger.warning("OLMo not installed. Ignore if using a different model.")
+    # try:
+    #     from hf_olmo import OLMoTokenizerFast
+    # except ImportError:
+    #     logger.warning("OLMo not installed. Ignore if using a different model.")
 
     # wandb login stage
     api_key_file = os.getenv('WANDB_API_KEY_FILE_AT')
@@ -289,8 +284,8 @@ def main():
 
 
     # COMMENT OUT! This is for debugging
-    # dataset_train = dataset_train.select(range(24))
-    # dataset_test = dataset_test.select(range(24))
+    dataset_train = dataset_train.select(range(240))
+    dataset_test = dataset_test.select(range(240))
 
     for i in range(10):
         logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(dataset_train[i]['chosen'])}\n\n"
@@ -307,6 +302,7 @@ def main():
         preprocess_for_symmetric_att,
         tokenizer=tokenizer,
         max_seq_length=args.max_seq_length,
+        att_loss=args.loss,
         logger=logger,
     )
 
@@ -620,9 +616,9 @@ def main():
                     if args.with_tracking:
                         accelerator.log(
                             {
-                                "learning_rate": lr_scheduler.get_last_lr()[0],
-                                "train_loss": avg_loss,
-                                "global_step": global_step,
+                                "train/learning_rate": lr_scheduler.get_last_lr()[0],
+                                "train/loss": avg_loss,
+                                "train/global_step": global_step,
                                 **avg_logs,
                             },
                         )
@@ -677,7 +673,7 @@ def main():
 
         logs["eval/avg_loss_per_label"] = (total_loss / total_num_labels).item()
         logs["eval/avg_loss_per_entry"] = (total_loss / len(test_dataset)).item()
-        logs["eval/ppl"] = np.exp(total_sum_logs["mlog_pi_t_yplus_sum"] / total_num_labels)
+        logs["eval/ppl"] = np.exp(-total_sum_logs["logp_yplus_att_sum"] / total_num_labels)
         logs["eval/total_num_labels"] = total_num_labels
         logs["eval/total_num_entries"] = len(test_dataset)
 

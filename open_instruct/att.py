@@ -42,7 +42,7 @@ def add_att_args(parser: argparse.ArgumentParser):
         "--loss",
         default="ce",
         choices=["ce", "symmetric", "symmetric_progressive", "symmetric_dpo", "symmetric_dpo_progressive",
-                 "symmetric_hinge", "ipo"],
+                 "symmetric_hinge", "ipo", "nonsymmetric_dpo_corrected", "dpo_corrected", "dpo_corrected_stopgrad"],
     )
 
     parser.add_argument('--dpo_use_lambda', action='store_true', help='If set, DPO is mixed with an SFT loss.')
@@ -56,6 +56,25 @@ def add_att_args(parser: argparse.ArgumentParser):
         '--hinge_delta', type=float, default=0.0,
         help='Delta used in the symmetric_hinge loss.'
     )
+
+
+# Losses that have a term for pi(y- | x, y-) and hence require the y- to be cropped to a fixed length.
+def loss_requires_yminus_yminus(loss):
+    return loss in ["nonsymmetric_dpo_corrected", "dpo_corrected", "dpo_corrected_stopgrad"]
+
+
+# Losses that have a term for pi(y+ | x, y+) and hence require the y+ to be cropped to a fixed length.
+def loss_requires_yplus_yplus(loss):
+    return loss in ["dpo_corrected", "dpo_corrected_stopgrad"]
+
+
+# Losses that have a term for pi(y- | x, y+)
+def loss_requires_yminus(loss):
+    return loss in ["symmetric", "symmetric_progressive", "symmetric_dpo", "symmetric_dpo_progressive",
+                    "symmetric_hinge", "dpo_corrected", "dpo_corrected_stopgrad"]
+
+
+# Note: all losses require pi(y+ | x, y-)
 
 
 def load_base_generations(base_generations_dir: str, existing_dataset: Dataset) -> Dataset:
@@ -259,7 +278,7 @@ def encode_with_chat_template(chat, tokenizer, max_seq_length, debug_print=False
 # 2. The remaining context budget is max_seq_length - prompt_len - slack_len (slack_len is for the template tokens)
 # 2. If the examples don't fit, first try cropping yminus to 1/3 of the remaining budget.
 # 3. If the examples still don't fit, crop yplus until they do.
-def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, slack_len=70, debug_print=False,
+def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, att_loss, slack_len=70, debug_print=False,
                                  logger=None):
     example = deepcopy(example)
     yplus_ref_orig = encode_with_chat_template(example['chosen'], tokenizer, max_seq_length, debug_print, logger)
@@ -269,8 +288,6 @@ def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, slack_len=7
     yminus_tokens = tokenizer.encode(example['rejected'][-1]['content'], add_special_tokens=False)
 
     prompt_len = (yplus_ref_orig['labels'] == -100).sum().item()
-    yplus_len = len(yplus_tokens)
-    yminus_len = len(yminus_tokens)
 
     if prompt_len >= max_seq_length:
         logger.warning(f"Prompt is too long: {prompt_len}")
@@ -287,6 +304,27 @@ def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, slack_len=7
             "yminus_ref": dummy_input,
         }
 
+    if loss_requires_yminus_yminus(att_loss):
+        # Losses that use logprobs of the form pi(y- | x,y-)
+        yminus_max_len = (max_seq_length - prompt_len - slack_len) // 2
+        if len(yminus_tokens) > yminus_max_len:
+            yminus_tokens = yminus_tokens[:yminus_max_len]
+
+    if loss_requires_yplus_yplus(att_loss):
+        # Losses that use logprobs of the form pi(y+ | x,y+)
+        yplus_max_len = (max_seq_length - prompt_len - slack_len) // 2
+        if len(yplus_tokens) > yplus_max_len:
+            yplus_tokens = yplus_tokens[:yplus_max_len]
+
+    yplus_len = len(yplus_tokens)
+    yminus_len = len(yminus_tokens)
+
+    # Losses that use logprobs of the form pi(y+ | x,y-) and potentially pi(y- | x,y+)
+    # Cropping strategy:
+    # 1. Do not crop the prompt. If it is too long, discard the example.
+    # 2. The remaining context budget is max_seq_length - prompt_len - slack_len (slack_len is for the template tokens)
+    # 2. If the examples don't fit, first try cropping yminus to 1/3 of the remaining budget.
+    # 3. If the examples still don't fit, crop yplus until they do.
     remaining_budget = max_seq_length - prompt_len - slack_len
     yminus_len_cropped = min(yminus_len, remaining_budget // 3)
     if prompt_len + yminus_len + yplus_len + slack_len <= max_seq_length:
@@ -295,15 +333,15 @@ def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, slack_len=7
     elif prompt_len + yminus_len_cropped + yplus_len + slack_len <= max_seq_length:
         # Only need to crop yminus
         yminus_len_necessary = max_seq_length - prompt_len - yplus_len - slack_len
-        yminus_cropped_tok = yminus_tokens[:yminus_len_necessary]
-        example['rejected'][-1]['content'] = tokenizer.decode(yminus_cropped_tok, skip_special_tokens=False)
+        yminus_tokens = yminus_tokens[:yminus_len_necessary]
     else:
         # Crop both yminus and yplus
-        yminus_cropped_tok = yminus_tokens[:yminus_len_cropped]
-        example['rejected'][-1]['content'] = tokenizer.decode(yminus_cropped_tok, skip_special_tokens=False)
+        yminus_tokens = yminus_tokens[:yminus_len_cropped]
         yplus_len_necessary = max_seq_length - prompt_len - yminus_len_cropped - slack_len
-        yplus_cropped_tok = yplus_tokens[:yplus_len_necessary]
-        example['chosen'][-1]['content'] = tokenizer.decode(yplus_cropped_tok, skip_special_tokens=False)
+        yplus_tokens = yplus_tokens[:yplus_len_necessary]
+
+    example['rejected'][-1]['content'] = tokenizer.decode(yminus_tokens, skip_special_tokens=False)
+    example['chosen'][-1]['content'] = tokenizer.decode(yplus_tokens, skip_special_tokens=False)
 
     yplus_ref = encode_with_chat_template(example['chosen'], tokenizer, max_seq_length, debug_print, logger)
     yminus_ref = encode_with_chat_template(example['rejected'], tokenizer, max_seq_length, debug_print, logger)
@@ -312,21 +350,25 @@ def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, slack_len=7
     yminus_att = apply_att_template({'chosen': example['rejected'], 'rejected': example['chosen']}, tokenizer,
                                     max_seq_length, debug_print, logger)
 
-    assert yplus_att['input_ids'].shape[
-               0] <= max_seq_length, f"yplus_att is too long: {yplus_att['input_ids'].shape[0]}"
-    assert yminus_att['input_ids'].shape[
-               0] <= max_seq_length, f"yminus_att is too long: {yminus_att['input_ids'].shape[0]}"
-    assert yplus_ref['input_ids'].shape[
-               0] <= max_seq_length, f"yplus_ref is too long: {yplus_ref['input_ids'].shape[0]}"
-    assert yminus_ref['input_ids'].shape[
-               0] <= max_seq_length, f"yminus_ref is too long: {yminus_ref['input_ids'].shape[0]}"
-
-    return {
+    result = {
         "yplus_att": yplus_att,
         "yminus_att": yminus_att,
         "yplus_ref": yplus_ref,
         "yminus_ref": yminus_ref,
     }
+    if loss_requires_yminus_yminus(att_loss):
+        yminus_yminus_att = apply_att_template({'chosen': example['rejected'], 'rejected': example['rejected']},
+                                               tokenizer, max_seq_length, debug_print, logger)
+        result["yminus_yminus_att"] = yminus_yminus_att
+    if loss_requires_yplus_yplus(att_loss):
+        yplus_yplus_att = apply_att_template({'chosen': example['chosen'], 'rejected': example['chosen']},
+                                             tokenizer, max_seq_length, debug_print, logger)
+        result["yplus_yplus_att"] = yplus_yplus_att
+
+    for name, inputs in result.items():
+        assert inputs['input_ids'].shape[0] <= max_seq_length, f"{name} is too long: {inputs['input_ids'].shape[0]}"
+
+    return result
 
 
 # Old cropping strategy for symmetric ATT
@@ -398,38 +440,33 @@ def neg_crossentropy(outputs, labels, reduce_loss='sum'):
         # more discussion and details.
         num_labels = (labels != -100).sum()
         loss = outputs.loss * num_labels
-
-        # logits = outputs.logits
-        # # Shift so that tokens < n predict n
-        # shift_logits = logits[..., :-1, :].contiguous()
-        # shift_labels = labels[..., 1:].contiguous()
-        # # Flatten the tokens
-        # loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
-        # shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-        # shift_labels = shift_labels.view(-1)
-        # # Enable model parallelism
-        # shift_labels = shift_labels.to(shift_logits.device)
-        # loss = loss_fct(shift_logits, shift_labels)
-        # print(f"loss: {loss}, alt_loss: {alt_loss} rel_err = {(loss - alt_loss) / alt_loss}")
-
     else:
         raise ValueError(f"Unknown reduce_loss value: {reduce_loss}")
     return loss
 
 
-def compute_loss_att(accelerator, model, batch, args, percentage_complete: float=0.5, eval=False, debug=False):
-    def log_neg_ce(value, labels, name):
-        num_predicted = (labels != -100).sum().item()
-        if args.reduce_loss == 'mean':
-            return {name + "_avg": value.item(), name + "_sum": value.item() * num_predicted}
-        elif args.reduce_loss == 'sum':
-            return {name + "_sum": value.item(), name + "_avg": value.item() / num_predicted}
-
+def compute_loss_att(accelerator, model, batch, args, percentage_complete: float = 0.5, eval=False, debug=False):
     logs = {}
-    with torch.set_grad_enabled(not eval):
-        yplus_outputs = model(**batch["yplus_att"])
-        yplus_neg_ce = neg_crossentropy(yplus_outputs, batch["yplus_att"]["labels"], args.reduce_loss)
-    logs = {**logs, **log_neg_ce(yplus_neg_ce, batch["yplus_att"]["labels"], "mlog_pi_t_yplus")}
+
+    def get_logprobs(name, disable_grad=False):
+        nonlocal logs, eval
+        with torch.set_grad_enabled(not (eval or disable_grad)):
+            outputs = model(**batch[name])
+            mean_logprobs = -outputs.loss
+            sum_logprobs = mean_logprobs * (batch[name]["labels"] != -100).sum()
+        logs = {**logs, "logp_" + name + "_avg": mean_logprobs.item(), "logp_" + name + "_sum": sum_logprobs.item()}
+
+        if args.reduce_loss == 'mean':
+            return mean_logprobs
+        elif args.reduce_loss == 'sum':
+            return sum_logprobs
+        else:
+            raise ValueError(f"Unknown reduce_loss value: {args.reduce_loss}")
+
+    yplus_logprobs = get_logprobs("yplus_att")
+
+    if args.loss == "ce":
+        return -yplus_logprobs, logs
 
     if "progressive" in args.loss:
         lam = args.loss_lambda * percentage_complete
@@ -437,63 +474,57 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
     else:
         lam = args.loss_lambda
 
-    if args.loss == "ce":
-        return yplus_neg_ce, logs
-
-    with torch.set_grad_enabled(not eval):
-        yminus_outputs = model(**batch["yminus_att"])
-        yminus_neg_ce = neg_crossentropy(yminus_outputs, batch["yminus_att"]["labels"], args.reduce_loss)
-    logs = {**logs, **log_neg_ce(yminus_neg_ce, batch["yminus_att"]["labels"], "mlog_pi_t_yminus")}
+    yminus_logprobs = get_logprobs("yminus_att") if loss_requires_yminus(args.loss) else None
+    disable_grad = args.loss == "dpo_corrected_stopgrad"
+    yminus_yminus_logprobs = get_logprobs("yminus_yminus_att", disable_grad=disable_grad) \
+        if loss_requires_yminus_yminus(args.loss) else None
+    yplus_yplus_logprobs = get_logprobs("yplus_yplus_att", disable_grad=disable_grad) \
+        if loss_requires_yplus_yplus(args.loss) else None
 
     if args.loss in ["symmetric", "symmetric_progressive"]:
         # Loss1
-        diff = -yplus_neg_ce.detach() + args.neg_example_strength * yminus_neg_ce
-        logs["log_pi_t_diff"] = diff.item()
-        return yplus_neg_ce + lam * F.softplus(-diff), logs
+        diff = yplus_logprobs.detach() - args.neg_example_strength * yminus_logprobs
+        logs["logp_diff"] = diff.item()
+        return -yplus_logprobs + lam * F.softplus(-diff), logs
     elif args.loss == "symmetric_hinge":
         # Loss2
-        diff = -yplus_neg_ce.detach() + args.neg_example_strength * yminus_neg_ce
-        logs["log_pi_t_diff"] = diff.item()
-        return yplus_neg_ce + args.loss_lambda * torch.relu(args.hinge_delta - diff), logs
-    elif args.loss in ["symmetric_dpo", "symmetric_dpo_progressive", "ipo"]:
-        # assert isinstance(model, )
-        yplus_ref_outputs = None
-        yminus_ref_outputs = None
-        with torch.no_grad():
-            if args.use_lora:
-                if debug:
-                    yplus_nodisable_outputs = model(**batch["yplus_ref"])
-                    yminus_nodisable_outputs = model(**batch["yminus_ref"])
-                    yplus_nodisable_ce = neg_crossentropy(yplus_nodisable_outputs, batch["yplus_ref"]["labels"],
-                                                          args.reduce_loss)
-                    yminus_nodisable_ce = neg_crossentropy(yminus_nodisable_outputs, batch["yminus_ref"]["labels"],
-                                                           args.reduce_loss)
-                    logs = {**logs,
-                            **log_neg_ce(yplus_nodisable_ce, batch["yplus_ref"]["labels"], "mlog_pi_yplus_nodisable")}
-                    logs = {**logs, **log_neg_ce(yminus_nodisable_ce, batch["yminus_ref"]["labels"],
-                                                 "mlog_pi_yminus_nodisable")}
-                with accelerator.unwrap_model(model).disable_adapter():
-                    yplus_ref_outputs = model(**batch["yplus_ref"])
-                    yminus_ref_outputs = model(**batch["yminus_ref"])
-            else:
-                assert False, "Not implemented"
-                # reference_chosen_logps, reference_rejected_logps = concatenated_forward(reference_model, batch)
+        diff = yplus_logprobs.detach() - args.neg_example_strength * yminus_logprobs
+        logs["logp_diff"] = diff.item()
+        return -yplus_logprobs + args.loss_lambda * torch.relu(args.hinge_delta - diff), logs
 
-            yplus_ref_ce = neg_crossentropy(yplus_ref_outputs, batch["yplus_ref"]["labels"], args.reduce_loss)
-            logs = {**logs, **log_neg_ce(yplus_ref_ce, batch["yplus_ref"]["labels"], "mlog_pi_ref_yplus")}
-            yminus_ref_ce = neg_crossentropy(yminus_ref_outputs, batch["yminus_ref"]["labels"], args.reduce_loss)
-            logs = {**logs, **log_neg_ce(yminus_ref_ce, batch["yminus_ref"]["labels"], "mlog_pi_ref_yminus")}
+    # The rest of the losses require the reference outputs
+    with torch.no_grad():
+        if args.use_lora:
+            with accelerator.unwrap_model(model).disable_adapter():
+                yplus_ref_logprobs = get_logprobs("yplus_ref")
+                yminus_ref_logprobs = get_logprobs("yminus_ref")
+        else:
+            raise ValueError("Non-LoRA is not supported for ATT")
 
-        diff = -yplus_neg_ce + yplus_ref_ce \
-               - args.neg_example_strength * (-yminus_neg_ce + yminus_ref_ce)
+    if args.loss in ["symmetric_dpo", "symmetric_dpo_progressive", "ipo"]:
+        assert yminus_logprobs is not None
+        diff = yplus_logprobs - yplus_ref_logprobs - args.neg_example_strength * (yminus_logprobs - yminus_ref_logprobs)
         logs["log_pi_t_diff_dpo"] = diff.item()
 
         if (args.loss == "symmetric_dpo" and args.dpo_use_lambda) or args.loss == "symmetric_dpo_progressive":
-            return yplus_neg_ce + lam * F.softplus(-args.dpo_beta * diff), logs
+            return -yplus_logprobs + lam * F.softplus(-args.dpo_beta * diff), logs
         elif args.loss == "symmetric_dpo":
             return F.softplus(-args.dpo_beta * diff), logs
         elif args.loss == "ipo":
             return (diff - 1 / (2 * args.dpo_beta)) ** 2, logs
+    elif args.loss == "nonsymmetric_dpo_corrected":
+        assert yminus_yminus_logprobs is not None
+        diff = yplus_logprobs - yplus_ref_logprobs \
+               - args.neg_example_strength * (yminus_yminus_logprobs - yminus_ref_logprobs)
+        logs["logp_diff_asymmetric"] = diff.item()
+        return F.softplus(-args.dpo_beta * diff), logs
+    elif args.loss in ["dpo_corrected", "dpo_corrected_stopgrad"]:
+        assert yminus_logprobs is not None
+        assert yminus_yminus_logprobs is not None
+        assert yplus_yplus_logprobs is not None
+        diff = yplus_logprobs + yplus_yplus_logprobs - 2 * yplus_ref_logprobs \
+                    - args.neg_example_strength * (yminus_logprobs + yminus_yminus_logprobs - 2 * yminus_ref_logprobs)
+        return F.softplus(-args.dpo_beta / 2 * diff), logs
     else:
         raise ValueError(f"Unknown loss type: {args.loss}")
 
