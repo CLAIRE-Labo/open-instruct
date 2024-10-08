@@ -284,8 +284,8 @@ def main():
 
 
     # COMMENT OUT! This is for debugging
-    dataset_train = dataset_train.select(range(240))
-    dataset_test = dataset_test.select(range(240))
+    # dataset_train = dataset_train.select(range(240))
+    # dataset_test = dataset_test.select(range(240))
 
     for i in range(10):
         logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(dataset_train[i]['chosen'])}\n\n"
