@@ -84,10 +84,6 @@ def add_common_training_args(parser: argparse.ArgumentParser):
         help="Pretrained config name or path if not the same as model_name",
     )
     parser.add_argument(
-        "--half_dataset",
-        action="store_true",
-    )
-    parser.add_argument(
         "--model_revision",
         help="""If given, specifies a model revision (for HuggingFace models). This will 
         be applied to both the `model_name_or_path` and `config_name` args.""",
@@ -572,7 +568,7 @@ def load_tokenizer(args, substitute_eos_token=False):
 
 
 # substitute_eos_token default value to not break existing code
-def load_tokenizer_model(accelerator, args, substitute_eos_token=True, load_lora=True):
+def load_tokenizer_model(accelerator, args, substitute_eos_token=False, load_lora=True):
     ######################################## Config and Tokenizer Loading ########################################
     def try_load_config() -> PretrainedConfig:
         # Load pretrained model and tokenizer

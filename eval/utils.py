@@ -532,7 +532,8 @@ def add_eval_args(parser):
         "--base_model_root", type=Path, help="If provided, prepended to the base model path in the train_run_args."
     )
     parser.add_argument("--evaluated_name", required=True, type=str, help="The name of the model that will be saved.")
-
+    parser.add_argument('--responses_base_log', type=Path,
+                        help='Path to the responses log of the base model. Can be used to skip recomputation or to evaluate a different base + ATT combination.')
     parser.add_argument(
         '--cache_dir',
         type=Path,
@@ -671,7 +672,41 @@ def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint, cache_dir=None):
     return reformatted_checkpoint
 
 
-def run_att_model_for_eval(train_args, eval_args, chats):
+# Checks if the merged model already exists, and if not, merges the LoRA adapter into the base model.
+def maybe_merge_lora(eval_args, train_args, actual_model_name_or_path, actual_tokenizer_name_or_path):
+    if eval_args.cache_dir is None:
+        merge_dir = eval_args.tuned_checkpoint.parent / f"{eval_args.tuned_checkpoint.name}_merged"
+    else:
+        rel_path = Path(*eval_args.tuned_checkpoint.parent.absolute().parts[1:])
+        merge_dir = Path(eval_args.cache_dir) / rel_path / f"{eval_args.tuned_checkpoint.name}_merged"
+    if merge_dir.exists():
+        print(f"The merged model directory {merge_dir} already exists. Skipping.")
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        tmp_args_fname = Path(f"tmp_args_{timestamp}.json")
+        train_args_copy = deepcopy(train_args)
+        train_args_copy.model_name_or_path = actual_model_name_or_path
+        if hasattr(train_args_copy, "tokenizer_name"):
+            train_args_copy.tokenizer_name = actual_tokenizer_name_or_path
+        save_args(train_args_copy, tmp_args_fname)
+        merge_command = \
+            f'python {Path(__file__).parents[1] / "open_instruct/merge_lora_from_training.py"}' \
+            f' --lora_model_name_or_path {eval_args.tuned_checkpoint.absolute().as_posix()}' \
+            f' --train_args {tmp_args_fname.absolute().as_posix()}' \
+            f' --output_dir {merge_dir}' \
+            f' --save_tokenizer'
+        print(f"Running merge command:\n{merge_command}")
+        merge_subprocess = subprocess.run(merge_command, shell=True, capture_output=True)
+        if merge_subprocess.returncode != 0:
+            print("Error while merging the model.")
+            print(merge_subprocess.stdout.decode())
+            print(merge_subprocess.stderr.decode())
+            raise RuntimeError("Error while merging the model.")
+        tmp_args_fname.unlink()
+    return merge_dir
+
+
+def run_att_model_for_eval(train_args, eval_args, chats, responses_base=None):
     def maybe_prepend_root(name_or_path):
         if eval_args.base_model_root is not None and name_or_path is not None \
                 and (eval_args.base_model_root / name_or_path).exists():
@@ -687,6 +722,7 @@ def run_att_model_for_eval(train_args, eval_args, chats):
     train_args.ignore_model_cache = False
 
     model_name_or_path = maybe_prepend_root(train_args.model_name_or_path)
+    tokenizer_name_or_path = maybe_prepend_root(train_args.tokenizer_name)
     tokenizer_name_or_path = None
     if hasattr(train_args, "tokenizer_name"):
         tokenizer_name_or_path = maybe_prepend_root(train_args.tokenizer_name)
@@ -694,7 +730,6 @@ def run_att_model_for_eval(train_args, eval_args, chats):
         tokenizer_name_or_path = model_name_or_path
 
     hf_revision = train_args.model_revision
-
 
     tokenizer, _ = load_tokenizer(train_args, False)
 
@@ -706,77 +741,43 @@ def run_att_model_for_eval(train_args, eval_args, chats):
             mem_util = 0.9 if eval_args.is_lora else 0.4
 
         merged_lora = None
-        need_base = eval_args.is_lora or not eval_args.not_att
+
+        def get_model(model_name_or_path, enable_lora):
+            return vllm.LLM(
+                model=model_name_or_path,
+                revision=hf_revision,
+                tokenizer=tokenizer_name_or_path,
+                tokenizer_revision=hf_revision,
+                tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
+                trust_remote_code=True,
+                enable_lora=enable_lora,
+                max_lora_rank=128,
+                disable_sliding_window=False,
+                # disable_sliding_window=True if not hasattr(eval_args, "disable_sliding_window") \
+                #     else eval_args.disable_sliding_window,
+                gpu_memory_utilization=mem_util,
+            )
+
+        need_base = eval_args.is_lora or (not eval_args.not_att)
+
         if need_base:
             try:
-                base_model = vllm.LLM(
-                    model=model_name_or_path,
-                    revision=hf_revision,
-                    tokenizer=tokenizer_name_or_path,
-                    tokenizer_revision=hf_revision,
-                    tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
-                    trust_remote_code=True,
-                    enable_lora=eval_args.is_lora,
-                    max_lora_rank=128,
-                    disable_sliding_window=False,
-                    # disable_sliding_window=True if not hasattr(eval_args, "disable_sliding_window") \
-                    #     else eval_args.disable_sliding_window,
-                    gpu_memory_utilization=mem_util,
-                )
+                base_model = get_model(model_name_or_path, eval_args.is_lora)
             except ValueError as e:
                 if "does not support LoRA" in str(e):
                     print("Model does not support LoRA. We will merge the lora adapter into the base model.")
                     # Will have to store both base and tuned in memory
                     mem_util = 0.4
-                    if eval_args.cache_dir is None:
-                        merge_dir = eval_args.tuned_checkpoint.parent / f"{eval_args.tuned_checkpoint.name}_merged"
-                    else:
-                        rel_path = Path(*eval_args.tuned_checkpoint.parent.absolute().parts[1:])
-                        merge_dir = Path(eval_args.cache_dir) / rel_path / f"{eval_args.tuned_checkpoint.name}_merged"
-                    if merge_dir.exists():
-                        print(f"The merged model directory {merge_dir} already exists. Skipping.")
-                    else:
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                        tmp_args_fname = Path(f"tmp_args_{timestamp}.json")
-                        train_args_copy = deepcopy(train_args)
-                        train_args_copy.model_name_or_path = maybe_prepend_root(train_args.model_name_or_path)
-                        if hasattr(train_args_copy, "tokenizer_name"):
-                            train_args_copy.tokenizer_name = maybe_prepend_root(train_args.tokenizer_name)
-                        save_args(train_args_copy, tmp_args_fname)
-                        merge_command = \
-                            f'python {Path(__file__).parents[1] / "open_instruct/merge_lora_from_training.py"}' \
-                            f' --lora_model_name_or_path {eval_args.tuned_checkpoint.absolute().as_posix()}' \
-                            f' --train_args {tmp_args_fname.absolute().as_posix()}' \
-                            f' --output_dir {merge_dir}' \
-                            f' --save_tokenizer'
-                        print(f"Running merge command:\n{merge_command}")
-                        merge_subprocess = subprocess.run(merge_command, shell=True, capture_output=True)
-                        if merge_subprocess.returncode != 0:
-                            print("Error while merging the model.")
-                            print(merge_subprocess.stdout.decode())
-                            print(merge_subprocess.stderr.decode())
-                            raise RuntimeError("Error while merging the model.")
-                        tmp_args_fname.unlink()
+                    merge_dir = maybe_merge_lora(eval_args, train_args, maybe_prepend_root)
 
                     eval_args.is_lora = False
                     eval_args.tuned_checkpoint = merge_dir
                     # Don't need the base model anymore if evaluating a non-ATT model, will load the merged model later
                     # For ATT, will still need a base model
                     if not eval_args.not_att:
-                        base_model = vllm.LLM(
-                            model=model_name_or_path,
-                            revision=hf_revision,
-                            tokenizer=tokenizer_name_or_path,
-                            tokenizer_revision=hf_revision,
-                            tokenizer_mode="auto" if not eval_args.use_slow_tokenizer else "slow",
-                            trust_remote_code=True,
-                            enable_lora=False,
-                            max_lora_rank=128,
-                            disable_sliding_window=False,
-                            # disable_sliding_window=True if not hasattr(eval_args, "disable_sliding_window") \
-                            #     else eval_args.disable_sliding_window,
-                            gpu_memory_utilization=mem_util,
-                        )
+                        base_model = get_model(model_name_or_path, False)
+                    else:
+                        base_model = None
                 else:
                     raise e
 
@@ -855,8 +856,8 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                     prompts_att,
                     outputs,
                 ) = generate_responses_vllm_att(base_model, tokenizer, chats, sampling_params,
-                                                lora_request=lora_request,
-                                                batch_size=eval_args.batch_size)
+                                                lora_request=lora_request, batch_size=eval_args.batch_size,
+                                                responses_base=responses_base)
             else:
                 # ATT, not using LoRA
                 (
@@ -867,7 +868,8 @@ def run_att_model_for_eval(train_args, eval_args, chats):
                 ) = generate_responses_vllm_att(base_model, tokenizer, chats, sampling_params,
                                                 att_model_checkpoint=eval_args.tuned_checkpoint.absolute().as_posix(),
                                                 tokenizer_name=tokenizer_name_or_path,
-                                                batch_size=eval_args.batch_size)
+                                                batch_size=eval_args.batch_size,
+                                                responses_base=responses_base)
             # Collect responses
             for chat, prompt_base, response_base, prompt_att, output in zip(
                     chats, prompts_base, responses_base, prompts_att, outputs

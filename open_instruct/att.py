@@ -8,11 +8,14 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from transformers import DataCollatorForSeq2Seq
-from datasets import Dataset
+from datasets import Dataset, concatenate_datasets
+from accelerate.utils import gather_object
 
 sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
 from open_instruct.constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE, ATT_RESPONSE_PREFIX
 from open_instruct.load_utils import pretty_print_chatml
+
+from open_instruct.dpo_utils import _get_batch_logps
 
 
 def add_att_args(parser: argparse.ArgumentParser):
@@ -55,6 +58,10 @@ def add_att_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         '--hinge_delta', type=float, default=0.0,
         help='Delta used in the symmetric_hinge loss.'
+    )
+    parser.add_argument(
+        '--precompute_ref_logprobs', type=str,
+        help='If set, the reference logprobs are precomputed into the path provided to this flag. The rest of the training is not run in this case.'
     )
 
 
@@ -103,8 +110,12 @@ def load_base_generations(base_generations_dir: str, existing_dataset: Dataset) 
 class DataCollatorForATT(DataCollatorForSeq2Seq):
     def __call__(self, features, return_tensors=None):
         keys = features[0].keys()
-        return {k: super(DataCollatorForATT, self).__call__([f[k] for f in features], return_tensors=return_tensors)
-                for k in keys}
+        keys_basic = [k for k in keys if isinstance(features[0][k], torch.Tensor)]
+        keys_recursive = [k for k in keys if k not in keys_basic]
+        basic = {k: torch.stack([f[k] for f in features]) for k in keys_basic}
+        rec = {k: super(DataCollatorForATT, self).__call__([f[k] for f in features], return_tensors=return_tensors)
+               for k in keys_recursive}
+        return {**basic, **rec}
 
 
 def _check_and_preprocess_chosen_rejected(example):
@@ -132,7 +143,7 @@ def _check_and_preprocess_chosen_rejected(example):
     return chosen, rejected, existing_system_prompt
 
 
-def _postprocess_input_ids(input_ids, end_idx, max_seq_length):
+def _postprocess_input_ids(input_ids, end_idx, max_seq_length, index=None):
     input_ids = torch.tensor([input_ids], dtype=torch.long)
     labels = input_ids.clone()
     labels[:, :end_idx] = -100
@@ -143,11 +154,14 @@ def _postprocess_input_ids(input_ids, end_idx, max_seq_length):
     # labels = labels[:, :max_seq_length]
     # attention_mask = attention_mask[:, :max_seq_length]
 
-    return {
+    retval = {
         'input_ids': input_ids.flatten(),
         'labels': labels.flatten(),
         'attention_mask': attention_mask.flatten(),
     }
+    if index is not None:
+        retval['index'] = index
+    return retval
 
 
 # OLMo chat template handles the BOS token, so we don't need to fiddle with add_bos.
@@ -282,7 +296,6 @@ def preprocess_for_symmetric_att(example, tokenizer, max_seq_length, att_loss, s
                                  logger=None):
     example = deepcopy(example)
     yplus_ref_orig = encode_with_chat_template(example['chosen'], tokenizer, max_seq_length, debug_print, logger)
-    yminus_ref_orig = encode_with_chat_template(example['rejected'], tokenizer, max_seq_length, debug_print, logger)
 
     yplus_tokens = tokenizer.encode(example['chosen'][-1]['content'], add_special_tokens=False)
     yminus_tokens = tokenizer.encode(example['rejected'][-1]['content'], add_special_tokens=False)
@@ -445,16 +458,81 @@ def neg_crossentropy(outputs, labels, reduce_loss='sum'):
     return loss
 
 
+# Given a nested dict of tensors with batch dim [B, ...], returns a list of B dicts with the batch dimension removed
+# Warning: this method treats BatchEncoding instances (output of tokenizer) as dicts, and the output will be a list of dicts even if the input contained BatchEncoding.
+def batch_to_list(batch, batch_dim):
+    def get_ith(i, subbatch):
+        ith = {}
+        for k, v in subbatch.items():
+            if isinstance(v, torch.Tensor):
+                assert v.shape[0] == batch_dim, f"Expected batch dim {batch_dim}, got {v.shape=}"
+                ith[k] = v[i]
+            else:
+                ith[k] = get_ith(i, v)
+        return ith
+
+    return [get_ith(i, batch) for i in range(batch_dim)]
+
+
+# Assumes the model has been prepared for training, so we get the reference model by disabling the adapter
+def precompute_save_ref_logprobs(accelerator, model, dataloader, data_dir):
+    def get_logprobs(batch, name):
+        with accelerator.unwrap_model(model).disable_adapter():
+            with torch.no_grad():
+                inputs = deepcopy(batch[name])
+                del inputs["labels"]  # We don't want to compute the loss
+                outputs = model(**inputs)
+                sum_logprobs = _get_batch_logps(outputs.logits, batch[name]["labels"], average_log_prob=False)
+                num_labels = (batch[name]["labels"] != -100).sum(axis=-1)
+                mean_logprobs = sum_logprobs / num_labels
+        return mean_logprobs, sum_logprobs
+
+    new_dataset = []
+    for batch in tqdm(dataloader, desc="Precomputing reference logprobs"):
+        mean_yplus, sum_yplus = get_logprobs(batch, "yplus_ref")
+        mean_yminus, sum_yminus = get_logprobs(batch, "yminus_ref")
+        new_batch = deepcopy(batch)
+        new_batch = {**new_batch,
+                     "logp_yplus_ref_mean": mean_yplus,
+                     "logp_yplus_ref_sum": sum_yplus,
+                     "logp_yminus_ref_mean": mean_yminus,
+                     "logp_yminus_ref_sum": sum_yminus,
+                     }
+        examples = batch_to_list(new_batch, mean_yplus.shape[0])
+        new_dataset.extend(examples)
+
+    new_dataset = Dataset.from_list(new_dataset)
+    new_dataset.set_format('pt')
+    gather_data = gather_object((new_dataset,))
+    if accelerator.is_main_process:
+        data_with_precomputed = concatenate_datasets(gather_data)
+        data_with_precomputed.save_to_disk(data_dir)
+
+
 def compute_loss_att(accelerator, model, batch, args, percentage_complete: float = 0.5, eval=False, debug=False):
-    logs = {}
+    logs = None
 
     def get_logprobs(name, disable_grad=False):
         nonlocal logs, eval
         with torch.set_grad_enabled(not (eval or disable_grad)):
-            outputs = model(**batch[name])
-            mean_logprobs = -outputs.loss
-            sum_logprobs = mean_logprobs * (batch[name]["labels"] != -100).sum()
-        logs = {**logs, "logp_" + name + "_avg": mean_logprobs.item(), "logp_" + name + "_sum": sum_logprobs.item()}
+            inputs = deepcopy(batch[name])
+            if not debug:
+                del inputs["labels"]  # We don't want to compute the loss
+            outputs = model(**inputs)
+            sum_logprobs = _get_batch_logps(outputs.logits, batch[name]["labels"], average_log_prob=False)
+            num_labels = (batch[name]["labels"] != -100).sum(axis=-1)
+            mean_logprobs = sum_logprobs / num_labels
+            if debug:
+                recompute_loss = -sum_logprobs.sum() / num_labels.sum()
+                rel_diff = (recompute_loss - outputs.loss) / outputs.loss
+                assert abs(rel_diff) < 1e-4, f"Rel diff: {rel_diff}"
+        new_logs = [{"logp_" + name + "_mean": mean_logprobs[i].item(), "logp_" + name + "_sum": sum_logprobs[i].item()} \
+                    for i in range(len(mean_logprobs))]
+        if logs is None:
+            logs = new_logs
+        else:
+            for i in range(len(mean_logprobs)):
+                logs[i].update(new_logs[i])
 
         if args.reduce_loss == 'mean':
             return mean_logprobs
@@ -466,11 +544,12 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
     yplus_logprobs = get_logprobs("yplus_att")
 
     if args.loss == "ce":
-        return -yplus_logprobs, logs
+        return -yplus_logprobs.sum(), logs
 
     if "progressive" in args.loss:
         lam = args.loss_lambda * percentage_complete
-        logs["loss_lambda"] = lam
+        for i in range(len(logs)):
+            logs[i]["loss_lambda"] = lam
     else:
         lam = args.loss_lambda
 
@@ -484,47 +563,72 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
     if args.loss in ["symmetric", "symmetric_progressive"]:
         # Loss1
         diff = yplus_logprobs.detach() - args.neg_example_strength * yminus_logprobs
-        logs["logp_diff"] = diff.item()
-        return -yplus_logprobs + lam * F.softplus(-diff), logs
+        for i in range(len(logs)):
+            logs[i]["logp_diff"] = diff[i].item()
+        return (-yplus_logprobs + lam * F.softplus(-diff)).sum(), logs
     elif args.loss == "symmetric_hinge":
         # Loss2
         diff = yplus_logprobs.detach() - args.neg_example_strength * yminus_logprobs
-        logs["logp_diff"] = diff.item()
-        return -yplus_logprobs + args.loss_lambda * torch.relu(args.hinge_delta - diff), logs
+        for i in range(len(logs)):
+            logs[i]["logp_diff"] = diff[i].item()
+        return (-yplus_logprobs + args.loss_lambda * torch.relu(args.hinge_delta - diff)).sum(), logs
 
     # The rest of the losses require the reference outputs
-    with torch.no_grad():
-        if args.use_lora:
-            with accelerator.unwrap_model(model).disable_adapter():
-                yplus_ref_logprobs = get_logprobs("yplus_ref")
-                yminus_ref_logprobs = get_logprobs("yminus_ref")
-        else:
-            raise ValueError("Non-LoRA is not supported for ATT")
+    # TODO recover the cached values if they are available
+    are_ref_logprobs_precomputed = "logp_yplus_ref_mean" in batch
+    reduce_loss = 'mean' if args.reduce_loss == 'mean' else 'sum'
+    if debug or not are_ref_logprobs_precomputed:
+        with torch.no_grad():
+            if args.use_lora:
+                with accelerator.unwrap_model(model).disable_adapter():
+                    yplus_ref_logprobs = get_logprobs("yplus_ref")
+                    yminus_ref_logprobs = get_logprobs("yminus_ref")
+            else:
+                raise ValueError("Non-LoRA is not supported for ATT")
+        if are_ref_logprobs_precomputed:  # debug mode, comparing ref logprobs
+            precomp_yplus_ref_logprobs = batch[f"logp_yplus_ref_{reduce_loss}"]
+            precomp_yminus_ref_logprobs = batch[f"logp_yminus_ref_{reduce_loss}"]
+            for i in range(len(yplus_ref_logprobs)):
+                diff_plus = torch.abs(precomp_yplus_ref_logprobs[i] - yplus_ref_logprobs[i]) / yplus_ref_logprobs[i]
+                diff_minus = torch.abs(precomp_yminus_ref_logprobs[i] - yminus_ref_logprobs[i]) / yminus_ref_logprobs[i]
+                assert diff_plus < 1e-4, f"rel diff plus: {diff_plus}"
+                assert diff_minus < 1e-4, f"rel diff minus: {diff_minus}"
+    else:
+        yplus_ref_logprobs = batch[f"logp_yplus_ref_{reduce_loss}"]
+        yminus_ref_logprobs = batch[f"logp_yminus_ref_{reduce_loss}"]
+        for i in range(len(logs)):
+            for reduce in {"mean", "sum"}:
+                logs[i][f"logp_yplus_ref_{reduce}"] = batch[f"logp_yplus_ref_{reduce}"][i].item()
+                logs[i][f"logp_yminus_ref_{reduce}"] = batch[f"logp_yminus_ref_{reduce}"][i].item()
 
     if args.loss in ["symmetric_dpo", "symmetric_dpo_progressive", "ipo"]:
         assert yminus_logprobs is not None
         diff = yplus_logprobs - yplus_ref_logprobs - args.neg_example_strength * (yminus_logprobs - yminus_ref_logprobs)
-        logs["log_pi_t_diff_dpo"] = diff.item()
+        for i in range(len(logs)):
+            logs[i]["logp_diff_dpo"] = diff[i].item()
 
         if (args.loss == "symmetric_dpo" and args.dpo_use_lambda) or args.loss == "symmetric_dpo_progressive":
-            return -yplus_logprobs + lam * F.softplus(-args.dpo_beta * diff), logs
+            return (-yplus_logprobs + lam * F.softplus(-args.dpo_beta * diff)).sum(), logs
         elif args.loss == "symmetric_dpo":
-            return F.softplus(-args.dpo_beta * diff), logs
+            return F.softplus(-args.dpo_beta * diff).sum(), logs
         elif args.loss == "ipo":
-            return (diff - 1 / (2 * args.dpo_beta)) ** 2, logs
+            return ((diff - 1 / (2 * args.dpo_beta)) ** 2).sum(), logs
     elif args.loss == "nonsymmetric_dpo_corrected":
         assert yminus_yminus_logprobs is not None
         diff = yplus_logprobs - yplus_ref_logprobs \
                - args.neg_example_strength * (yminus_yminus_logprobs - yminus_ref_logprobs)
-        logs["logp_diff_asymmetric"] = diff.item()
-        return F.softplus(-args.dpo_beta * diff), logs
+        for i in range(len(logs)):
+            logs[i]["logp_diff_asymmetric"] = diff[i].item()
+        return F.softplus(-args.dpo_beta * diff).sum(), logs
     elif args.loss in ["dpo_corrected", "dpo_corrected_stopgrad"]:
         assert yminus_logprobs is not None
         assert yminus_yminus_logprobs is not None
         assert yplus_yplus_logprobs is not None
         diff = yplus_logprobs + yplus_yplus_logprobs - 2 * yplus_ref_logprobs \
-                    - args.neg_example_strength * (yminus_logprobs + yminus_yminus_logprobs - 2 * yminus_ref_logprobs)
-        return F.softplus(-args.dpo_beta / 2 * diff), logs
+               - args.neg_example_strength * (yminus_logprobs + yminus_yminus_logprobs - 2 * yminus_ref_logprobs)
+        for i in range(len(logs)):
+            logs[i]["logp_diff_dpo_corrected"] = diff[i].item()
+        return F.softplus(-args.dpo_beta / 2 * diff).sum(), logs
     else:
         raise ValueError(f"Unknown loss type: {args.loss}")
 

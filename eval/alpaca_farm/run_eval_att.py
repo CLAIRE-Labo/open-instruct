@@ -50,7 +50,13 @@ def evaluate(args):
             responses_log = json.load(f)
         logger.info(f"Loaded responses from {responses_log_path}")
     else:
-        responses_log = run_att_model_for_eval(train_args, args, chats)
+        if args.responses_base_log is not None:
+            with open(args.responses_base_log, "r") as f:
+                responses_base_log = json.load(f)
+            responses_base = [r["output"] for r in responses_base_log]
+        else:
+            responses_base = None
+        responses_log = run_att_model_for_eval(train_args, args, chats, responses_base=responses_base)
         with open(responses_log_path, "w") as f:
             json.dump(responses_log, f)
 
@@ -115,7 +121,6 @@ def evaluate(args):
             print(base_leaderboard.to_string(float_format="%.2f"))
             with open(base_metrics_file, "w") as fout:
                 json.dump(base_leaderboard.to_dict(), fout)
-
 
 
 if __name__ == '__main__':

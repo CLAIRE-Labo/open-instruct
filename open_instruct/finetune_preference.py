@@ -40,8 +40,7 @@ sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 from load_utils import (add_common_training_args, pretty_print_chatml, preprocess_data_to_chatml, \
                         load_tokenizer_model, save_args, load_args)
 from att import apply_att_template, add_att_args, neg_crossentropy, DataCollatorForATT, preprocess_for_symmetric_att, \
-    has_responses, compute_loss_att, load_base_generations
-
+    has_responses, compute_loss_att, load_base_generations, precompute_save_ref_logprobs
 
 # from eval.truthfulqa.run_eval import main as run_eval
 # from eval.truthfulqa.run_eval import parse_args as parse_args_eval
@@ -51,7 +50,6 @@ from att import apply_att_template, add_att_args, neg_crossentropy, DataCollator
 
 logger = get_logger(__name__)
 import pandas as pd
-
 
 if __name__ == "__main__":
     # try:
@@ -211,6 +209,123 @@ def build_optimizer(args, model):
     return optimizer
 
 
+def get_dataloader(dataset, tokenizer, model, batch_size):
+    return DataLoader(
+        dataset,
+        collate_fn=DataCollatorForATT(tokenizer=tokenizer, model=model, padding="longest"),
+        batch_size=batch_size
+    )
+
+
+def load_data_from_disk(path):
+    data = datasets.load_from_disk(path)
+    data.set_format(type="pt")
+    return data
+
+
+def prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=False):
+    if load_from_cache_file:
+        logger.info("Loading preprocessed data from cache file.")
+        train_path = Path(args.precompute_ref_logprobs) / "train"
+        test_path = Path(args.precompute_ref_logprobs) / "test"
+        train_dataset = load_data_from_disk(train_path)
+        test_dataset = load_data_from_disk(test_path)
+    else:
+        train_dataset, test_dataset = preprocess_data_to_chatml(accelerator, args)
+        if args.base_generations_dir is not None:
+            self_impr_dataset = load_base_generations(args.base_generations_dir, train_dataset)
+            train_dataset = concatenate_datasets([train_dataset, self_impr_dataset])
+        train_dataset = train_dataset.shuffle(seed=args.seed)
+        # apparently shuffle is lazy, so we need to force it to reorder the data and save time during training
+        train_dataset = train_dataset.flatten_indices()
+        # Used to be a temporary solution for the self-improvement dataset
+        # if args.half_dataset:
+        #     dataset_train = dataset_train.select(range(len(dataset_train) // 2))
+        # COMMENT OUT! This is for debugging
+        # train_dataset = train_dataset.select(range(240))
+        # test_dataset = test_dataset.select(range(240))
+        for i in range(3):
+            logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(train_dataset[i]['chosen'])}\n\n"
+                        f"Example {i} rejected:\n{pretty_print_chatml(train_dataset[i]['rejected'])}\n\n")
+            apply_att_template(test_dataset[i], tokenizer, args.max_seq_length, debug_print=True, logger=logger)
+        filtered_dataset = DatasetDict({
+            'train': train_dataset,
+            'test': test_dataset
+        })
+        encode_function = partial(
+            # apply_att_template,
+            preprocess_for_symmetric_att,
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            att_loss=args.loss,
+            logger=logger,
+        )
+        with accelerator.main_process_first():
+            lm_datasets = filtered_dataset.map(
+                encode_function,
+                batched=False,
+                num_proc=args.preprocessing_num_workers,
+                load_from_cache_file=not args.overwrite_cache,
+                remove_columns=[name for name in filtered_dataset["train"].column_names if
+                                name not in ["input_ids", "labels", "attention_mask"]],
+                desc="Tokenizing and reformatting instruction data",
+            )
+            lm_datasets.set_format(type="pt")
+            lm_datasets = lm_datasets.filter(has_responses)
+        train_dataset = lm_datasets["train"]
+        test_dataset = lm_datasets["test"]
+
+    if accelerator.is_main_process:
+        def len_stats(lens, name):
+            maxlen = max(lens)
+            perc_max = sum(x == maxlen for x in lens) / len(lens)
+            return f"Avg length of {name}: {np.mean(lens):.1f} +/- {np.std(lens):.1f}, " \
+                     f"in [{np.min(lens)}, {np.max(lens)}] ({perc_max:.1%} at max length)"
+        lens_att = [x["yplus_att"]["input_ids"].shape[0] for x in train_dataset]
+        len_response_att = [torch.sum(x["yplus_att"]["labels"] != -100).item() for x in train_dataset]
+        lens_ref = [x["yplus_ref"]["input_ids"].shape[0] for x in train_dataset]
+        len_response_ref = [torch.sum(x["yplus_ref"]["labels"] != -100).item() for x in train_dataset]
+        logger.info(len_stats(lens_att, "example ATT"))
+        logger.info(len_stats(len_response_att, "response ATT"))
+        logger.info(len_stats(lens_ref, "example ref"))
+        logger.info(len_stats(len_response_ref, "response ref"))
+    accelerator.wait_for_everyone()
+    # TODO check that nothing breaks if we don't add special tokens
+    # We only use instruct models, so tokens should already be there
+    # Log a few random samples from the training set
+    num_train_ex = accelerator.num_processes
+    num_test_ex = accelerator.num_processes
+    indices_train_ex = random.sample(range(len(train_dataset)), num_train_ex)
+    indices_test_ex = random.sample(range(len(test_dataset)), num_test_ex)
+    train_examples = [train_dataset[i] for i in indices_train_ex]
+    test_examples = [test_dataset[i] for i in indices_test_ex]
+
+    # for index, ex in enumerate(train_examples):
+    #     logger.info(f"Sample {index} of the training set: {ex}.")
+    def put_big_to_front(dataset):
+        logger.info("Putting the biggest examples to the front of the dataset to catch OOMs early.")
+        lens = [x["yplus_att"]["input_ids"].shape[0] for x in dataset]
+        order = list(sorted(range(len(lens)), key=lambda x: lens[x], reverse=True))
+        if len(order) > 128:
+            order = order[:128] + random.sample(order[128:], k=len(order[128:]))
+        dataset = dataset.select(order)
+        return dataset
+
+    train_dataset = put_big_to_front(train_dataset)
+    test_dataset = put_big_to_front(test_dataset)
+    if args.dataset_subsample_size is not None:
+        train_dataset = train_dataset.select(range(min(args.dataset_subsample_size, len(train_dataset))))
+        test_dataset = test_dataset.select(range(min(args.dataset_subsample_size, len(test_dataset))))
+    print("Size of training set:", len(train_dataset))
+    print("Size of test set:", len(test_dataset))
+
+    # DataLoaders creation:
+    train_dataloader = get_dataloader(train_dataset, tokenizer, model, args.per_device_train_batch_size)
+    test_dataloader = get_dataloader(test_dataset, tokenizer, model, args.per_device_train_batch_size)
+    logger.info(f"Check: {len(train_dataset)=} {len(train_dataloader)=} {len(test_dataset)=} {len(test_dataloader)=}")
+    return test_dataloader, test_examples, train_dataloader, train_examples
+
+
 def main():
     parser = argparse.ArgumentParser(description="Finetune a transformers model using pairwise preference data.")
     add_common_training_args(parser)
@@ -270,117 +385,20 @@ def main():
 
     checkpointing_dir = setup_checkpointing(accelerator, args)
 
-    ######################################## Data Preprocessing ########################################
-    dataset_train, dataset_test = preprocess_data_to_chatml(accelerator, args)
-    if args.base_generations_dir is not None:
-        self_impr_dataset = load_base_generations(args.base_generations_dir, dataset_train)
-        dataset_train = concatenate_datasets([dataset_train, self_impr_dataset])
-        dataset_train = dataset_train.shuffle(seed=args.seed)
-        dataset_train = dataset_train.flatten_indices()
+    ######################################## Data Preprocessing #######################################
 
-    # Temporary solution for the self-improvement dataset
-    if args.half_dataset:
-        dataset_train = dataset_train.select(range(len(dataset_train) // 2))
+    need_precompute_ref_logprobs = (args.precompute_ref_logprobs is not None \
+                                    and not Path(args.precompute_ref_logprobs).exists())
+    have_precomputed_ref_logprobs = (args.precompute_ref_logprobs is not None \
+                                    and Path(args.precompute_ref_logprobs).exists())
 
+    test_dataloader, test_examples, train_dataloader, train_examples \
+        = prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=have_precomputed_ref_logprobs)
 
-    # COMMENT OUT! This is for debugging
-    # dataset_train = dataset_train.select(range(240))
-    # dataset_test = dataset_test.select(range(240))
-
-    for i in range(10):
-        logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(dataset_train[i]['chosen'])}\n\n"
-                    f"Example {i} rejected:\n{pretty_print_chatml(dataset_train[i]['rejected'])}\n\n")
-        apply_att_template(dataset_test[i], tokenizer, args.max_seq_length, debug_print=True, logger=logger)
-
-    filtered_dataset = DatasetDict({
-        'train': dataset_train,
-        'test': dataset_test
-    })
-
-    encode_function = partial(
-        # apply_att_template,
-        preprocess_for_symmetric_att,
-        tokenizer=tokenizer,
-        max_seq_length=args.max_seq_length,
-        att_loss=args.loss,
-        logger=logger,
-    )
-
-    with accelerator.main_process_first():
-        lm_datasets = filtered_dataset.map(
-            encode_function,
-            batched=False,
-            num_proc=args.preprocessing_num_workers,
-            load_from_cache_file=not args.overwrite_cache,
-            remove_columns=[name for name in filtered_dataset["train"].column_names if
-                            name not in ["input_ids", "labels", "attention_mask"]],
-            desc="Tokenizing and reformatting instruction data",
-        )
-        lm_datasets.set_format(type="pt")
-        lm_datasets = lm_datasets.filter(has_responses)
-
-    if accelerator.is_main_process:
-        lens_att = [x["yplus_att"]["input_ids"].shape[0] for x in lm_datasets["train"]]
-        len_response_att = [torch.sum(x["yplus_att"]["labels"] != -100) for x in lm_datasets["train"]]
-        lens_ref = [x["yplus_ref"]["input_ids"].shape[0] for x in lm_datasets["train"]]
-        len_response_ref = [torch.sum(x["yplus_ref"]["labels"] != -100) for x in lm_datasets["train"]]
-        logger.info(f"Avg length of example ATT: {np.mean(lens_att):.1f} +/- {np.std(lens_att):.1f}")
-        logger.info(f"Avg length of response ATT: {np.mean(len_response_att):.1f} +/- {np.std(len_response_att):.1f}")
-        logger.info(f"Avg length of example ref: {np.mean(lens_ref):.1f} +/- {np.std(lens_ref):.1f}")
-        logger.info(f"Avg length of response ref: {np.mean(len_response_ref):.1f} +/- {np.std(len_response_ref):.1f}")
-    accelerator.wait_for_everyone()
-
-    train_dataset = lm_datasets["train"]
-    test_dataset = lm_datasets["test"]
-
-    # TODO check that nothing breaks if we don't add special tokens
-    # We only use instruct models, so tokens should already be there
-
-    # Log a few random samples from the training set
-
-    num_train_ex = accelerator.num_processes
-    num_test_ex = accelerator.num_processes
-    indices_train_ex = random.sample(range(len(train_dataset)), num_train_ex)
-    indices_test_ex = random.sample(range(len(test_dataset)), num_test_ex)
-
-    train_examples = [train_dataset[i] for i in indices_train_ex]
-    test_examples = [test_dataset[i] for i in indices_test_ex]
-
-    # for index, ex in enumerate(train_examples):
-    #     logger.info(f"Sample {index} of the training set: {ex}.")
+    num_train_examples = len(train_dataloader.dataset)
+    num_test_examples = len(test_dataloader.dataset)
 
     ######################################## Training Setup ########################################
-    def put_big_to_front(dataset):
-        logger.info("Putting the biggest examples to the front of the dataset to catch OOMs early.")
-        lens = [x["yplus_att"]["input_ids"].shape[0] for x in dataset]
-        order = list(sorted(range(len(lens)), key=lambda x: lens[x], reverse=True))
-        if len(order) > 128:
-            order = order[:128] + random.sample(order[128:], k=len(order[128:]))
-        dataset = dataset.select(order)
-        return dataset
-
-    train_dataset = put_big_to_front(train_dataset)
-    test_dataset = put_big_to_front(test_dataset)
-
-    if args.dataset_subsample_size is not None:
-        train_dataset = train_dataset.select(range(min(args.dataset_subsample_size, len(train_dataset))))
-        test_dataset = test_dataset.select(range(min(args.dataset_subsample_size, len(test_dataset))))
-
-    print("Size of training set:", len(train_dataset))
-    print("Size of test set:", len(test_dataset))
-
-    # DataLoaders creation:
-    def get_dataloader(dataset, batch_size):
-        return DataLoader(
-            dataset,
-            shuffle=True,
-            collate_fn=DataCollatorForATT(tokenizer=tokenizer, model=model, padding="longest"),
-            batch_size=batch_size
-        )
-
-    train_dataloader = get_dataloader(train_dataset, args.per_device_train_batch_size)
-    test_dataloader = get_dataloader(test_dataset, args.per_device_train_batch_size)
-
     # Optimizer
     optimizer = build_optimizer(args, model)
 
@@ -404,26 +422,32 @@ def main():
     # Define custom step metric for evaluation
     # run_id = wandb.run.id
 
-    # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
-    embeddings = model.get_input_embeddings()
-    with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
-        embedding_size = embeddings.weight.shape[0]
-
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-
     # Prepare everything with `accelerator`.
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
     test_dataloader = accelerator.prepare(test_dataloader)
+
+    if need_precompute_ref_logprobs:
+        train_path = Path(args.precompute_ref_logprobs) / "train"
+        test_path = Path(args.precompute_ref_logprobs) / "test"
+        precompute_save_ref_logprobs(accelerator, model, train_dataloader, train_path)
+        precompute_save_ref_logprobs(accelerator, model, train_dataloader, test_path)
+        # Reload the data to get the precomputed logprobs
+        train_dataloader, train_examples, test_dataloader, test_examples \
+            = prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=True)
+        train_dataloader = accelerator.prepare(train_dataloader)
+        test_dataloader = accelerator.prepare(test_dataloader)
+
+    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {num_train_examples}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -472,7 +496,7 @@ def main():
     #     return accelerator.get_tracker("wandb").current_step
 
     # TODO if we end up using phi2, look into the bug in the chat template we have for it
-    def log_examples_to_wandb(step: int):
+    def log_examples_to_wandb():
         def gen_examples(example_full, example_idx: int, gen_config: GenerationConfig) -> Tuple[
             Tuple[float, str, str, str]]:
             start_time = time.time()
@@ -560,7 +584,7 @@ def main():
     accelerator.wait_for_everyone()
 
     if accelerator.sync_gradients and not args.logging_examples_ignore_first:
-        log_examples_to_wandb(completed_steps)
+        log_examples_to_wandb()
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_loss = 0
@@ -609,6 +633,7 @@ def main():
                     avg_loss = gathered_loss.mean().item() / args.gradient_accumulation_steps / args.logging_steps
 
                     all_logs = gather_object((logs,))
+                    all_logs = sum(all_logs, [])
                     avg_logs = {"train/" + k: sum(log[k] for log in all_logs) / len(all_logs) for k in all_logs[0]}
                     # logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
                     # Print number of examples processed so far in this epoch
@@ -626,7 +651,7 @@ def main():
                     total_loss = 0
 
                 if args.logging_examples_steps and completed_steps % args.logging_examples_steps == 0:
-                    log_examples_to_wandb(completed_steps)
+                    log_examples_to_wandb()
 
                 if isinstance(checkpointing_steps, int) and completed_steps % checkpointing_steps == 0:
                     output_dir = checkpointing_dir / f"step_{completed_steps}"
@@ -656,6 +681,7 @@ def main():
             loss, logs = compute_loss_att(accelerator, model, batch, args, eval=True, debug=False)
             loss /= accelerator.num_processes
             all_logs = gather_object((logs,))
+            all_logs = sum(all_logs, [])
             sum_logs = {k: sum(log[k] for log in all_logs) for k in all_logs[0]}
             total_sum_logs = sum_logs if total_sum_logs is None \
                 else {k: (total_sum_logs[k] + sum_logs[k]) for k in sum_logs}
@@ -672,12 +698,12 @@ def main():
         total_num_labels = all_num_labels.sum().item()
 
         logs["eval/avg_loss_per_label"] = (total_loss / total_num_labels).item()
-        logs["eval/avg_loss_per_entry"] = (total_loss / len(test_dataset)).item()
+        logs["eval/avg_loss_per_entry"] = (total_loss / num_test_examples).item()
         logs["eval/ppl"] = np.exp(-total_sum_logs["logp_yplus_att_sum"] / total_num_labels)
         logs["eval/total_num_labels"] = total_num_labels
-        logs["eval/total_num_entries"] = len(test_dataset)
+        logs["eval/total_num_entries"] = num_test_examples
 
-        logs = {**logs, **{f"eval/per_entry_{k}": total_sum_logs[k] / len(test_dataset) for k in total_sum_logs}}
+        logs = {**logs, **{f"eval/per_entry_{k}": total_sum_logs[k] / num_test_examples for k in total_sum_logs}}
         logs = {**logs, **{f"eval/per_label_{k}": total_sum_logs[k] / total_num_labels for k in total_sum_logs}}
 
         if args.with_tracking:

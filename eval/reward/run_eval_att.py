@@ -23,7 +23,7 @@ from eval.utils import query_openai_chat_model, query_openai_model, run_att_mode
 from open_instruct.load_utils import load_args, load_tokenizer_model
 
 # logger = get_logger(__name__)
-# logger = getLogger(__name__)
+logger = getLogger(__name__)
 
 
 # Taken from https://huggingface.co/RLHFlow/ArmoRM-Llama3-8B-v0.1
@@ -84,14 +84,21 @@ def evaluate(args):
         if args.num_instances is not None:
             prompt_chats = prompt_chats[:args.num_instances]
 
-        responses_log = []
-        if responses_log_path.exists():
-            with open(responses_log_path, "r") as f:
-                responses_log = json.load(f)
-            print(f"Loaded responses from {responses_log_path}")
+        if args.responses_base_log is not None:
+            with open(args.responses_base_log, "r") as f:
+                responses_base_log = json.load(f)
+            responses_base = [r["output"] for r in responses_base_log]
         else:
-            responses_log = run_att_model_for_eval(train_args, args, prompt_chats)
-            with open(responses_log_path, "w") as f:
+            responses_base = None
+
+        responses_log = run_att_model_for_eval(train_args, args, prompt_chats, responses_base=responses_base)
+        with open(responses_log_path, "w") as f:
+            responses_log = []
+            if responses_log_path.exists():
+                with open(responses_log_path, "r") as f:
+                    responses_log = json.load(f)
+                logger.info(f"Loaded responses from {responses_log_path}")
+            else:
                 json.dump(responses_log, f)
 
         # Evaluate the responses

@@ -47,8 +47,8 @@ def generate_response(model, tokenizer, chat, generation_config):
 def generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_request=None, batch_size=None):
     prompts = [tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True) for chat in chats]
 
-    batches = [prompts[i:i + batch_size] for i in range(0, len(prompts), batch_size)] if batch_size is not None else [
-        prompts]
+    batches = [prompts[i:i + batch_size] for i in range(0, len(prompts), batch_size)] \
+        if batch_size is not None else [prompts]
     responses = []
     for batch in tqdm(batches, desc="Generating responses"):
         responses += model.generate(
@@ -64,15 +64,19 @@ def generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_reque
 
 
 def generate_responses_vllm_att(model, tokenizer, chats, sampling_params, lora_request=None, att_model_checkpoint=None,
-                                tokenizer_name=None, batch_size=None):
+                                tokenizer_name=None, batch_size=None, responses_base=None):
     if lora_request is not None:
         assert att_model_checkpoint is None, "If the LoRA request is set, we assume that the ATT model is the LoRA adapter."
     else:
         assert att_model_checkpoint is not None, "If the LoRA request is not set, we need a separate ATT model."
         assert tokenizer_name is not None, "If the LoRA request is not set, please provide the tokenizer_name."
 
-    prompts_base, responses_base = generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_request=None,
-                                                           batch_size=batch_size)
+    if responses_base is not None:
+        assert len(chats) == len(responses_base), "If responses_base is provided, it must have the same length as chats."
+        prompts_base = ["" for _ in range(len(chats))]
+    else:
+        prompts_base, responses_base = generate_responses_vllm(model, tokenizer, chats, sampling_params, lora_request=None,
+                                                               batch_size=batch_size)
 
     prompts_att = []
     for i, (chat, response_base) in enumerate(zip(chats, responses_base)):
