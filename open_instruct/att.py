@@ -487,6 +487,8 @@ def precompute_save_ref_logprobs(accelerator, model, dataloader, data_dir):
                 mean_logprobs = sum_logprobs / num_labels
         return mean_logprobs, sum_logprobs
 
+    data_dir.parent.mkdir(parents=True, exist_ok=True)
+
     new_dataset = []
     for batch in tqdm(dataloader, desc="Precomputing reference logprobs"):
         mean_yplus, sum_yplus = get_logprobs(batch, "yplus_ref")
@@ -507,6 +509,7 @@ def precompute_save_ref_logprobs(accelerator, model, dataloader, data_dir):
     if accelerator.is_main_process:
         data_with_precomputed = concatenate_datasets(gather_data)
         data_with_precomputed.save_to_disk(data_dir)
+    accelerator.wait_for_everyone()
 
 
 def compute_loss_att(accelerator, model, batch, args, percentage_complete: float = 0.5, eval=False, debug=False):

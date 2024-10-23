@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding=utf-8
 
-import os
+import gc
 import sys
 import time
 import html
@@ -280,7 +280,8 @@ def prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=F
             maxlen = max(lens)
             perc_max = sum(x == maxlen for x in lens) / len(lens)
             return f"Avg length of {name}: {np.mean(lens):.1f} +/- {np.std(lens):.1f}, " \
-                     f"in [{np.min(lens)}, {np.max(lens)}] ({perc_max:.1%} at max length)"
+                   f"in [{np.min(lens)}, {np.max(lens)}] ({perc_max:.1%} at max length)"
+
         lens_att = [x["yplus_att"]["input_ids"].shape[0] for x in train_dataset]
         len_response_att = [torch.sum(x["yplus_att"]["labels"] != -100).item() for x in train_dataset]
         lens_ref = [x["yplus_ref"]["input_ids"].shape[0] for x in train_dataset]
@@ -387,10 +388,11 @@ def main():
 
     ######################################## Data Preprocessing #######################################
 
-    need_precompute_ref_logprobs = (args.precompute_ref_logprobs is not None \
-                                    and not Path(args.precompute_ref_logprobs).exists())
-    have_precomputed_ref_logprobs = (args.precompute_ref_logprobs is not None \
-                                    and Path(args.precompute_ref_logprobs).exists())
+
+    have_precomputed_ref_logprobs = args.precompute_ref_logprobs is not None \
+                                     and (Path(args.precompute_ref_logprobs) / "train").exists() \
+                                     and (Path(args.precompute_ref_logprobs) / "test").exists()
+    need_precompute_ref_logprobs = args.precompute_ref_logprobs is not None and not have_precomputed_ref_logprobs
 
     test_dataloader, test_examples, train_dataloader, train_examples \
         = prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=have_precomputed_ref_logprobs)
@@ -657,8 +659,13 @@ def main():
                     output_dir = checkpointing_dir / f"step_{completed_steps}"
                     save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
 
-                if completed_steps >= args.max_train_steps:
-                    break
+            gc.collect()
+            torch.cuda.empty_cache()
+            accelerator.free_memory()
+            gc.collect()
+
+            if completed_steps >= args.max_train_steps:
+                break
 
         print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
 
