@@ -6,6 +6,7 @@ import sys
 import time
 import html
 import json
+from distutils.command.clean import clean
 from typing import Dict, List, Tuple
 from pathlib import Path
 import argparse
@@ -38,7 +39,7 @@ from transformers import (
 
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 from load_utils import (add_common_training_args, pretty_print_chatml, preprocess_data_to_chatml, \
-                        load_tokenizer_model, save_args, load_args)
+                        load_tokenizer_model, save_args, load_args, clean_memory)
 from att import apply_att_template, add_att_args, neg_crossentropy, DataCollatorForATT, preprocess_for_symmetric_att, \
     has_responses, compute_loss_att, load_base_generations, precompute_save_ref_logprobs
 
@@ -659,10 +660,7 @@ def main():
                     output_dir = checkpointing_dir / f"step_{completed_steps}"
                     save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
 
-            gc.collect()
-            torch.cuda.empty_cache()
-            accelerator.free_memory()
-            gc.collect()
+            clean_memory(accelerator)
 
             if completed_steps >= args.max_train_steps:
                 break

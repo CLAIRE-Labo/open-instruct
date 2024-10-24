@@ -1,3 +1,4 @@
+import gc
 import os
 import sys
 from pathlib import Path
@@ -700,6 +701,14 @@ def load_tokenizer_model(accelerator, args, substitute_eos_token=False, load_lor
         accelerator.wait_for_everyone()
 
     return model, tokenizer, actual_eos_token, generation_config_nucleus, generation_config_greedy
+
+
+def clean_memory(accelerator=None):
+    gc.collect()
+    torch.cuda.empty_cache()
+    if accelerator is not None:
+        accelerator.free_memory()
+    gc.collect()
 
 
 if __name__ == "__main__":

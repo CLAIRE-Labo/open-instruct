@@ -1,3 +1,4 @@
+import gc
 import sys
 from pathlib import Path
 import argparse
@@ -12,6 +13,7 @@ from datasets import Dataset, concatenate_datasets
 from accelerate.utils import gather_object
 
 sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
+from load_utils import clean_memory
 from open_instruct.constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE, ATT_RESPONSE_PREFIX
 from open_instruct.load_utils import pretty_print_chatml
 
@@ -505,10 +507,18 @@ def precompute_save_ref_logprobs(accelerator, model, dataloader, data_dir):
 
     new_dataset = Dataset.from_list(new_dataset)
     new_dataset.set_format('pt')
-    gather_data = gather_object((new_dataset,))
+    all_chunk_names = [data_dir.parent / f"{data_dir.name}_chunk_{i}" for i in range(accelerator.num_processes)]
+    new_dataset.save_to_disk(all_chunk_names[accelerator.process_index])
+    del new_dataset
+    clean_memory()
+    accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        data_with_precomputed = concatenate_datasets(gather_data)
-        data_with_precomputed.save_to_disk(data_dir)
+        chunks = []
+        for i, chunk_name in enumerate(all_chunk_names):
+            chunks.append(Dataset.load_from_disk(chunk_name))
+            # chunk_name.unlink()
+        new_dataset = concatenate_datasets(chunks)
+        new_dataset.save_to_disk(data_dir)
     accelerator.wait_for_everyone()
 
 
