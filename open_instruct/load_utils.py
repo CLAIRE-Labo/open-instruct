@@ -706,8 +706,8 @@ def load_tokenizer_model(accelerator, args, substitute_eos_token=False, load_lor
 def clean_memory(accelerator=None):
     gc.collect()
     torch.cuda.empty_cache()
-    if accelerator is not None:
-        accelerator.free_memory()
+    # if accelerator is not None:
+    #     accelerator.free_memory()
     gc.collect()
 
 

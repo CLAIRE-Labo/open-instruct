@@ -284,10 +284,12 @@ def prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=F
                    f"in [{np.min(lens)}, {np.max(lens)}] ({perc_max:.1%} at max length)"
 
         lens_att = [x["yplus_att"]["input_ids"].shape[0] for x in train_dataset]
+        lens_att_test = [x["yplus_att"]["input_ids"].shape[0] for x in test_dataset]
         len_response_att = [torch.sum(x["yplus_att"]["labels"] != -100).item() for x in train_dataset]
         lens_ref = [x["yplus_ref"]["input_ids"].shape[0] for x in train_dataset]
         len_response_ref = [torch.sum(x["yplus_ref"]["labels"] != -100).item() for x in train_dataset]
         logger.info(len_stats(lens_att, "example ATT"))
+        logger.info(len_stats(lens_att_test, "example ATT test"))
         logger.info(len_stats(len_response_att, "response ATT"))
         logger.info(len_stats(lens_ref, "example ref"))
         logger.info(len_stats(len_response_ref, "response ref"))
@@ -325,7 +327,7 @@ def prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=F
     train_dataloader = get_dataloader(train_dataset, tokenizer, model, args.per_device_train_batch_size)
     test_dataloader = get_dataloader(test_dataset, tokenizer, model, args.per_device_train_batch_size)
     logger.info(f"Check: {len(train_dataset)=} {len(train_dataloader)=} {len(test_dataset)=} {len(test_dataloader)=}")
-    return test_dataloader, test_examples, train_dataloader, train_examples
+    return train_dataloader, train_examples, test_dataloader, test_examples
 
 
 def main():
@@ -395,7 +397,7 @@ def main():
                                      and (Path(args.precompute_ref_logprobs) / "test").exists()
     need_precompute_ref_logprobs = args.precompute_ref_logprobs is not None and not have_precomputed_ref_logprobs
 
-    test_dataloader, test_examples, train_dataloader, train_examples \
+    train_dataloader, train_examples, test_dataloader, test_examples  \
         = prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=have_precomputed_ref_logprobs)
 
     num_train_examples = len(train_dataloader.dataset)
@@ -435,7 +437,7 @@ def main():
         train_path = Path(args.precompute_ref_logprobs) / "train"
         test_path = Path(args.precompute_ref_logprobs) / "test"
         precompute_save_ref_logprobs(accelerator, model, train_dataloader, train_path)
-        precompute_save_ref_logprobs(accelerator, model, train_dataloader, test_path)
+        precompute_save_ref_logprobs(accelerator, model, test_dataloader, test_path)
         # Reload the data to get the precomputed logprobs
         train_dataloader, train_examples, test_dataloader, test_examples \
             = prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=True)
@@ -588,6 +590,8 @@ def main():
 
     if accelerator.sync_gradients and not args.logging_examples_ignore_first:
         log_examples_to_wandb()
+
+    eval_log_step = 0
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_loss = 0
@@ -603,6 +607,8 @@ def main():
             )
         else:
             active_dataloader = train_dataloader
+
+        accum_logs = []
         for step, batch in enumerate(active_dataloader):
             global_step = step + len(train_dataloader) * epoch
             percentage_complete = global_step / args.max_train_steps
@@ -612,9 +618,8 @@ def main():
             with accelerator.accumulate(model):
                 loss, logs = compute_loss_att(accelerator, model, batch, args, percentage_complete=percentage_complete,
                                               eval=False, debug=False)
-
-                # For adam this doesn't matter, but to sleep better we still do it
-                loss /= batch_size
+                # logs is a list of per_device_batch_size dicts
+                accum_logs.append(logs)
 
                 total_loss += loss.detach().float()
                 accelerator.backward(loss)
@@ -625,23 +630,23 @@ def main():
                 optimizer.zero_grad()
                 lr_scheduler.step()
 
-                # for cuda out of memory
-                if step % 2000 == 0:
-                    torch.cuda.empty_cache()
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 completed_steps += 1
                 if args.logging_steps and completed_steps % args.logging_steps == 0:
                     gathered_loss = accelerator.gather(total_loss)
-                    avg_loss = gathered_loss.mean().item() / args.gradient_accumulation_steps / args.logging_steps
+                    # Average per one entry (x,y-,y+) in the dataset
+                    avg_loss = gathered_loss.mean().item() / args.gradient_accumulation_steps / args.logging_steps / args.per_device_train_batch_size
 
-                    all_logs = gather_object((logs,))
-                    all_logs = sum(all_logs, [])
+                    all_logs = gather_object((accum_logs,))
+                    all_logs = sum(sum(all_logs, []), [])
+                    # Average over logging_steps batches. Each batch is of size num_devices * per_device_batch_size * gradient_accumulation_steps
                     avg_logs = {"train/" + k: sum(log[k] for log in all_logs) / len(all_logs) for k in all_logs[0]}
                     # logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
                     # Print number of examples processed so far in this epoch
                     # print(f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
                     if args.with_tracking:
+                        # print(f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
                         accelerator.log(
                             {
                                 "train/learning_rate": lr_scheduler.get_last_lr()[0],
@@ -650,8 +655,8 @@ def main():
                                 **avg_logs,
                             },
                         )
-
                     total_loss = 0
+                    accum_logs = []
 
                 if args.logging_examples_steps and completed_steps % args.logging_examples_steps == 0:
                     log_examples_to_wandb()
@@ -684,14 +689,18 @@ def main():
             # with (torch.no_grad()):
             num_labels = batch["yplus_att"]["labels"].ne(-100).sum()
             loss, logs = compute_loss_att(accelerator, model, batch, args, eval=True, debug=False)
-            loss /= accelerator.num_processes
             all_logs = gather_object((logs,))
             all_logs = sum(all_logs, [])
+            # print(f"Step {step}: {len(all_logs)=}")
             sum_logs = {k: sum(log[k] for log in all_logs) for k in all_logs[0]}
             total_sum_logs = sum_logs if total_sum_logs is None \
                 else {k: (total_sum_logs[k] + sum_logs[k]) for k in sum_logs}
             for proc_log in all_logs:
-                accelerator.log(proc_log)
+                # train logs are averaged over the batch, eval logs (here) are saved for each example
+                to_log = {f"eval/{k}": proc_log[k] for k in proc_log}
+                to_log["eval/log_step"] = eval_log_step
+                accelerator.log(to_log)
+                eval_log_step += 1
 
             batch_loss = accelerator.gather(loss).sum().item()
             total_loss += batch_loss
@@ -699,6 +708,7 @@ def main():
             eval_pbar.set_postfix({"avg_loss": (total_loss / (step + 1)).item()})
         # logs = {"eval/avg_loss": (total_loss / (step + 1)).item()}
         logs = {}
+
         all_num_labels = accelerator.gather(num_labels_per_proc)
         total_num_labels = all_num_labels.sum().item()
 
