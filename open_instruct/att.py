@@ -13,9 +13,8 @@ from datasets import Dataset, concatenate_datasets
 from accelerate.utils import gather_object
 
 sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
-from load_utils import clean_memory
 from open_instruct.constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE, ATT_RESPONSE_PREFIX
-from open_instruct.load_utils import pretty_print_chatml
+from open_instruct.load_utils import pretty_print_chatml, clean_memory
 
 from open_instruct.dpo_utils import _get_batch_logps
 

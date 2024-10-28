@@ -91,14 +91,13 @@ def evaluate(args):
         else:
             responses_base = None
 
-        responses_log = run_att_model_for_eval(train_args, args, prompt_chats, responses_base=responses_base)
-        with open(responses_log_path, "w") as f:
-            responses_log = []
-            if responses_log_path.exists():
-                with open(responses_log_path, "r") as f:
-                    responses_log = json.load(f)
-                logger.info(f"Loaded responses from {responses_log_path}")
-            else:
+        if responses_log_path.exists():
+            with open(responses_log_path, "r") as f:
+                responses_log = json.load(f)
+            logger.info(f"Loaded responses from {responses_log_path}")
+        else:
+            responses_log = run_att_model_for_eval(train_args, args, prompt_chats, responses_base=responses_base)
+            with open(responses_log_path, "w") as f:
                 json.dump(responses_log, f)
 
         # Evaluate the responses
