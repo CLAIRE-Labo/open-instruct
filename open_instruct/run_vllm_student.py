@@ -8,29 +8,19 @@ from ray.tune.examples.pbt_dcgan_mnist.common import batch_size
 from tqdm import tqdm
 import vllm
 import sys
+import json
+import os
+import multiprocessing
 
 sys.path.append((Path(__file__).parents[1].absolute().as_posix()))
 from eval.utils import maybe_create_reformatted_lora_checkpoint
+from eval.chat import generate_responses_vllm
 
 from load_utils import load_tokenizer
+import torch.multiprocessing as mp
 
 
-def generate_responses_vllm(model, tokenizer, prompts, sampling_params, lora_request=None, batch_size=None):
-    #takes directly chat template applied versions
-
-    responses = model.generate(
-            prompts,
-            use_tqdm=batch_size is None,
-            sampling_params=sampling_params,
-            lora_request=lora_request,
-    )
-    if len(responses) > 1:
-        return prompts, [output.text for response in responses for output in response.outputs]
-    else:
-        return prompts, [r.outputs[0].text for r in responses]
-
-
-def run_model_for_student_vllm(args,input_sampling_params, batch):
+def run_model_for_student_vllm(args, prompts):
     model_name_or_path = args.model_name_or_path
     tokenizer_name_or_path = getattr(args, "tokenizer_name", None)
 
@@ -39,12 +29,11 @@ def run_model_for_student_vllm(args,input_sampling_params, batch):
 
     # Load tokenizer
     tokenizer, _ = load_tokenizer(args, substitute_eos_token=False)
-    max_new_tokens= input_sampling_params.max_new_tokens
 
     responses_log=[]
-    if input_sampling_params.use_vllm:
+    if args.use_vllm:
         print("Loading vLLM model...")
-        mem_util = args.mem_util if hasattr(input_sampling_params, "mem_util") else 0.9 if input_sampling_params.is_lora else 0.4
+        mem_util = args.mem_util if hasattr(args, "mem_util") else 0.9 if args.is_lora else 0.4
 
         base_model = vllm.LLM(
             model=model_name_or_path,
@@ -53,23 +42,21 @@ def run_model_for_student_vllm(args,input_sampling_params, batch):
             tokenizer_revision=hf_revision,
             tokenizer_mode="auto" if not args.use_slow_tokenizer else "slow",
             trust_remote_code=args.trust_remote_code,
-            enable_lora=input_sampling_params.is_lora,
+            enable_lora=args.is_lora,
             max_lora_rank=128,
-            disable_sliding_window=True if not hasattr(input_sampling_params, "disable_sliding_window") else input_sampling_params.disable_sliding_window,
-            gpu_memory_utilization=mem_util,
+            disable_sliding_window=True if not hasattr(args, "disable_sliding_window") else args.disable_sliding_window,
+            gpu_memory_utilization=mem_util
         )
 
         sampling_params = vllm.SamplingParams(
-            top_p=1.0 if input_sampling_params.greedy else input_sampling_params.top_p,
-            temperature=0.0 if input_sampling_params.greedy else input_sampling_params.temperature,
+            top_p=1.0 if args.greedy else args.top_p,
+            temperature=0.0 if args.greedy else args.temperature,
             seed=239,
-            max_tokens=input_sampling_params.max_new_tokens,
-            n=1 if not hasattr(input_sampling_params, "n_sample_per_prompt") else input_sampling_params.n_sample_per_prompt,
+            max_tokens=128,
+            n=1 if not hasattr(args, "n_sample_per_prompt") else args.n_sample_per_prompt,
         )
 
-        #responses_log = []
-
-        if input_sampling_params.is_lora:
+        if args.is_lora:
             # Not ATT, using LoRA
             lora_request=None
             if args.lora_model_name_or_path:
@@ -99,7 +86,7 @@ def run_model_for_student_vllm(args,input_sampling_params, batch):
             )
 
             formatted_prompts, outputs= generate_responses_vllm(
-                tuned_model, tokenizer, prompts, sampling_params, max_new_tokens
+                tuned_model, tokenizer, prompts, sampling_params
             )
 
         # Collect responses
@@ -110,25 +97,21 @@ def run_model_for_student_vllm(args,input_sampling_params, batch):
             })
 
         del base_model  # Free up GPU memory
-
-    try:
-        with open(args.pickle_output, "wb") as f:
-            pickle.dump(responses_log, f)
-        print(f"successfully output: {args.pickle_output}")
-
-    except Exception as e :
-        print(f"Error writing to {args.pickle_output}: {e}")
     return responses_log
-
 
 # Load arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name_or_path", type=str, help="Path to the model checkpoint")
 parser.add_argument("--lora_model_name_or_path", type=str, help="Path to the lora model checkpoint")
 parser.add_argument("--tokenizer_name", type=str, required=False, help="Name or path of the tokenizer")
-parser.add_argument("--pickle_prompts", type=Path, required=True, help="Path to the pickle file for batch data")
-parser.add_argument("--pickle_sampling_params", type=Path, required=True, help="Path to the pickle file for sampling parameters")
-parser.add_argument("--pickle_output", type=Path, required=True, help="Path to the pickle file for output results")
+parser.add_argument("--generated_res", type=Path, required=True, help="Path of resulting generations file")
+parser.add_argument("--batch_file", type=Path, required=True, help="Path of prompts file")
+
+parser.add_argument("--max_new_tokens", type=int, default=20, help="Maximum number of new tokens to generate")
+parser.add_argument("--top_p", type=float, default=0.9, help="Top p for sampling")
+parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling")
+parser.add_argument("--greedy", action="store_true", help="Whether to use greedy sampling")
+parser.add_argument("--n_sample_per_prompt", type=int, default=1, help="Number of samples to generate per prompt")
 parser.add_argument("--mem_util", type=float, default=0.4, help="GPU memory utilization")
 parser.add_argument("--batch_size", type=str, default="30", help="Batch size for model generation")
 
@@ -139,21 +122,36 @@ parser.add_argument("--tokenizer_revision", type=str, default="main", help="The 
 parser.add_argument("--model_revision", type=str, default="main", help="The specific revision of the model to use")
 
 parser.add_argument("--cache_dir", type=str, default= None, help= "cache directory path")
+
+parser.add_argument('--is_lora', action='store_true', help='Enable LoRA support')
+parser.add_argument('--use_vllm', action='store_true', help='Enable vLLM model usage')
+parser.add_argument('--disable_sliding_window', action='store_true', help='Disable sliding window for inference')
+
 args = parser.parse_args()
 
-# Load the batch
-with open(args.pickle_prompts, "rb") as f:
-    prompts = pickle.load(f)
+# Set multiprocessing to use 'spawn' method for CUDA compatibility
+multiprocessing.set_start_method('spawn', force=True)
 
-# Load sampling params
-with open(args.pickle_sampling_params, "rb") as f:
-    input_sampling_params = pickle.load(f)
-
+# read the prompts from json file
+with open(args.batch_file, "r") as f:
+    prompts = json.load(f)
 # Call the function to generate responses
-responses_log = run_model_for_student_vllm(args, input_sampling_params, batch=prompts)
+responses_log = run_model_for_student_vllm(args, prompts=prompts)
 
-# Save the results in pickle format
-#with open(args.pickle_output, "wb") as f:
-#    pickle.dump(responses_log, f)
+#write the things to the files
+# Extract the directory and filename from the batch_file path
+directory = os.path.dirname(args.batch_file)
+filename = os.path.basename(args.batch_file)
 
+# Create the new filename with the 'res_' prefix
+new_filename = f"res_{filename}"
+
+# Create the full path for the new file
+result_file = os.path.join(directory, new_filename)
+
+# Store the results in the new JSON file
+with open(result_file, 'w') as f:
+    json.dump(responses_log, f)
+
+print(f"Results stored in: {result_file}")
 

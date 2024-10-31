@@ -34,22 +34,11 @@ import deepspeed
 import wandb
 import huggingface_hub
 from accelerate.utils import DeepSpeedPlugin
+from datasets import Dataset, DatasetDict
 
 import transformers
 from transformers import (
-    AutoConfig,
-    PretrainedConfig,
-    GenerationConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    LlamaTokenizer,
-    LlamaTokenizerFast,
-    DataCollatorForSeq2Seq,
     get_scheduler,
-    GPTNeoXTokenizerFast,
-    GPT2Tokenizer,
-    OPTForCausalLM,
-    BitsAndBytesConfig,
 )
 import torch.nn.functional as F
 import torch.multiprocessing as mp
@@ -57,22 +46,14 @@ import pickle
 sys.path.append(Path(__file__).parents[1].absolute().as_posix())
 
 from peft import PeftConfig, PeftModel, LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-from att import apply_att_template, encode_with_chat_template, DataCollatorForATT, has_responses
+from att import apply_att_template, encode_with_chat_template, DataCollatorForATT, preprocess_for_symmetric_att
 
-from eval.utils import maybe_create_reformatted_lora_checkpoint
-from constants import BAD_MISTRAL_CHAT_TEMPLATE, ATT_SYSTEM_PROMPT, ATT_TEMPLATE
 from load_utils import (add_common_training_args, pretty_print_chatml, preprocess_data_to_chatml, \
                         load_tokenizer_model, save_args, load_args, preprocess_hh_common, target_lora_modules)
 from datetime import datetime
-# from eval.truthfulqa.run_eval import main as run_eval
-# from eval.truthfulqa.run_eval import parse_args as parse_args_eval
-
-# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256" - Cuda out of memory
 
 
 logger = get_logger(__name__)
-import pandas as pd
-import gc
 
 try:
     from hf_olmo import OLMoTokenizerFast
@@ -92,63 +73,11 @@ if api_key_file:
 else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
-def convert_batches_to_sentences(tokenizer, small_batches):
-    all_sentences = []
-    all_input_ids_length = []  
-
-    for batch in small_batches:
-        input_ids_batch = batch["input_ids"]
-        attention_mask_batch = batch["attention_mask"]
-
-        # Loop through each example in the batch
-        for input_ids in input_ids_batch:
-            # Decode the input_ids to a sentence (skip special tokens like padding)
-            sentence = tokenizer.decode(input_ids, skip_special_tokens=True)
-            all_sentences.append(sentence)
-            all_input_ids_length.append(len(input_ids))  # Append the length of the input_ids
-    
-    return all_sentences, all_input_ids_length   
-
-def generalized_jsd_loss(
-        student_logits, teacher_logits, labels=None, beta=0.5, temperature=1.0, reduction="batchmean"
-):
-    # Apply temperature scaling
-    student_logits = student_logits / temperature
-    teacher_logits = teacher_logits / temperature
-
-    # Log probabilities
-    student_log_probs = F.log_softmax(student_logits, dim=-1)
-    teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
-
-    # Interpolated log probabilities
-    interpolated_log_probs = beta * student_log_probs + (1 - beta) * teacher_log_probs
-
-    # KL divergence
-    kl_teacher = F.kl_div(interpolated_log_probs, teacher_log_probs, reduction="none", log_target=True)
-    kl_student = F.kl_div(interpolated_log_probs, student_log_probs, reduction="none", log_target=True)
-
-    # Generalized JSD
-    jsd = beta * kl_teacher + (1 - beta) * kl_student
-
-    # Mask out padding tokens
-    if labels is not None:
-        mask = labels != -100
-        jsd = jsd[mask]
-
-    # Apply reduction
-    if reduction == "batchmean":
-        return jsd.sum() / mask.sum() if labels is not None else jsd.sum() / (jsd.size(0) * jsd.size(1))
-    elif reduction == "sum":
-        return jsd.sum()
-    elif reduction == "mean":
-        return jsd.mean()
-    else:
-        return jsd
 
 
 
 def get_run_id(args: Namespace) -> str:
-    timestamp = time.strftime("%Y%m%d_%H%M%S") if not os.getenv('RUN_TIMESTAMP') else os.getenv('RUN_TIMESTAMP')
+    round = args.round
     # try to get the git commit hash
     # try:
     #     git_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('utf-8').strip()
@@ -159,7 +88,7 @@ def get_run_id(args: Namespace) -> str:
     # arg_set = frozenset(vars(args).items())
     # args_hash = abs(hash(arg_set))
     # print(f"arg_set: {frozenset} args_hash: {args_hash}")
-    return f"{timestamp}"
+    return f"{round}"
     # return f"{timestamp}_{args_hash}"
     # return f"{timestamp}_{git_commit}_{args_hash}"
 
@@ -182,17 +111,8 @@ def add_distill_args(parser: argparse.ArgumentParser):
         help="If set, the new token template is used for ATT traning."
     )
     parser.add_argument("--teacher_lora_model_name_or_path", type=str, help="Teacher model path")
-    parser.add_argument(
-        "--train_args",
-        type=str,
-        help="The tokenizer, model and lora config will be loaded with the same config as in training",
-        required=True,
-    )
-    ## this script will directly take the path of generated rejected answers
-    parser.add_argument(
-        "--generation_storage", type=str, default="data_sft.json", help="A json file will store the generated data.",
-        required=True
-    )
+    parser.add_argument("--wandb_id", type=str, default=None, required=True)
+
     parser.add_argument(
         "--deepspeed_config_file", type=str, help="the path of deepspeed config file"
     )
@@ -202,6 +122,10 @@ def add_distill_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--max_new_tokens", type=int, default=2048, required=False
     )
+    parser.add_argument(
+        "--pickle_batch", type=str, required=True
+    )
+
 
 
 def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
@@ -294,43 +218,95 @@ def build_lr_scheduler(accelerator, args, optimizer, train_dataloader):
     return lr_scheduler, overrode_max_train_steps
 
 
+def preprocess_for_att(example, tokenizer, max_seq_length, slack_len=70, debug_print=False,
+                                 logger=None):
+    example = deepcopy(example)
+    yplus_ref_orig = encode_with_chat_template(example['chosen'], tokenizer, max_seq_length, debug_print, logger)
+    yminus_ref_orig = encode_with_chat_template(example['rejected'], tokenizer, max_seq_length, debug_print, logger)
+
+    yplus_tokens = tokenizer.encode(example['chosen'][-1]['content'], add_special_tokens=False)
+    yminus_tokens = tokenizer.encode(example['rejected'][-1]['content'], add_special_tokens=False)
+
+    prompt_len = (yplus_ref_orig['labels'] == -100).sum().item()
+    yplus_len = len(yplus_tokens)
+    yminus_len = len(yminus_tokens)
+
+    if prompt_len >= max_seq_length:
+        logger.warning(f"Prompt is too long: {prompt_len}")
+        dummy_input = {
+            'input_ids': torch.tensor([tokenizer.bos_token_id], dtype=torch.long),
+            'labels': torch.tensor([-100], dtype=torch.long),
+            'attention_mask': torch.tensor([1], dtype=torch.long),
+        }
+
+        return dummy_input
+
+    remaining_budget = max_seq_length - prompt_len - slack_len
+    yminus_len_cropped = min(yminus_len, remaining_budget // 3)
+    if prompt_len + yminus_len + yplus_len + slack_len <= max_seq_length:
+        # No cropping needed
+        pass
+    elif prompt_len + yminus_len_cropped + yplus_len + slack_len <= max_seq_length:
+        # Only need to crop yminus
+        yminus_len_necessary = max_seq_length - prompt_len - yplus_len - slack_len
+        yminus_cropped_tok = yminus_tokens[:yminus_len_necessary]
+        example['rejected'][-1]['content'] = tokenizer.decode(yminus_cropped_tok, skip_special_tokens=False)
+    else:
+        # Crop both yminus and yplus
+        yminus_cropped_tok = yminus_tokens[:yminus_len_cropped]
+        example['rejected'][-1]['content'] = tokenizer.decode(yminus_cropped_tok, skip_special_tokens=False)
+        yplus_len_necessary = max_seq_length - prompt_len - yminus_len_cropped - slack_len
+        yplus_cropped_tok = yplus_tokens[:yplus_len_necessary]
+        example['chosen'][-1]['content'] = tokenizer.decode(yplus_cropped_tok, skip_special_tokens=False)
+
+    yplus_att = apply_att_template(example, tokenizer, max_seq_length, debug_print, logger)
+
+    if yplus_att["input_ids"].shape[0]> max_seq_length:
+        return None
+
+    return yplus_att
+
 def apply_formatting_and_encoding(example, tokenizer, max_seq_length, debug_print=False, logger=None):
-    def empty_assistant_chosen(messages):
-        for msg in messages:
-            if msg["role"] == "assistant":
-                msg["content"] = ""
-        return messages
-
-    example["chosen"] = empty_assistant_chosen(example["chosen"])
-    teacher_encoded = apply_att_template(example, tokenizer, max_seq_length, debug_print, logger)
-    input_ids = teacher_encoded['input_ids']
-    labels = teacher_encoded['labels']
-    prompt_ids = input_ids[labels == -100]
-    teacher_encoded["input_ids"] = prompt_ids
-
-    # prompt_text = tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=False)
-    # print(f"Teacher Prompt: \n\n{prompt_text}\n\n")
-
+    # Student encoding
     student_encoded = encode_with_chat_template(example["chosen"], tokenizer, max_seq_length, debug_print, logger)
 
-    input_ids = student_encoded['input_ids']
-    labels = student_encoded['labels']
-    prompt_ids = input_ids[labels == -100]
-    student_encoded["input_ids"] = prompt_ids
-    if len(prompt_ids) > max_seq_length + 30:  # 30 is assumed to be the extra token amount.
-        logger.warning(f"Skipping student data: input size  {len(prompt_ids)} exceeds {max_seq_length}")
-        return None
-    # prompt_text = tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=False)
-    # print(f"Student Prompt: \n\n{prompt_text}\n\n")
+    # Teacher encoding
+    teacher_encoded = preprocess_for_att(example, tokenizer, max_seq_length, debug_print, logger)
 
+    # If any of the encodings return None, return None to indicate the sample should be skipped
+    if student_encoded is None or teacher_encoded is None:
+        if logger:
+            logger.warning("Skipping example due to encoding failure.")
+        return {
+            'teacher_encoded': None,
+            'student_encoded': None
+        }
+
+    # Return the valid encoding
     return {
         'teacher_encoded': teacher_encoded,
-        'student_encoded': student_encoded,
+        'student_encoded': student_encoded
     }
+
+def has_responses(processed_example):
+    # First, check if processed_example is None
+    if processed_example is None:
+        return False
+
+    # Ensure that none of the values in processed_example are None
+    for e in processed_example.values():
+        if e is None or "labels" not in e:
+            return False
+        # Check if the labels contain valid entries
+        if (e["labels"] == -100).all():
+            return False
+
+    # If all checks pass, return True
+    return True
+
 
 
 def main():
-    mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser(description="Finetune a transformers model using pairwise preference data.")
     add_common_training_args(parser)
     add_distill_args(parser)
@@ -345,7 +321,6 @@ def main():
         assert args.report_to in ["wandb", "all"], "Currently only wandb is supported for tracking."
         wandb_api_key = os.getenv('WANDB_API_KEY')
         # This should be done in accelerator.init_trackers
-        # wandb.init(project="alignment_translation", entity="claire-labo")
         # Configure wandb logging within Accelerator
         accelerator_log_kwargs["log_with"] = args.report_to
         accelerator_log_kwargs["project_dir"] = args.output_dir
@@ -389,16 +364,27 @@ def main():
 
     accelerator.wait_for_everyone()
 
+    #TODO: changes that should be done?
+    # if first run, get the load lora True then should be false since it will be the adapter
+    # load the teacher model in the same way but load lora false
+
     model, tokenizer, actual_eos_token, generation_config_nucleus, generation_config_greedy \
         = load_tokenizer_model(accelerator, args, substitute_eos_token=True, load_lora=False)
 
-    model.generation_config = generation_config_greedy
+    #model.generation_config = generation_config_greedy
     model.eos_token = actual_eos_token
     peft_model = PeftModel.from_pretrained(model, str(args.teacher_lora_model_name_or_path))
 
     teacher_model = peft_model.merge_and_unload()  # get the merged teacher_model
 
-    # apply lora on top of student model
+    #model.generation_config = generation_config_greedy
+    if args.student_lora_model_name_or_path:
+        model.eos_token = actual_eos_token
+        peft_model = PeftModel.from_pretrained(model, str(args.student_lora_model_name_or_path))
+        model = peft_model.merge_and_unload()  # get the merged teacher_model
+
+
+    # apply lora on top of student model - TODO: delete this part it wont be needed
     if args.use_lora:
         logger.info("Initializing LORA model...")
         peft_config = LoraConfig(
@@ -417,8 +403,8 @@ def main():
     logger.info(str(model), main_process_only=True)
     """for name, param in model.named_parameters():
         print(f"Parameter: {name}, Data Type: {param.dtype}")"""
-    run_id = get_run_id(args)
-    checkpointing_dir = Path(args.output_dir) / run_id
+
+    checkpointing_dir = Path(args.output_dir)
     # If the output directory already exists, the process was interrupted and restarted by the cluster.
     # We should resume from the last checkpoint.
 
@@ -438,39 +424,31 @@ def main():
                          x.stem.startswith("step_") or x.stem.startswith("epoch_")]
             if len(ckpt_dirs) > 0:
                 last_checkpoint = max(ckpt_dirs, key=os.path.getctime)
-                args.resume_from_checkpoint = last_checkpoint
+                args.resume_from_checkpoint = str(last_checkpoint)
     logger.info(f"\n\n\nSaving checkpoints to {checkpointing_dir}\n\n\n")
 
     ######################################## Data Preprocessing ########################################
-    dataset_train, dataset_test = preprocess_data_to_chatml(args)
-    filtered_dataset = DatasetDict({
-        'train': dataset_train,
-        'test': dataset_test
-    })
+     #read pickle file as dataset
+    with open(args.pickle_batch, 'rb') as f:
+        dataset = pickle.load(f)
 
-    # Replace the rejected answers in dataset with sft models' responses
+    # Assume `dataset` contains 'chosen' and 'rejected' lists
+    if isinstance(dataset, dict):  # Ensure it's a dictionary-like object
+        if isinstance(dataset.get("chosen"), list) and isinstance(dataset.get("rejected"), list):
+            # Combine 'chosen' and 'rejected' into one dataset
+            combined_data = {
+                "chosen": dataset["chosen"],  # Add 'chosen' list as a column
+                "rejected": dataset["rejected"]  # Add 'rejected' list as a column
+            }
 
-    if args.generation_storage:
-        generated_responses = []
-        with open(args.generation_storage, "r") as file:
-            for line in file:
-                try:
-                    data = json.loads(line.strip())
-                    generated_responses.extend(data.get("batch_generations", []))
-                except json.JSONDecodeError as e:
-                    print(f"Skipping invalid line due to JSONDecodeError:{e}")
-        print("Already generated answers are taken, ex:", generated_responses[0])
-
-    for idx, example in enumerate(filtered_dataset["train"]):
-        # Check if the example contains "rejected" and it's non-empty
-        if "rejected" in example and len(example["rejected"]) > 0:
-            # Access the last item in the "rejected" field
-            last_message = example["rejected"][-1]
-
-            # Check if the role is "assistant"
-            if last_message["role"] == "assistant":
-                # Replace the content with the corresponding generated response
-                last_message["content"] = generated_responses[idx]
+            # Create the new 'train' split with both 'chosen' and 'rejected' columns
+            dataset = DatasetDict({
+                "train": Dataset.from_dict(combined_data)  # New 'train' dataset containing 'chosen' and 'rejected' columns
+            })
+        else:
+            raise ValueError("Both 'chosen' and 'rejected' must be present as lists.")
+    else:
+        raise TypeError(f"Expected a DatasetDict-like object, but got {type(dataset)}.")
 
     encode_function = partial(
         apply_formatting_and_encoding,
@@ -481,23 +459,24 @@ def main():
     )
 
     with accelerator.main_process_first():
-        lm_datasets = filtered_dataset.map(
+        lm_datasets = dataset.map(
             encode_function,
             batched=False,
             num_proc=args.preprocessing_num_workers,
             load_from_cache_file=not args.overwrite_cache,
-            remove_columns=[name for name in filtered_dataset["train"].column_names if
+            remove_columns=[name for name in dataset["train"].column_names if
                             name not in ["input_ids", "labels", "attention_mask"]],
-            desc="Tokenizing and reformatting instruction data", )
+            desc="Tokenizing and reformatting instruction data",
+        )
 
+        # Set format to pytorch tensors
         lm_datasets.set_format(type="pt")
         lm_datasets = lm_datasets.filter(has_responses)
 
-    print("Size of training set:", len(filtered_dataset['train']))
-    print("Size of test set:", len(filtered_dataset['test']))
+    print("Size of training set:", len(dataset['train']))
 
     train_dataset = lm_datasets["train"]
-    test_dataset = lm_datasets["test"]
+    #test_dataset = lm_datasets["test"]
 
     # COMMENT OUT! This is for debugging epoch checkpointing
     # train_dataset = train_dataset.select(range(192))
@@ -509,28 +488,8 @@ def main():
     # Log a few random samples from the training set
 
     num_train_ex = accelerator.num_processes
-    num_test_ex = accelerator.num_processes
-    indices_train_ex = random.sample(range(len(train_dataset)), num_train_ex)
-    indices_test_ex = random.sample(range(len(test_dataset)), num_test_ex)
-
-    train_examples = [train_dataset[i] for i in indices_train_ex]
-    test_examples = [test_dataset[i] for i in indices_test_ex]
-
-    def put_big_to_front(dataset):
-        logger.info("Putting the biggest examples to the front of the dataset to catch OOMs early.")
-        lens = [x["teacher_encoded"]["input_ids"].shape[0] for x in dataset]
-        order = list(sorted(range(len(lens)), key=lambda x: lens[x], reverse=True))
-        if len(order) > 128:
-            order = order[:128] + random.sample(order[128:], k=len(order[128:]))
-        dataset = dataset.select(order)
-        return dataset
-
-    train_dataset = put_big_to_front(train_dataset)
-    test_dataset = put_big_to_front(test_dataset)
 
     print("Size of training set:", len(train_dataset))
-    print("Size of test set:", len(test_dataset))
-
     ######################################## Training Setup ########################################
     # DataLoaders creation:
     def get_dataloader(dataset, batch_size):
@@ -542,7 +501,7 @@ def main():
         )
 
     train_dataloader = get_dataloader(train_dataset, args.per_device_train_batch_size)
-    test_dataloader = get_dataloader(test_dataset, args.per_device_train_batch_size)
+    #test_dataloader = get_dataloader(test_dataset, args.per_device_train_batch_size)
 
     # Optimizer
     optimizer = build_optimizer(args, model)
@@ -562,10 +521,10 @@ def main():
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
         accelerator.init_trackers(project_name="alignment_translation", config=experiment_config,
-                                  init_kwargs={"wandb": {"entity": "claire-labo"}})
+                                  init_kwargs={"wandb": {"entity": "claire-labo", "id":args.wandb_id, "resume":"allow"}})
 
     # Define custom step metric for evaluation
-    # run_id = wandb.run.id
+    #run_id = wandb.run.id
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -586,13 +545,7 @@ def main():
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
-    # teacher_model= accelerator_teacher.prepare(teacher_model)
-    test_dataloader = accelerator.prepare(test_dataloader)
-
     teacher_model = accelerator_teacher.prepare(teacher_model)
-
-    for param in teacher_model.parameters():
-        param.requires_grad = False
 
     # accelerator.state.select_deepspeed_plugin("student")
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -609,60 +562,39 @@ def main():
 
     ######################################## Checkpointing ########################################
     # Potentially load in the weights and states from a previous save
+    epoch_name=None
     if args.resume_from_checkpoint is not None:
         checkpoint_path = Path(args.resume_from_checkpoint)
         path = os.path.basename(args.resume_from_checkpoint)
-
+        ##get the epoch name from the path
+        if 'epoch' in path:
+            epoch_name = path.split('_')[-1]  # Get the part after 'epoch_'
+            print(f"Extracted epoch name: {epoch_name}")
+            epoch_name=int(epoch_name)
+        else:
+            print("No epoch name found in the checkpoint path.")
         state_path = Path(checkpoint_path) / "state"
         assert state_path.exists(), f"Checkpoint path {state_path} does not exist."
         logger.info(f"Resuming from checkpoint: {state_path}", main_process_only=True)
         accelerator.load_state(str(state_path))
         logger.info(f"Accelerator state loaded", main_process_only=True)
 
-        # Extract `epoch_{i}` or `step_{i}`
-        training_difference = checkpoint_path.stem
-        if "epoch" in training_difference:
-            starting_epoch = int(training_difference.replace("epoch_", "")) + 1
-            resume_step = None
-            completed_steps = starting_epoch * num_update_steps_per_epoch
-        else:
-            # need to multiply `gradient_accumulation_steps` to reflect real steps
-            resume_step = (
-                    int(training_difference.replace("step_", ""))
-                    * args.gradient_accumulation_steps
-            )
-            starting_epoch = resume_step // len(train_dataloader)
-            completed_steps = resume_step // args.gradient_accumulation_steps
-            resume_step -= starting_epoch * len(train_dataloader)
+
 
     # update the progress_bar if load from checkpoint
-    progress_bar.update(completed_steps)
+    #progress_bar.update(completed_steps)
 
     ######################################## Training Loop ########################################
     print(f"{accelerator.sync_gradients=}", flush=True)
     accelerator.wait_for_everyone()
 
-    # TODO handle the eval after
-    """    if accelerator.sync_gradients and not args.logging_examples_ignore_first:
-        log_examples_to_wandb(completed_steps)"""
+    #will be run only 1 epoch all the time  - REVIEW
 
-    torch.cuda.empty_cache()
-    checkpoint_path = ""  #will be filled with the future checkpoints
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_loss = 0
         epoch_data_count = 0  # To keep track of the number of data points in each epoch
-        if (
-                args.resume_from_checkpoint
-                and epoch == starting_epoch
-                and resume_step is not None
-        ):
-            # We skip the first `n` batches in the dataloader when resuming from a checkpoint
-            active_dataloader = accelerator.skip_first_batches(
-                train_dataloader, resume_step
-            )
-        else:
-            active_dataloader = train_dataloader
+        active_dataloader = train_dataloader
         """
         Algorithm: Generalized Knowledge Distillation (GKD)
         1: Given: Teacher model pT, Student Model pθS, Dataset (X, Y) containing (input, output) pairs
@@ -677,187 +609,52 @@ def main():
         10:  Update θ to minimize LGKD: θ ← θ - η * (1/B) * Σ_{(x,y)∈B} ∇θD(pT∥pθS)(y|x)
         11: end for
         """
-        num_gpus = torch.cuda.device_count()  # Get the number of available GPUs (e.g., 8 GPUs)
-        all_responses = []  # To store all responses across GPUs
-
+        model.train()
         for step, batch in enumerate(active_dataloader):
-            # Check if we want to use the student model's generated outputs (on-policy learning)
-            if random.random() <= args.lambda_value:
+            # Use original batch data for both student and teacher
+            student_inputs = {
+                'input_ids': batch['student_encoded']['input_ids'],
+                'attention_mask': batch['student_encoded']['attention_mask'],
+                'labels': batch['student_encoded']['labels'],
+            }
 
-                # Split the batch into 8 smaller batches, one for each GPU
-                batch_size_per_gpu = len(batch["student_encoded"]["input_ids"]) // num_gpus
-                small_batches = [
-                    {
-                        "input_ids": batch["student_encoded"]["input_ids"][i:i + batch_size_per_gpu],
-                        "attention_mask": batch["student_encoded"]["attention_mask"][i:i + batch_size_per_gpu],
-                    }
-                    for i in range(0, len(batch["student_encoded"]["input_ids"]), batch_size_per_gpu)
-                ]
-                gpu_sentences_matrix =[[] for _ in range(num_gpus)]
-                input_ids_len_matrix =[[] for _ in range(num_gpus)]
-                # Prepare sampling params
-                sampling_params = {
-                    'max_new_tokens': 128,
-                    'top_p': 0.9,
-                    'temperature': 0.8,
-                    'greedy': False,
-                    'n_sample_per_prompt':1,
-                    'use_vllm':True,
-                    'is_lora': True,
-                    'disable_sliding_window': True
-                }
-                sampling_params = Namespace(**sampling_params)
-
-                # List of processes for parallel execution
-                processes = []
-                responses = [None] * num_gpus  # To store the responses from each GPU
-
-                # Get the current timestamp to ensure file uniqueness
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                gpu_id= int(torch.cuda.current_device())
-                print("executing ",gpu_id)
-
-                gpu_sentences_matrix[gpu_id], input_ids_len_matrix[gpu_id] = convert_batches_to_sentences(tokenizer, [small_batches[gpu_id]])
-
-                Path("pickles").mkdir(parents=True, exist_ok=True)
-                # Create unique paths for pickle files for each GPU
-                pickle_prompts_path = Path(f"pickles/prompts_{timestamp}_gpu{gpu_id}.pkl").absolute().as_posix()
-                pickle_output_path = Path(f"pickles/output_{timestamp}_gpu{gpu_id}.pkl").absolute().as_posix()
-                pickle_sampling_params_path = Path(f"pickles/sampling_params_{timestamp}_gpu{gpu_id}.pkl").absolute().as_posix()
-                vllm_script = (Path(__file__).parents[0] / "run_vllm_student.py").absolute().as_posix()
-                # Serialize the prompts and sampling parameters into pickle files
-                with open(pickle_prompts_path, "wb") as f:
-                    pickle.dump(gpu_sentences_matrix[gpu_id], f)
-
-                with open(pickle_sampling_params_path, "wb") as f:
-                    pickle.dump(sampling_params, f)
-
-                # Run subprocess on the current GPU and get the results
-                #todo get the results from subprocess - encode them and get the y+
-                #todo crop if needed cases
-                #calculate the losses
-
-                p = subprocess.Popen(
-                    ["python", vllm_script, "--model_name_or_path", args.model_name_or_path,
-                     "--lora_model_name_or_path", checkpoint_path,
-                     "--tokenizer_name", args.tokenizer_name,
-                     "--pickle_prompts", pickle_prompts_path,
-                     "--pickle_sampling_params", pickle_sampling_params_path,
-                     "--pickle_output",pickle_output_path,
-                     #"--mem_util", str(getattr(sampling_params, "mem_util", 0.4)),
-                     "--batch_size", str(batch_size_per_gpu), "--trust_remote_code"],
-                    env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)},
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                processes.append((p, gpu_id))
-                
-
-                # Wait for all processes to complete and gather their results
-                for p, gpu_id in processes:
-                    stdout, stderr=p.communicate()
-                    if p.returncode !=0:
-                        print(f"Subprocess for GPU {gpu_id} failed with return code {p.returncode}")
-                        print(f"error: {stderr.decode('utf-8')}")
-                        raise RuntimeError("subprocess failed")
-                    if stdout:
-                        print(f"subprocess for gpu {gpu_id} output:\n {stdout.decode('utf-8')}")
-                    #p.wait()  # Wait for the process to finish
-
-                # Read the responses from the output pickle file
-                with open(pickle_output_path, "rb") as f:
-                    responses[gpu_id] = pickle.load(f)
-
-                Path(pickle_prompts_path).unlink()
-                Path(pickle_sampling_params_path).unlink()
-                Path(pickle_output_path).unlink()
-
-                # Store the responses
-                all_responses.extend(responses)
-                responses_log=None
-                #TODO - change the remaining
-                generated_tokens = responses_log["input_ids"][:, original_input_length:]
-                new_attention_mask = responses_log["attention_mask"][:, original_input_length:]
-
-                # Use generated student outputs
-                student_inputs = {
-                    'input_ids': responses_log["input_ids"],
-                    'attention_mask': responses_log["attention_mask"]  # New attention mask for generated tokens
-                }
-                
-                # Keep teacher inputs from original data
-                teacher_inputs = {
-                    'input_ids': torch.cat([batch['teacher_input_ids'], generated_tokens], dim=1),
-                    'attention_mask': torch.cat([batch['teacher_attention_mask'], new_attention_mask], dim=1)
-                }
-
-            else:
-                original_input_length = batch["attention_mask"].sum(dim=1)
-                # Use original batch data for both student and teacher
-                student_inputs = {
-                    'input_ids': batch['input_ids'],
-                    'attention_mask': batch['attention_mask']
-                }
-                teacher_inputs = {
-                    'input_ids': batch['teacher_input_ids'],
-                    'attention_mask': batch['teacher_attention_mask']
-                }
+            # Extract teacher inputs
+            teacher_inputs = {
+                'input_ids': batch['teacher_encoded']['input_ids'],
+                'attention_mask': batch['teacher_encoded']['attention_mask'],
+                'labels': batch['teacher_encoded']['labels'],
+            }
 
             # Forward pass for the student model
             with accelerator.accumulate(model):  # Accumulate gradients
                 student_outputs = model(**student_inputs)
 
-                # Forward pass for the teacher model (in evaluation mode)
-                teacher_model.eval()
-                # Get the teacher input and attention mask
-                teacher_input_ids = batch['teacher_input_ids']
-                teacher_attention_mask = batch['teacher_attention_mask']
-
-                # Calculate the actual non-padding length of each sequence
-                teacher_token_lengths = teacher_attention_mask.sum(
-                    dim=1)  # Number of non-padding tokens for each sequence
-
-                # Dynamically truncate the input sequences for the teacher model based on the non-padding length
-                # We'll loop over the batch to truncate each sequence individually
-
-                truncated_teacher_input_ids = []
-                truncated_teacher_attention_masks = []
-
-                for i in range(teacher_input_ids.size(0)):  # Iterate over the batch
-                    seq_len = teacher_token_lengths[i].item()  # Get the non-padding length for this sequence
-                    truncated_teacher_input_ids.append(teacher_input_ids[i, :seq_len])  # Truncate input_ids
-                    truncated_teacher_attention_masks.append(
-                        teacher_attention_mask[i, :seq_len])  # Truncate attention mask
-
-                # Convert the lists back to tensors with dynamic batch sizes
-                truncated_teacher_input_ids = torch.nn.utils.rnn.pad_sequence(truncated_teacher_input_ids,
-                                                                              batch_first=True,
-                                                                              padding_value=tokenizer.pad_token_id)
-                truncated_teacher_attention_masks = torch.nn.utils.rnn.pad_sequence(truncated_teacher_attention_masks,
-                                                                                    batch_first=True, padding_value=0)
-
+                #print(student_outputs.logits.requires_grad)
                 # Forward pass for the teacher model (in evaluation mode) using truncated inputs
-                teacher_model.eval()
                 with torch.no_grad():
                     teacher_outputs = teacher_model(**teacher_inputs)
 
                 # Slice logits based on prompt lengths - to compare them over generated responses
-                prompt_lengths_student = batch['input_ids'].shape[1]
-                prompt_lengths_teacher = batch["teacher_input_ids"].shape[1]
-                student_logits = student_outputs.logits[:, prompt_lengths_student - 1:-1,
-                                 :]  # prompt_lengths_teacher - 1: -1, :]
-                teacher_logits = teacher_outputs.logits[:, prompt_lengths_teacher - 1:-1,
-                                 :]  # prompt_lengths_teacher - 1: -1, :]
-                labels = batch['labels'][:, :prompt_lengths_teacher]  # [:, prompt_lengths_student:]
+                prompt_lengths_student = student_inputs['input_ids'].shape[1]
+                prompt_lengths_teacher = teacher_inputs["input_ids"].shape[1]
+                # Step 1: Calculate softmax for both teacher and student logits
+                student_logits = student_outputs.logits[:, :prompt_lengths_student]
+                teacher_logits = teacher_outputs.logits[:, :prompt_lengths_teacher]
 
-                # Compute the Generalized JSD loss
-                loss = generalized_jsd_loss(
-                    student_logits=student_logits,
-                    teacher_logits=teacher_logits,
-                    labels=labels,
-                    beta=0.5,
-                    temperature=1.0,
-                )
+                # Ensure that the logits are the same shape for both student and teacher, if not, align them. - TODO
+                min_length = min(student_logits.shape[1], teacher_logits.shape[1])
+                student_logits = student_logits[:, :min_length]
+                teacher_logits = teacher_logits[:, :min_length]
+
+                # Step 2: Apply softmax to get probabilities
+                student_probs = F.softmax(student_logits, dim=-1)
+                teacher_probs = F.softmax(teacher_logits, dim=-1)
+
+                if not student_probs.requires_grad:
+                    student_probs.requires_grad_()
+
+                #   Step 3: Compute KL Divergence
+                loss = F.kl_div(student_probs.log(), teacher_probs, reduction='batchmean')
 
                 # Backpropagation and optimizer step
                 accelerator.backward(loss)  # Use accelerator to handle distributed backward pass
@@ -866,11 +663,10 @@ def main():
                 optimizer.zero_grad()
 
                 # Accumulate total loss and count for logging
-                total_loss += loss.item()
-                epoch_data_count += batch['input_ids'].size(0)
+                total_loss += loss.detach().float()
 
                 # for cuda out of memory
-                if step % 500 == 0:
+                if step % 2000 == 0:
                     torch.cuda.empty_cache()
 
             if accelerator.sync_gradients:
@@ -892,9 +688,6 @@ def main():
 
                     total_loss = 0
 
-                """if args.logging_examples_steps and completed_steps % args.logging_examples_steps == 0:
-                    log_examples_to_wandb(completed_steps)"""
-
                 if isinstance(checkpointing_steps, int) and completed_steps % checkpointing_steps == 0:
                     output_dir = checkpointing_dir / f"step_{completed_steps}"
                     save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
@@ -902,39 +695,71 @@ def main():
                 if completed_steps >= args.max_train_steps:
                     break
 
-            print(f"Completed Epoch {epoch + 1}: Total processed examples = {epoch_data_count}")
+        print(f"Completed Epoch {epoch + 1}")
 
-        model.eval()
+        accelerator.wait_for_everyone()
+        torch.cuda.empty_cache()
+        #TODO : how should we evaluate the performance since in this version there is no yplus_att etc.?
+        """model.eval()
         eval_pbar = tqdm(test_dataloader, desc="Evaluating", disable=not accelerator.is_local_main_process)
-        total_loss = 0.0
-        total_num_labels = 0
+        total_loss = torch.zeros((), device=accelerator.device, dtype=torch.bfloat16)
+        total_yplus_ce = 0.0
+        num_labels_per_proc = torch.zeros((), device=accelerator.device, dtype=int)
+        total_sum_logs = None
+        step = 0
         for step, batch in enumerate(eval_pbar):
             if args.max_train_steps is not None and step >= args.max_train_steps:
                 break
-            with torch.no_grad():
-                outputs = model(**batch, use_cache=False)
-                num_labels = batch["labels"].ne(-100).sum()
-                loss = compute_loss(batch, outputs)
-            batch_num_labels = accelerator.gather(num_labels.repeat(accelerator.num_processes)).sum().item()
-            batch_loss = accelerator.gather(loss.repeat(accelerator.num_processes)).sum().item()
-            total_loss += batch_loss
-            total_num_labels += batch_num_labels
-            eval_pbar.set_postfix({"loss": total_loss / total_num_labels})
 
-        logs = {"eval_loss": total_loss / total_num_labels, "eval_ppl": math.exp(total_loss / total_num_labels)}
+            # Encountered a random deepspeed bug, goes away if I don't add no_grad
+            # with (torch.no_grad()):
+            num_labels = batch["yplus_att"]["labels"].ne(-100).sum()
+            loss, logs = compute_loss_att(accelerator, model, batch, args, eval=True, debug=False)
+            loss /= accelerator.num_processes
+            all_logs = gather_object((logs,))
+            sum_logs = {k: sum(log[k] for log in all_logs) for k in all_logs[0]}
+            total_sum_logs = sum_logs if total_sum_logs is None \
+                else {k: (total_sum_logs[k] + sum_logs[k]) for k in sum_logs}
+            for proc_log in all_logs:
+                accelerator.log(proc_log)
+
+            batch_loss = accelerator.gather(loss).sum().item()
+            total_loss += batch_loss
+            num_labels_per_proc += num_labels
+            eval_pbar.set_postfix({"avg_loss": (total_loss / (step + 1)).item()})
+        # logs = {"eval/avg_loss": (total_loss / (step + 1)).item()}
+        logs = {}
+        all_num_labels = accelerator.gather(num_labels_per_proc)
+        total_num_labels = all_num_labels.sum().item()
+
+        logs["eval/avg_loss_per_label"] = (total_loss / total_num_labels).item()
+        logs["eval/avg_loss_per_entry"] = (total_loss / len(test_dataset)).item()
+        logs["eval/ppl"] = np.exp(total_sum_logs["mlog_pi_t_yplus_sum"] / total_num_labels)
+        logs["eval/total_num_labels"] = total_num_labels
+        logs["eval/total_num_entries"] = len(test_dataset)
+
+        logs = {**logs, **{f"eval/per_entry_{k}": total_sum_logs[k] / len(test_dataset) for k in total_sum_logs}}
+        logs = {**logs, **{f"eval/per_label_{k}": total_sum_logs[k] / total_num_labels for k in total_sum_logs}}
+
         if args.with_tracking:
             accelerator.log(logs)
-        model.train()
+        model.train()"""
 
         if args.checkpointing_steps == "epoch":
-            output_dir = checkpointing_dir / f"epoch_{epoch}"
+
+            if epoch_name is not None:
+                epoch_name=epoch_name+1
+                output_dir = checkpointing_dir / f"epoch_{epoch_name}"
+            else:
+                output_dir = checkpointing_dir / f"epoch_{epoch}"
+
+            print("saved to ", output_dir)
             save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
-            with open(output_dir / "logs.json", "w") as f:
-                json.dump(logs, f)
-
-    output_dir = checkpointing_dir / "final"
-    save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
-
+            """if accelerator.is_main_process:
+                print(logs)
+                with open(output_dir / "logs.json", "w") as f:
+                    json.dump(logs, f)"""
+    print("process is finished")
     accelerator.wait_for_everyone()
     if args.with_tracking:
         accelerator.end_training()
