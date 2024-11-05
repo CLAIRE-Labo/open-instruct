@@ -5,6 +5,7 @@ import argparse
 from copy import deepcopy
 import json
 
+from thunder.executors.torchex import full_like
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
@@ -64,6 +65,8 @@ def add_att_args(parser: argparse.ArgumentParser):
         '--precompute_ref_logprobs', type=str,
         help='If set, the reference logprobs are precomputed into the path provided to this flag. The rest of the training is not run in this case.'
     )
+    parser.add_argument('--base_model_is_att', action='store_true',
+                        help='If set, the reference probabilities will also be computed assuming the LM is a translation model.')
 
 
 # Losses that have a term for pi(y- | x, y-) and hence require the y- to be cropped to a fixed length.
@@ -476,7 +479,7 @@ def batch_to_list(batch, batch_dim):
 
 
 # Assumes the model has been prepared for training, so we get the reference model by disabling the adapter
-def precompute_save_ref_logprobs(accelerator, model, dataloader, data_dir):
+def precompute_save_ref_logprobs(accelerator, model, dataloader, data_dir, base_model_is_att):
     def get_logprobs(batch, name):
         with accelerator.unwrap_model(model).disable_adapter():
             with torch.no_grad():
@@ -492,16 +495,31 @@ def precompute_save_ref_logprobs(accelerator, model, dataloader, data_dir):
 
     new_dataset = []
     for batch in tqdm(dataloader, desc="Precomputing reference logprobs"):
-        mean_yplus, sum_yplus = get_logprobs(batch, "yplus_ref")
-        mean_yminus, sum_yminus = get_logprobs(batch, "yminus_ref")
         new_batch = deepcopy(batch)
-        new_batch = {**new_batch,
-                     "logp_yplus_ref_mean": mean_yplus,
-                     "logp_yplus_ref_sum": sum_yplus,
-                     "logp_yminus_ref_mean": mean_yminus,
-                     "logp_yminus_ref_sum": sum_yminus,
-                     }
-        examples = batch_to_list(new_batch, mean_yplus.shape[0])
+        if base_model_is_att:
+            def add_ref(name: str):
+                nonlocal batch, new_batch
+                if name in batch:
+                    mean_logp, sum_logp = get_logprobs(batch, name)
+                    new_batch = {**new_batch,
+                                 f"logp_{name}_ref_mean": mean_logp,
+                                 f"logp_{name}_ref_sum": sum_logp
+                                 }
+
+            add_ref("yplus_att")
+            add_ref("yplus_yplus_att")
+            add_ref("yminus_att")
+            add_ref("yminus_yminus_att")
+        else:
+            mean_yplus, sum_yplus = get_logprobs(batch, "yplus_ref")
+            mean_yminus, sum_yminus = get_logprobs(batch, "yminus_ref")
+            new_batch = {**new_batch,
+                         "logp_yplus_ref_mean": mean_yplus,
+                         "logp_yplus_ref_sum": sum_yplus,
+                         "logp_yminus_ref_mean": mean_yminus,
+                         "logp_yminus_ref_sum": sum_yminus,
+                         }
+        examples = batch_to_list(new_batch, next(iter(new_batch.values())).shape[0])
         new_dataset.extend(examples)
 
     new_dataset = Dataset.from_list(new_dataset)
@@ -553,9 +571,55 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
         else:
             raise ValueError(f"Unknown reduce_loss value: {args.reduce_loss}")
 
-    yplus_logprobs = get_logprobs("yplus_att")
+    # pi_ref is obtained from our model by removing the lora adapter
+    def compute_log_piref(ref_name):
+        with torch.no_grad():
+            if args.use_lora:
+                with accelerator.unwrap_model(model).disable_adapter():
+                    return get_logprobs(ref_name)
+            else:
+                raise ValueError("Non-LoRA is not supported for pi_ref computation")
+
+    # Empty if the ref logprobs were not precomputed
+    # These are the values of log pi_ref on various inputs required by the losses
+    precomp_ref_logprobs = {k: v for k, v in batch.items() if "ref" in k}
+
+    # This function looks up the log pi_ref value from the above cache. If it is not available, the function computes it
+    # and populates the cache. Optionally it can re-compute the cached value and compare against it for debugging
+    def get_ref(ref_name, debug=False):
+        nonlocal precomp_ref_logprobs, logs
+        precomp_ref_name = f"{ref_name}_{args.reduce_loss}"
+        if precomp_ref_name in precomp_ref_logprobs:
+            result = precomp_ref_logprobs
+            for i in range(len(result)):
+                logs[i][precomp_ref_name] = result[i].item()
+            if debug:
+                result_check = compute_log_piref(ref_name)
+                diff = torch.abs(result_check - result).sum().item()
+                assert diff < 1e-5, f"{diff=} > 1e-5! {result_check=} {result=}"
+        else:
+            result = compute_log_piref(ref_name)
+            precomp_ref_logprobs[precomp_ref_name] = result
+        return result
+
+    # If args.base_model_is_att is True, the ATT loss will contain terms such as log (pi(y+|x,y-)/pi_ref(y+|x,y-))
+    # Otherwise, the reference model is not a translation model, and the terms will look like log (pi(y+|x,y-)/pi_ref(y+|x))
+    # This function computes both forms in a unified manner
+    def get_log_ratio(name, disable_grad=False):
+        logprobs = get_logprobs(name, disable_grad=disable_grad)
+        if args.base_model_is_att:
+            ref_name = name
+        else:
+            if name.startswith("yplus"):
+                ref_name = "logp_yplus_ref"
+            else:
+                assert name.startswith("yminus")
+                ref_name = "logp_yminus_ref"
+        ref_logprobs = get_ref(ref_name)
+        return logprogbs, ref_logprobs, logprobs - ref_logprobs
 
     if args.loss == "ce":
+        yplus_logprobs = get_logprobs("yplus_att")
         return -yplus_logprobs.sum(), logs
 
     if "progressive" in args.loss:
@@ -565,57 +629,32 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
     else:
         lam = args.loss_lambda
 
-    yminus_logprobs = get_logprobs("yminus_att") if loss_requires_yminus(args.loss) else None
-    disable_grad = args.loss == "dpo_corrected_stopgrad"
-    yminus_yminus_logprobs = get_logprobs("yminus_yminus_att", disable_grad=disable_grad) \
-        if loss_requires_yminus_yminus(args.loss) else None
-    yplus_yplus_logprobs = get_logprobs("yplus_yplus_att", disable_grad=disable_grad) \
-        if loss_requires_yplus_yplus(args.loss) else None
-
     if args.loss in ["symmetric", "symmetric_progressive"]:
         # Loss1
+        yplus_logprobs = get_logprobs("yplus_att")
+        yminus_logprobs = get_logprobs("yminus_att")
         diff = yplus_logprobs.detach() - args.neg_example_strength * yminus_logprobs
         for i in range(len(logs)):
             logs[i]["logp_diff"] = diff[i].item()
         return (-yplus_logprobs + lam * F.softplus(-diff)).sum(), logs
     elif args.loss == "symmetric_hinge":
         # Loss2
+        yplus_logprobs = get_logprobs("yplus_att")
+        yminus_logprobs = get_logprobs("yminus_att")
         diff = yplus_logprobs.detach() - args.neg_example_strength * yminus_logprobs
         for i in range(len(logs)):
             logs[i]["logp_diff"] = diff[i].item()
         return (-yplus_logprobs + args.loss_lambda * torch.relu(args.hinge_delta - diff)).sum(), logs
 
-    # The rest of the losses require the reference outputs
-    # TODO recover the cached values if they are available
-    are_ref_logprobs_precomputed = "logp_yplus_ref_mean" in batch
-    reduce_loss = 'mean' if args.reduce_loss == 'mean' else 'sum'
-    if debug or not are_ref_logprobs_precomputed:
-        with torch.no_grad():
-            if args.use_lora:
-                with accelerator.unwrap_model(model).disable_adapter():
-                    yplus_ref_logprobs = get_logprobs("yplus_ref")
-                    yminus_ref_logprobs = get_logprobs("yminus_ref")
-            else:
-                raise ValueError("Non-LoRA is not supported for ATT")
-        if are_ref_logprobs_precomputed:  # debug mode, comparing ref logprobs
-            precomp_yplus_ref_logprobs = batch[f"logp_yplus_ref_{reduce_loss}"]
-            precomp_yminus_ref_logprobs = batch[f"logp_yminus_ref_{reduce_loss}"]
-            for i in range(len(yplus_ref_logprobs)):
-                diff_plus = torch.abs(precomp_yplus_ref_logprobs[i] - yplus_ref_logprobs[i]) / yplus_ref_logprobs[i]
-                diff_minus = torch.abs(precomp_yminus_ref_logprobs[i] - yminus_ref_logprobs[i]) / yminus_ref_logprobs[i]
-                assert diff_plus < 1e-4, f"rel diff plus: {diff_plus}"
-                assert diff_minus < 1e-4, f"rel diff minus: {diff_minus}"
-    else:
-        yplus_ref_logprobs = batch[f"logp_yplus_ref_{reduce_loss}"]
-        yminus_ref_logprobs = batch[f"logp_yminus_ref_{reduce_loss}"]
-        for i in range(len(logs)):
-            for reduce in {"mean", "sum"}:
-                logs[i][f"logp_yplus_ref_{reduce}"] = batch[f"logp_yplus_ref_{reduce}"][i].item()
-                logs[i][f"logp_yminus_ref_{reduce}"] = batch[f"logp_yminus_ref_{reduce}"][i].item()
+    yminus_yminus_logprobs = get_logprobs("yminus_yminus_att", disable_grad=disable_grad) \
+        if loss_requires_yminus_yminus(args.loss) else None
+    yplus_yplus_logprobs = get_logprobs("yplus_yplus_att", disable_grad=disable_grad) \
+        if loss_requires_yplus_yplus(args.loss) else None
 
     if args.loss in ["symmetric_dpo", "symmetric_dpo_progressive", "ipo"]:
-        assert yminus_logprobs is not None
-        diff = yplus_logprobs - yplus_ref_logprobs - args.neg_example_strength * (yminus_logprobs - yminus_ref_logprobs)
+        yplus_logprobs, yplus_ref_logprobs, yplus_log_ratio = get_log_ratio("yplus_att")
+        yminus_logprobs, yminus_ref_logprobs, yminus_log_ratio = get_log_ratio("yminus_att")
+        diff = yplus_log_ratio - args.neg_example_strength * yminus_log_ratio
         for i in range(len(logs)):
             logs[i]["logp_diff_dpo"] = diff[i].item()
 
@@ -626,18 +665,23 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
         elif args.loss == "ipo":
             return ((diff - 1 / (2 * args.dpo_beta)) ** 2).sum(), logs
     elif args.loss == "nonsymmetric_dpo_corrected":
+        yplus_logprobs, yplus_ref_logprobs, yplus_log_ratio = get_log_ratio("yplus_att")
+        yminus_yminus_logprobs, yminus_yminus_ref_logprobs, yminus_yminus_log_ratio = get_log_ratio("yminus_yminus_att")
         assert yminus_yminus_logprobs is not None
-        diff = yplus_logprobs - yplus_ref_logprobs \
-               - args.neg_example_strength * (yminus_yminus_logprobs - yminus_ref_logprobs)
+        diff = yplus_log_ratio - args.neg_example_strength * yminus_yminus_log_ratio
         for i in range(len(logs)):
             logs[i]["logp_diff_asymmetric"] = diff[i].item()
         return F.softplus(-args.dpo_beta * diff).sum(), logs
     elif args.loss in ["dpo_corrected", "dpo_corrected_stopgrad"]:
-        assert yminus_logprobs is not None
-        assert yminus_yminus_logprobs is not None
-        assert yplus_yplus_logprobs is not None
-        diff = yplus_logprobs + yplus_yplus_logprobs - 2 * yplus_ref_logprobs \
-               - args.neg_example_strength * (yminus_logprobs + yminus_yminus_logprobs - 2 * yminus_ref_logprobs)
+        disable_grad = args.loss == "dpo_corrected_stopgrad"
+        yplus_logprobs, yplus_ref_logprobs, yplus_log_ratio = get_log_ratio("yplus_att", disable_grad=False)
+        yplus_yplus_logprobs, yplus_yplus_ref_logprobs, yplus_yplus_log_ratio = get_log_ratio("yplus_yplus_att",
+                                                                                              disable_grad=disable_grad)
+        yminus_logprobs, yminus_ref_logprobs, yminus_log_ratio = get_log_ratio("yminus_att", disable_grad=False)
+        yminus_yminus_logprobs, yminus_yminus_ref_logprobs, yminus_yminus_log_ratio = get_log_ratio("yminus_yminus_att",
+                                                                                                    disable_grad=disable_grad)
+        diff = yplus_log_ratio + yplus_yplus_log_ratio \
+               - args.neg_example_strength * (yminus_log_ratio + yminus_yminus_log_ratio)
         for i in range(len(logs)):
             logs[i]["logp_diff_dpo_corrected"] = diff[i].item()
         return F.softplus(-args.dpo_beta / 2 * diff).sum(), logs
