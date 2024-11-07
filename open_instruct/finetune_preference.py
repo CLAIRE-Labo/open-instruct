@@ -243,8 +243,8 @@ def prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=F
         # if args.half_dataset:
         #     dataset_train = dataset_train.select(range(len(dataset_train) // 2))
         # COMMENT OUT! This is for debugging
-        train_dataset = train_dataset.select(range(240))
-        test_dataset = test_dataset.select(range(240))
+        # train_dataset = train_dataset.select(range(240))
+        # test_dataset = test_dataset.select(range(240))
         for i in range(3):
             logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(train_dataset[i]['chosen'])}\n\n"
                         f"Example {i} rejected:\n{pretty_print_chatml(train_dataset[i]['rejected'])}\n\n")
