@@ -243,8 +243,8 @@ def prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=F
         # if args.half_dataset:
         #     dataset_train = dataset_train.select(range(len(dataset_train) // 2))
         # COMMENT OUT! This is for debugging
-        # train_dataset = train_dataset.select(range(240))
-        # test_dataset = test_dataset.select(range(240))
+        train_dataset = train_dataset.select(range(240))
+        test_dataset = test_dataset.select(range(240))
         for i in range(3):
             logger.info(f"\n\nExample {i} chosen:\n{pretty_print_chatml(train_dataset[i]['chosen'])}\n\n"
                         f"Example {i} rejected:\n{pretty_print_chatml(train_dataset[i]['rejected'])}\n\n")
@@ -391,13 +391,12 @@ def main():
 
     ######################################## Data Preprocessing #######################################
 
-
     have_precomputed_ref_logprobs = args.precompute_ref_logprobs is not None \
-                                     and (Path(args.precompute_ref_logprobs) / "train").exists() \
-                                     and (Path(args.precompute_ref_logprobs) / "test").exists()
+                                    and (Path(args.precompute_ref_logprobs) / "train").exists() \
+                                    and (Path(args.precompute_ref_logprobs) / "test").exists()
     need_precompute_ref_logprobs = args.precompute_ref_logprobs is not None and not have_precomputed_ref_logprobs
 
-    train_dataloader, train_examples, test_dataloader, test_examples  \
+    train_dataloader, train_examples, test_dataloader, test_examples \
         = prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=have_precomputed_ref_logprobs)
 
     num_train_examples = len(train_dataloader.dataset)
@@ -436,8 +435,10 @@ def main():
     if need_precompute_ref_logprobs:
         train_path = Path(args.precompute_ref_logprobs) / "train"
         test_path = Path(args.precompute_ref_logprobs) / "test"
-        precompute_save_ref_logprobs(accelerator, model, train_dataloader, train_path)
-        precompute_save_ref_logprobs(accelerator, model, test_dataloader, test_path)
+        precompute_save_ref_logprobs(accelerator, model, train_dataloader, train_path,
+                                     base_model_is_att=args.base_model_is_att)
+        precompute_save_ref_logprobs(accelerator, model, test_dataloader, test_path,
+                                     base_model_is_att=args.base_model_is_att)
         # Reload the data to get the precomputed logprobs
         train_dataloader, train_examples, test_dataloader, test_examples \
             = prepare_att_data(accelerator, tokenizer, model, args, load_from_cache_file=True)

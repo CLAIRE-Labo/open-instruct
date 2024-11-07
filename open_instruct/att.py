@@ -519,7 +519,7 @@ def precompute_save_ref_logprobs(accelerator, model, dataloader, data_dir, base_
                          "logp_yminus_ref_mean": mean_yminus,
                          "logp_yminus_ref_sum": sum_yminus,
                          }
-        examples = batch_to_list(new_batch, next(iter(new_batch.values())).shape[0])
+        examples = batch_to_list(new_batch, new_batch['yplus_att']['input_ids'].shape[0])
         new_dataset.extend(examples)
 
     new_dataset = Dataset.from_list(new_dataset)
@@ -582,15 +582,15 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
 
     # Empty if the ref logprobs were not precomputed
     # These are the values of log pi_ref on various inputs required by the losses
-    precomp_ref_logprobs = {k: v for k, v in batch.items() if "ref" in k}
+    precomp_ref_logprobs = {k: v for k, v in batch.items() if "logp" in k and "ref" in k}
 
     # This function looks up the log pi_ref value from the above cache. If it is not available, the function computes it
     # and populates the cache. Optionally it can re-compute the cached value and compare against it for debugging
     def get_ref(ref_name, debug=False):
         nonlocal precomp_ref_logprobs, logs
-        precomp_ref_name = f"{ref_name}_{args.reduce_loss}"
+        precomp_ref_name = f"logp_{ref_name}_ref_{args.reduce_loss}"
         if precomp_ref_name in precomp_ref_logprobs:
-            result = precomp_ref_logprobs
+            result = precomp_ref_logprobs[precomp_ref_name]
             for i in range(len(result)):
                 logs[i][precomp_ref_name] = result[i].item()
             if debug:
@@ -616,7 +616,7 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
                 assert name.startswith("yminus")
                 ref_name = "logp_yminus_ref"
         ref_logprobs = get_ref(ref_name)
-        return logprogbs, ref_logprobs, logprobs - ref_logprobs
+        return logprobs, ref_logprobs, logprobs - ref_logprobs
 
     if args.loss == "ce":
         yplus_logprobs = get_logprobs("yplus_att")
@@ -630,7 +630,7 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
         lam = args.loss_lambda
 
     if args.loss in ["symmetric", "symmetric_progressive"]:
-        # Loss1
+        assert False, "Check this code again before running it!"
         yplus_logprobs = get_logprobs("yplus_att")
         yminus_logprobs = get_logprobs("yminus_att")
         diff = yplus_logprobs.detach() - args.neg_example_strength * yminus_logprobs
@@ -638,7 +638,7 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
             logs[i]["logp_diff"] = diff[i].item()
         return (-yplus_logprobs + lam * F.softplus(-diff)).sum(), logs
     elif args.loss == "symmetric_hinge":
-        # Loss2
+        assert False, "Check this code again before running it!"
         yplus_logprobs = get_logprobs("yplus_att")
         yminus_logprobs = get_logprobs("yminus_att")
         diff = yplus_logprobs.detach() - args.neg_example_strength * yminus_logprobs
@@ -646,12 +646,8 @@ def compute_loss_att(accelerator, model, batch, args, percentage_complete: float
             logs[i]["logp_diff"] = diff[i].item()
         return (-yplus_logprobs + args.loss_lambda * torch.relu(args.hinge_delta - diff)).sum(), logs
 
-    yminus_yminus_logprobs = get_logprobs("yminus_yminus_att", disable_grad=disable_grad) \
-        if loss_requires_yminus_yminus(args.loss) else None
-    yplus_yplus_logprobs = get_logprobs("yplus_yplus_att", disable_grad=disable_grad) \
-        if loss_requires_yplus_yplus(args.loss) else None
-
     if args.loss in ["symmetric_dpo", "symmetric_dpo_progressive", "ipo"]:
+        assert False, "Check this code again before running it!"
         yplus_logprobs, yplus_ref_logprobs, yplus_log_ratio = get_log_ratio("yplus_att")
         yminus_logprobs, yminus_ref_logprobs, yminus_log_ratio = get_log_ratio("yminus_att")
         diff = yplus_log_ratio - args.neg_example_strength * yminus_log_ratio
