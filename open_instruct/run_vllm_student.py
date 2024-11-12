@@ -90,7 +90,7 @@ def run_model_for_student_vllm(args, prompts):
             )
 
         # Collect responses
-        for prompt, output in zip(formatted_prompts, outputs):
+        for prompt, output in zip(prompts, outputs):
             responses_log.append({
                 "prompt": prompt,
                 "output": output
@@ -99,59 +99,65 @@ def run_model_for_student_vllm(args, prompts):
         del base_model  # Free up GPU memory
     return responses_log
 
-# Load arguments
-parser = argparse.ArgumentParser()
-parser.add_argument("--model_name_or_path", type=str, help="Path to the model checkpoint")
-parser.add_argument("--lora_model_name_or_path", type=str, help="Path to the lora model checkpoint")
-parser.add_argument("--tokenizer_name", type=str, required=False, help="Name or path of the tokenizer")
-parser.add_argument("--generated_res", type=Path, required=True, help="Path of resulting generations file")
-parser.add_argument("--batch_file", type=Path, required=True, help="Path of prompts file")
+def main():
+    # Load arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name_or_path", type=str, help="Path to the model checkpoint")
+    parser.add_argument("--lora_model_name_or_path", type=str, help="Path to the lora model checkpoint")
+    parser.add_argument("--tokenizer_name", type=str, required=False, help="Name or path of the tokenizer")
+    parser.add_argument("--generated_res", type=Path, required=True, help="Path of resulting generations file")
+    parser.add_argument("--batch_file", type=Path, required=True, help="Path of prompts file")
 
-parser.add_argument("--max_new_tokens", type=int, default=20, help="Maximum number of new tokens to generate")
-parser.add_argument("--top_p", type=float, default=0.9, help="Top p for sampling")
-parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling")
-parser.add_argument("--greedy", action="store_true", help="Whether to use greedy sampling")
-parser.add_argument("--n_sample_per_prompt", type=int, default=1, help="Number of samples to generate per prompt")
-parser.add_argument("--mem_util", type=float, default=0.4, help="GPU memory utilization")
-parser.add_argument("--batch_size", type=str, default="30", help="Batch size for model generation")
+    parser.add_argument("--max_new_tokens", type=int, default=20, help="Maximum number of new tokens to generate")
+    parser.add_argument("--top_p", type=float, default=0.9, help="Top p for sampling")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling")
+    parser.add_argument("--greedy", action="store_true", help="Whether to use greedy sampling")
+    parser.add_argument("--n_sample_per_prompt", type=int, default=1, help="Number of samples to generate per prompt")
+    parser.add_argument("--mem_util", type=float, default=0.4, help="GPU memory utilization")
+    parser.add_argument("--batch_size", type=str, default="30", help="Batch size for model generation")
 
-parser.add_argument("--trust_remote_code", action="store_true", help="Trust remote code when loading the tokenizer")
-parser.add_argument("--use_slow_tokenizer", action="store_true", help="Use the slow tokenizer")
-parser.add_argument("--ignore_model_cache", action="store_true", help="Force download the model even if it's cached")
-parser.add_argument("--tokenizer_revision", type=str, default="main", help="The specific revision of the tokenizer to use")
-parser.add_argument("--model_revision", type=str, default="main", help="The specific revision of the model to use")
+    parser.add_argument("--trust_remote_code", action="store_true", help="Trust remote code when loading the tokenizer")
+    parser.add_argument("--use_slow_tokenizer", action="store_true", help="Use the slow tokenizer")
+    parser.add_argument("--ignore_model_cache", action="store_true", help="Force download the model even if it's cached")
+    parser.add_argument("--tokenizer_revision", type=str, default="main", help="The specific revision of the tokenizer to use")
+    parser.add_argument("--model_revision", type=str, default="main", help="The specific revision of the model to use")
 
-parser.add_argument("--cache_dir", type=str, default= None, help= "cache directory path")
+    parser.add_argument("--cache_dir", type=str, default= None, help= "cache directory path")
 
-parser.add_argument('--is_lora', action='store_true', help='Enable LoRA support')
-parser.add_argument('--use_vllm', action='store_true', help='Enable vLLM model usage')
-parser.add_argument('--disable_sliding_window', action='store_true', help='Disable sliding window for inference')
+    parser.add_argument('--is_lora', action='store_true', help='Enable LoRA support')
+    parser.add_argument('--use_vllm', action='store_true', help='Enable vLLM model usage')
+    parser.add_argument('--disable_sliding_window', action='store_true', help='Disable sliding window for inference')
 
-args = parser.parse_args()
+    args = parser.parse_args()
 
-# Set multiprocessing to use 'spawn' method for CUDA compatibility
-multiprocessing.set_start_method('spawn', force=True)
+    # Set multiprocessing to use 'spawn' method for CUDA compatibility
+    multiprocessing.set_start_method('spawn', force=True)
 
-# read the prompts from json file
-with open(args.batch_file, "r") as f:
-    prompts = json.load(f)
-# Call the function to generate responses
-responses_log = run_model_for_student_vllm(args, prompts=prompts)
+    # read the prompts from json file
+    with open(args.batch_file, "r") as f:
+        prompts = json.load(f)
 
-#write the things to the files
-# Extract the directory and filename from the batch_file path
-directory = os.path.dirname(args.batch_file)
-filename = os.path.basename(args.batch_file)
+    # Call the function to generate responses
+    responses_log = run_model_for_student_vllm(args, prompts=prompts)
 
-# Create the new filename with the 'res_' prefix
-new_filename = f"res_{filename}"
+    #write the things to the files
+    # Extract the directory and filename from the batch_file path
+    directory = os.path.dirname(args.batch_file)
+    filename = os.path.basename(args.batch_file)
 
-# Create the full path for the new file
-result_file = os.path.join(directory, new_filename)
+    # Create the new filename with the 'res_' prefix
+    new_filename = f"res_{filename}"
 
-# Store the results in the new JSON file
-with open(result_file, 'w') as f:
-    json.dump(responses_log, f)
+    # Create the full path for the new file
+    result_file = os.path.join(directory, new_filename)
 
-print(f"Results stored in: {result_file}")
+    # Store the results in the new JSON file
+    with open(result_file, 'w') as f:
+        json.dump(responses_log, f)
+
+    print(f"Results stored in: {result_file}")
+
+
+if __name__ == "__main__":
+    main()
 

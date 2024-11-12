@@ -5,7 +5,7 @@ import sys
 import time
 import html
 import json
-from heapq import merge
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from copy import deepcopy
 from typing import Dict, List, Tuple
 from pathlib import Path
@@ -29,11 +29,11 @@ from accelerate.utils import set_seed, InitProcessGroupKwargs, gather_object, br
 import datasets
 from datasets import DatasetDict
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+
 import deepspeed
 import wandb
 import huggingface_hub
-from accelerate.utils import DeepSpeedPlugin
+from tqdm import tqdm
 from datasets import Dataset, DatasetDict
 
 import transformers
@@ -73,9 +73,6 @@ if api_key_file:
 else:
     raise ValueError("WANDB_API_KEY_FILE_AT environment variable not set")
 
-
-
-
 def get_run_id(args: Namespace) -> str:
     round = args.round
     # try to get the git commit hash
@@ -111,7 +108,7 @@ def add_distill_args(parser: argparse.ArgumentParser):
         help="If set, the new token template is used for ATT traning."
     )
     parser.add_argument("--teacher_lora_model_name_or_path", type=str, help="Teacher model path")
-    parser.add_argument("--wandb_id", type=str, default=None, required=True)
+    parser.add_argument("--wandb_id", type=str, default=None, required=False)
 
     parser.add_argument(
         "--deepspeed_config_file", type=str, help="the path of deepspeed config file"
@@ -123,7 +120,7 @@ def add_distill_args(parser: argparse.ArgumentParser):
         "--max_new_tokens", type=int, default=2048, required=False
     )
     parser.add_argument(
-        "--pickle_batch", type=str, required=True
+        "--pickle_batch", type=str, required=False
     )
 
 
@@ -329,7 +326,6 @@ def main():
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        # deepspeed_plugin=args.deepspeed_config_file,
         **accelerator_log_kwargs,
         kwargs_handlers=[timeout_kwargs],
     )
@@ -337,7 +333,6 @@ def main():
     accelerator_teacher = Accelerator(
         **accelerator_log_kwargs,
         kwargs_handlers=[timeout_kwargs],
-        # deepspeed_plugin=args.deepspeed_config_file
     )
 
     # Make one log on every process with the configuration for debugging.
@@ -346,6 +341,7 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
+
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
@@ -364,41 +360,20 @@ def main():
 
     accelerator.wait_for_everyone()
 
-    #TODO: changes that should be done?
-    # if first run, get the load lora True then should be false since it will be the adapter
-    # load the teacher model in the same way but load lora false
-
-    model, tokenizer, actual_eos_token, generation_config_nucleus, generation_config_greedy \
-        = load_tokenizer_model(accelerator, args, substitute_eos_token=True, load_lora=False)
-
+    #if it is the very first run of this script use load lora true
+    #model is the student model
+    args.first_run=True #TODO: change this
+    if args.first_run:
+        model, tokenizer, actual_eos_token, generation_config_sampling, generation_config_greedy \
+            = load_tokenizer_model(None, args, substitute_eos_token=True, load_lora=True)
+    else:
+        model, tokenizer, actual_eos_token, generation_config_sampling, generation_config_greedy \
+             = load_tokenizer_model(None, args, substitute_eos_token=True, load_lora=False)
+        model = PeftModel.from_pretrained(model, str(args.student_lora_model_name_or_path))
+    tokenizer.eos_token = actual_eos_token
     #model.generation_config = generation_config_greedy
-    model.eos_token = actual_eos_token
-    peft_model = PeftModel.from_pretrained(model, str(args.teacher_lora_model_name_or_path))
 
-    teacher_model = peft_model.merge_and_unload()  # get the merged teacher_model
-
-    #model.generation_config = generation_config_greedy
-    if args.student_lora_model_name_or_path:
-        model.eos_token = actual_eos_token
-        peft_model = PeftModel.from_pretrained(model, str(args.student_lora_model_name_or_path))
-        model = peft_model.merge_and_unload()  # get the merged teacher_model
-
-
-    # apply lora on top of student model - TODO: delete this part it wont be needed
-    if args.use_lora:
-        logger.info("Initializing LORA model...")
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            inference_mode=False,
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=target_lora_modules(model)
-        )
-        model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
-    elif args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+    teacher_model = PeftModel.from_pretrained(model, str(args.teacher_lora_model_name_or_path))
 
     logger.info(str(model), main_process_only=True)
     """for name, param in model.named_parameters():
@@ -432,18 +407,30 @@ def main():
     with open(args.pickle_batch, 'rb') as f:
         dataset = pickle.load(f)
 
-    # Assume `dataset` contains 'chosen' and 'rejected' lists
-    if isinstance(dataset, dict):  # Ensure it's a dictionary-like object
+    if isinstance(dataset, dict):
         if isinstance(dataset.get("chosen"), list) and isinstance(dataset.get("rejected"), list):
-            # Combine 'chosen' and 'rejected' into one dataset
-            combined_data = {
-                "chosen": dataset["chosen"],  # Add 'chosen' list as a column
-                "rejected": dataset["rejected"]  # Add 'rejected' list as a column
+            chosen_dataset = Dataset.from_dict({"chosen": dataset["chosen"]})
+            rejected_dataset = Dataset.from_dict({"rejected": dataset["rejected"]})
+
+            chosen_split = chosen_dataset.train_test_split(test_size=0.2, shuffle=False)
+            rejected_split = rejected_dataset.train_test_split(test_size=0.2, shuffle=False)
+
+            combined_train_data = {
+                "chosen": chosen_split["train"]["chosen"],
+                "rejected": rejected_split["train"]["rejected"]
             }
 
-            # Create the new 'train' split with both 'chosen' and 'rejected' columns
+            combined_test_data = {
+                "chosen": chosen_split["test"]["chosen"],
+                "rejected": rejected_split["test"]["rejected"]
+            }
+
+            train_dataset = Dataset.from_dict(combined_train_data)
+            test_dataset = Dataset.from_dict(combined_test_data)
+
             dataset = DatasetDict({
-                "train": Dataset.from_dict(combined_data)  # New 'train' dataset containing 'chosen' and 'rejected' columns
+                "train": train_dataset,
+                "test": test_dataset
             })
         else:
             raise ValueError("Both 'chosen' and 'rejected' must be present as lists.")
@@ -476,16 +463,7 @@ def main():
     print("Size of training set:", len(dataset['train']))
 
     train_dataset = lm_datasets["train"]
-    #test_dataset = lm_datasets["test"]
-
-    # COMMENT OUT! This is for debugging epoch checkpointing
-    # train_dataset = train_dataset.select(range(192))
-    # test_dataset = test_dataset.select(range(192))
-
-    # TODO check that nothing breaks if we don't add special tokens
-    # We only use instruct models, so tokens should already be there
-
-    # Log a few random samples from the training set
+    test_dataset = lm_datasets["test"]
 
     num_train_ex = accelerator.num_processes
 
@@ -501,7 +479,7 @@ def main():
         )
 
     train_dataloader = get_dataloader(train_dataset, args.per_device_train_batch_size)
-    #test_dataloader = get_dataloader(test_dataset, args.per_device_train_batch_size)
+    test_dataloader = get_dataloader(test_dataset, args.per_device_train_batch_size)
 
     # Optimizer
     optimizer = build_optimizer(args, model)
@@ -522,9 +500,6 @@ def main():
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
         accelerator.init_trackers(project_name="alignment_translation", config=experiment_config,
                                   init_kwargs={"wandb": {"entity": "claire-labo", "id":args.wandb_id, "resume":"allow"}})
-
-    # Define custom step metric for evaluation
-    #run_id = wandb.run.id
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -547,155 +522,126 @@ def main():
     )
     teacher_model = accelerator_teacher.prepare(teacher_model)
 
-    # accelerator.state.select_deepspeed_plugin("student")
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        args.max_train_steps = num_update_steps_per_epoch  #num of epochs 1
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    completed_steps = 0
-    starting_epoch = 0
-
-    ######################################## Checkpointing ########################################
-    # Potentially load in the weights and states from a previous save
-    epoch_name=None
-    if args.resume_from_checkpoint is not None:
-        checkpoint_path = Path(args.resume_from_checkpoint)
-        path = os.path.basename(args.resume_from_checkpoint)
-        ##get the epoch name from the path
-        if 'epoch' in path:
-            epoch_name = path.split('_')[-1]  # Get the part after 'epoch_'
-            print(f"Extracted epoch name: {epoch_name}")
-            epoch_name=int(epoch_name)
-        else:
-            print("No epoch name found in the checkpoint path.")
-        state_path = Path(checkpoint_path) / "state"
-        assert state_path.exists(), f"Checkpoint path {state_path} does not exist."
-        logger.info(f"Resuming from checkpoint: {state_path}", main_process_only=True)
-        accelerator.load_state(str(state_path))
-        logger.info(f"Accelerator state loaded", main_process_only=True)
-
-
-
-    # update the progress_bar if load from checkpoint
-    #progress_bar.update(completed_steps)
 
     ######################################## Training Loop ########################################
     print(f"{accelerator.sync_gradients=}", flush=True)
     accelerator.wait_for_everyone()
 
     #will be run only 1 epoch all the time  - REVIEW
+    total_steps = args.max_train_steps
+    progress_bar = tqdm(total=total_steps, desc="Training Progress")
 
-    for epoch in range(starting_epoch, args.num_train_epochs):
-        model.train()
-        total_loss = 0
-        epoch_data_count = 0  # To keep track of the number of data points in each epoch
-        active_dataloader = train_dataloader
-        """
-        Algorithm: Generalized Knowledge Distillation (GKD)
-        1: Given: Teacher model pT, Student Model pθS, Dataset (X, Y) containing (input, output) pairs
-        2: Hyperparameters: Student data fraction λ ∈ [0, 1], Divergence D, Learning rate η
-        3: for each step k = 1, . . . , K do
-        4:   Generate a random value u ∼ Uniform(0, 1)
-        5:   if u ≤ λ then
-        6:       Sample inputs x from X and generate outputs y ∼ pθS(·|x) to obtain B = {(xb, yb)}_b=1
-        7:   else
-        8:       Sample batch of inputs and outputs from (X, Y) to obtain B = {(xb, yb)}_b=1.
-        9:   end if
-        10:  Update θ to minimize LGKD: θ ← θ - η * (1/B) * Σ_{(x,y)∈B} ∇θD(pT∥pθS)(y|x)
-        11: end for
-        """
-        model.train()
-        for step, batch in enumerate(active_dataloader):
-            # Use original batch data for both student and teacher
-            student_inputs = {
-                'input_ids': batch['student_encoded']['input_ids'],
-                'attention_mask': batch['student_encoded']['attention_mask'],
-                'labels': batch['student_encoded']['labels'],
-            }
+    completed_steps = 0  # Initialize the completed steps counter
+    total_loss = 0  # Initialize total loss for logging
 
-            # Extract teacher inputs
-            teacher_inputs = {
-                'input_ids': batch['teacher_encoded']['input_ids'],
-                'attention_mask': batch['teacher_encoded']['attention_mask'],
-                'labels': batch['teacher_encoded']['labels'],
-            }
+    active_dataloader = train_dataloader
+    """
+    Algorithm: Generalized Knowledge Distillation (GKD)
+    1: Given: Teacher model pT, Student Model pθS, Dataset (X, Y) containing (input, output) pairs
+    2: Hyperparameters: Student data fraction λ ∈ [0, 1], Divergence D, Learning rate η
+    3: for each step k = 1, . . . , K do
+    4:   Generate a random value u ∼ Uniform(0, 1)
+    5:   if u ≤ λ then
+    6:       Sample inputs x from X and generate outputs y ∼ pθS(·|x) to obtain B = {(xb, yb)}_b=1
+    7:   else
+    8:       Sample batch of inputs and outputs from (X, Y) to obtain B = {(xb, yb)}_b=1.
+    9:   end if
+    10:  Update θ to minimize LGKD: θ ← θ - η * (1/B) * Σ_{(x,y)∈B} ∇θD(pT∥pθS)(y|x)
+    11: end for
+    """
+    model.train()
+    teacher_model.eval()
+    for step, batch in enumerate(active_dataloader):
+        # Use original batch data for both student and teacher
+        student_inputs = {
+            'input_ids': batch['student_encoded']['input_ids'],
+            'attention_mask': batch['student_encoded']['attention_mask'],
+            'labels': batch['student_encoded']['labels'],
+        }
 
-            # Forward pass for the student model
-            with accelerator.accumulate(model):  # Accumulate gradients
-                student_outputs = model(**student_inputs)
+        # Extract teacher inputs
+        teacher_inputs = {
+            'input_ids': batch['teacher_encoded']['input_ids'],
+            'attention_mask': batch['teacher_encoded']['attention_mask'],
+            'labels': batch['teacher_encoded']['labels'],
+        }
 
-                #print(student_outputs.logits.requires_grad)
-                # Forward pass for the teacher model (in evaluation mode) using truncated inputs
-                with torch.no_grad():
-                    teacher_outputs = teacher_model(**teacher_inputs)
+        # Forward pass for the student model
+        with accelerator.accumulate(model):  # Accumulate gradients
+            student_outputs = model(**student_inputs)
 
-                # Slice logits based on prompt lengths - to compare them over generated responses
-                prompt_lengths_student = student_inputs['input_ids'].shape[1]
-                prompt_lengths_teacher = teacher_inputs["input_ids"].shape[1]
-                # Step 1: Calculate softmax for both teacher and student logits
-                student_logits = student_outputs.logits[:, :prompt_lengths_student]
-                teacher_logits = teacher_outputs.logits[:, :prompt_lengths_teacher]
+            #print(student_outputs.logits.requires_grad)
+            # Forward pass for the teacher model (in evaluation mode) using truncated inputs
+            with torch.no_grad():
+                teacher_outputs = teacher_model(**teacher_inputs)
 
-                # Ensure that the logits are the same shape for both student and teacher, if not, align them. - TODO
-                min_length = min(student_logits.shape[1], teacher_logits.shape[1])
-                student_logits = student_logits[:, :min_length]
-                teacher_logits = teacher_logits[:, :min_length]
+            # Slice logits based on prompt lengths - to compare them over generated responses
+            prompt_lengths_student = student_inputs['input_ids'].shape[1]
+            prompt_lengths_teacher = teacher_inputs["input_ids"].shape[1]
+            # Step 1: Calculate softmax for both teacher and student logits
+            student_logits = student_outputs.logits[:, :prompt_lengths_student]
+            teacher_logits = teacher_outputs.logits[:, :prompt_lengths_teacher]
 
-                # Step 2: Apply softmax to get probabilities
-                student_probs = F.softmax(student_logits, dim=-1)
-                teacher_probs = F.softmax(teacher_logits, dim=-1)
+            # Ensure that the logits are the same shape for both student and teacher, if not, align them. - TODO
+            min_length = min(student_logits.shape[1], teacher_logits.shape[1])
+            student_logits = student_logits[:, :min_length]
+            teacher_logits = teacher_logits[:, :min_length]
 
-                if not student_probs.requires_grad:
-                    student_probs.requires_grad_()
+            # Step 2: Apply softmax to get probabilities
+            student_probs = F.softmax(student_logits, dim=-1)
+            teacher_probs = F.softmax(teacher_logits, dim=-1)
 
-                #   Step 3: Compute KL Divergence
-                loss = F.kl_div(student_probs.log(), teacher_probs, reduction='batchmean')
+            if not student_probs.requires_grad:
+                student_probs.requires_grad_()
 
-                # Backpropagation and optimizer step
-                accelerator.backward(loss)  # Use accelerator to handle distributed backward pass
+            #   Step 3: Compute KL Divergence
+            loss = F.kl_div(student_probs.log(), teacher_probs, reduction='batchmean')
 
-                optimizer.step()
-                optimizer.zero_grad()
+            # Backpropagation and optimizer step
+            accelerator.backward(loss)  # Use accelerator to handle distributed backward pass
 
-                # Accumulate total loss and count for logging
-                total_loss += loss.detach().float()
+            optimizer.step()
+            optimizer.zero_grad()
 
-                # for cuda out of memory
-                if step % 2000 == 0:
-                    torch.cuda.empty_cache()
+            # Accumulate total loss and count for logging
+            total_loss += loss.detach().float()
 
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                completed_steps += 1
-                if args.logging_steps and completed_steps % args.logging_steps == 0:
-                    avg_loss = accelerator.gather(
-                        total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_steps
-                    # logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
-                    # Print number of examples processed so far in this epoch
-                    # print(f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
-                    if args.with_tracking:
-                        accelerator.log(
-                            {
-                                "learning_rate": lr_scheduler.get_last_lr()[0],
-                                "train_loss": avg_loss,
-                            },
-                        )
+            # for cuda out of memory
+            if step % 2000 == 0:
+                torch.cuda.empty_cache()
 
-                    total_loss = 0
+        if accelerator.sync_gradients:
+            progress_bar.update(1)
+            completed_steps += 1
+            if args.logging_steps and completed_steps % args.logging_steps == 0:
+                avg_loss = accelerator.gather(
+                    total_loss).mean().item() / args.gradient_accumulation_steps / args.logging_steps
+                # logger.info(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
+                # Print number of examples processed so far in this epoch
+                # print(f"Step {completed_steps}: Processed {epoch_data_count} examples so far in Epoch {epoch + 1}")
+                if args.with_tracking:
+                    accelerator.log(
+                        {
+                            "learning_rate": lr_scheduler.get_last_lr()[0],
+                            "train_loss": avg_loss,
+                        },
+                    )
 
-                if isinstance(checkpointing_steps, int) and completed_steps % checkpointing_steps == 0:
-                    output_dir = checkpointing_dir / f"step_{completed_steps}"
-                    save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
+                total_loss = 0
 
-                if completed_steps >= args.max_train_steps:
-                    break
+            if isinstance(checkpointing_steps, int) and completed_steps % checkpointing_steps == 0:
+                output_dir = checkpointing_dir / f"step_{completed_steps}"
+                save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
 
-        print(f"Completed Epoch {epoch + 1}")
+            if completed_steps >= args.max_train_steps:
+                break
+
 
         accelerator.wait_for_everyone()
         torch.cuda.empty_cache()

@@ -469,6 +469,35 @@ def preprocess_data_to_chatml(accelerator, args):
     return chatml_dataset_train, chatml_dataset_test
 
 
+def preprocess_data_to_chatml_without_accelerator(args):
+    chatml_datasets_train = []
+    chatml_datasets_test = []
+    for dataset_name in args.dataset_name:
+        raw_data = load_dataset(dataset_name)
+        if dataset_name == "Anthropic/hh-rlhf":
+            dataset_train, dataset_test = preprocess_hh_common(raw_data, remove_multiturn_data=True)
+        elif dataset_name == "HuggingFaceH4/ultrafeedback_binarized":
+            dataset_train = raw_data['train_prefs']
+            dataset_test = raw_data['test_prefs']
+        elif dataset_name == "Magpie-Align/Magpie-Air-DPO-100K-v0.1":
+            dataset_train = raw_data['train']
+            dataset_test = raw_data['test']
+        else:
+            raise ValueError(f"Dataset {dataset_name} not supported yet.")
+        chatml_datasets_train.append(dataset_train)
+        chatml_datasets_test.append(dataset_test)
+
+    # merge training datasets
+    chatml_dataset_train = chatml_datasets_train[0]
+    for dataset in chatml_datasets_train[1:]:
+        chatml_dataset_train = chatml_dataset_train.concatenate(dataset)
+
+    # merge test datasets
+    chatml_dataset_test = chatml_datasets_test[0]
+    for dataset in chatml_datasets_test[1:]:
+        chatml_dataset_test = chatml_dataset_test.concatenate(dataset)
+    return chatml_dataset_train, chatml_dataset_test
+
 def preprocess_hh_common(raw_dataset, remove_multiturn_data=False):
     dataset_train = raw_dataset['train'].map(parse_entry_anthropic_hh)
     dataset_test = raw_dataset['test'].map(parse_entry_anthropic_hh)
