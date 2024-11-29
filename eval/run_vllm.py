@@ -41,8 +41,11 @@ model = vllm.LLM(
 )
 
 responses = []
-for batch in tqdm(batches, desc="Generating responses in batches"):
-    cur_responses = model.generate(batch, sampling_params=sampling_params, use_tqdm=False)
+our_tqdm = len(batches) > 1
+if our_tqdm:
+    batches = tqdm(batches, desc="Generating responses in batches")
+for batch in batches:
+    cur_responses = model.generate(batch, sampling_params=sampling_params, use_tqdm=not our_tqdm)
     responses.extend(cur_responses)
 
 responses_text = [t.outputs[0].text for t in responses]
