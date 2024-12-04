@@ -615,6 +615,15 @@ def copy_all_files(src_dir, dest_dir):
             shutil.copy(file_path, dest_dir / file_path.name)
 
 
+def subprocess_run_interactive_capture_output(command, shell=False):
+    # Adapted from https://stackoverflow.com/questions/18421757/live-output-from-subprocess-command
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=shell)
+    for c in iter(lambda: process.stdout.read(1), b""):
+        sys.stdout.buffer.write(c)
+    process.wait()
+
+
 # vLLM unfortunately requires the checkpoints to be in a slightly different format compared to what HF provides.
 def maybe_create_reformatted_lora_checkpoint(tuned_checkpoint, cache_dir=None):
     tuned_checkpoint = Path(tuned_checkpoint)

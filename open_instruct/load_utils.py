@@ -27,7 +27,7 @@ from datasets import load_dataset
 from accelerate.logging import get_logger
 
 sys.path.append(str(Path(__file__).parents[1].absolute().as_posix()))
-from open_instruct.constants import PHI2_CHAT_TEMPLATE, LLAMA_TULU_CHAT_TEMPLATE
+from open_instruct.constants import PHI2_CHAT_TEMPLATE, LLAMA_TULU_CHAT_TEMPLATE, ALPACA_PKU_CHAT_TEMPLATE
 
 logger = get_logger(__name__)
 
@@ -583,12 +583,14 @@ def load_tokenizer(args, substitute_eos_token=False):
     # The SFTd Phi-2 model
     if tokenizer_name == 'lxuechen/phi-2-sft':
         tokenizer.chat_template = PHI2_CHAT_TEMPLATE
+    elif tokenizer_name == "PKU-Alignment/alpaca-7b-reproduced":
+        tokenizer.chat_template = ALPACA_PKU_CHAT_TEMPLATE
     # this also doesn't provide its own chat template, so we wrote it ourselves
     elif tokenizer_name in ['allenai/tulu-v1-llama2-7b', "allenai/open-instruct-opt-6.7b-tulu", "allenai/open-instruct-pythia-6.9b-tulu" ]:
         tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
-    if "facebook/opt" in tokenizer_name:
+    elif "facebook/opt" in tokenizer_name:
         tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
-    if "EleutherAI/pythia" in tokenizer_name:
+    elif "EleutherAI/pythia" in tokenizer_name:
         tokenizer.chat_template = LLAMA_TULU_CHAT_TEMPLATE
     else:
         assert hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None, \

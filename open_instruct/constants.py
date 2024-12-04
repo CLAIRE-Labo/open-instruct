@@ -94,6 +94,27 @@ LLAMA_TULU_CHAT_TEMPLATE = \
 # LLAMA_TULU_CHAT_TEMPLATE = "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{{'<|' + message['role'] + '|>' + '\n' + message['content'] + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>\n' }}{% endif %}"
 
 
+# The template adapted from the sample code given with the PKU reproduction of Alpaca: https://huggingface.co/PKU-Alignment/alpaca-7b-reproduced
+# For whatever reason, 'USER:' has a space after it and 'ASSISTANT:' does not
+# The behavior on multiple turns is not well-defined, the model was trained only on single-turn
+ALPACA_PKU_CHAT_TEMPLATE = \
+"""BEGINNING OF CONVERSATION:
+{%- if not add_generation_prompt is defined -%}
+    {%- set add_generation_prompt = false -%}
+{%- endif -%}
+{%- for message in messages -%}
+    {%- if message['role'] == 'user' -%}
+        {{ ' USER: ' + message['content'] }}
+    {%- elif message['role'] == 'assistant' -%}
+        {{ ' ASSISTANT:' + message['content'] }}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{ ' ASSISTANT:' }}
+{%- endif -%}
+"""
+
+
 if __name__ == "__main__":
     from jinja2 import Template
 
@@ -105,7 +126,8 @@ if __name__ == "__main__":
 
     templates = [
         # ("phi2", Template(PHI2_CHAT_TEMPLATE)),
-        ("llama", Template(LLAMA_TULU_CHAT_TEMPLATE))
+        # ("llama", Template(LLAMA_TULU_CHAT_TEMPLATE))
+        ("alpaca-pku", Template(ALPACA_PKU_CHAT_TEMPLATE))
     ]
 
     for name, template in templates:
